@@ -18,6 +18,7 @@
 #include "../soc/clock.h"
 #include "../soc/t210.h"
 #include "../utils/util.h"
+#include "../utils/fatal.h"
 #include "../emmc/sdmmc.h"
 
 static const sclock_t _clock_i2c5 = {
@@ -65,12 +66,16 @@ void clock_disable_i2c5()
 
 static void _clock_enable_pllc4()
 {
-	if ((CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | 0xFFFFFF))
+	u32 old_base = CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
+	u32 old_misc = CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC);
+	if ((old_base & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | 0xFFFFFF))
 		== (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | (104 << 8) | 4))
 		return;
+	if ((old_base & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK)) == (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK))
+		fatal_abort(Fatal_DdrPll);
 
 	// Enable Phase and Frequency lock detection.
-	//CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC) = PLLC4_MISC_EN_LCKDET;
+	CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC) |= PLLC4_MISC_EN_LCKDET;
 
 	// Disable PLL and IDDQ in case they are on.
 	CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) &= ~PLLCX_BASE_ENABLE;
@@ -84,8 +89,14 @@ static void _clock_enable_pllc4()
 	// Enable PLLC4 and wait for Phase and Frequency lock.
 	CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) |= PLLCX_BASE_ENABLE;
 	(void)CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
-	while (!(CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) & PLLCX_BASE_LOCK))
-		;
+	u64 deadline = get_tmr_us() + 1000;
+	while (!(CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) & PLLCX_BASE_LOCK)) {
+		if (get_tmr_us() >= deadline) {
+			CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) = old_base;
+			CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC) = old_misc;
+			fatal_abort(Fatal_DdrPll);
+		}
+	}
 
 	msleep(1); // Wait a bit for PLL to stabilize.
 }

@@ -36,7 +36,13 @@ enum FatalReason
     Fatal_FatfsFileOpen,
     Fatal_FatfsMemExhaustion,
     Fatal_InvalidEnum,
-    Fatal_Max
+    Fatal_Max,
+    Fatal_DdrNativeHost = 0x61,
+    Fatal_DdrReassert = 0x62,
+    Fatal_DdrRead = 0x63,
+    Fatal_DdrWrite = 0x64,
+    Fatal_DdrSnapshot = 0x65,
+    Fatal_DdrPll = 0x66
 };
 
 #define AMS_FATAL_ERROR_MAX_STACKTRACE 0x20
@@ -70,10 +76,13 @@ typedef struct
     uint64_t stack_dump_size;
     uint64_t stack_trace[AMS_FATAL_ERROR_MAX_STACKTRACE];
     uint8_t stack_dump[AMS_FATAL_ERROR_MAX_STACKDUMP];
+    uint8_t tls[0x100];
 } atmosphere_fatal_error_ctx;
 
-/* "AFE1" */
-#define ATMOSPHERE_REBOOT_TO_FATAL_MAGIC 0x31454641
+_Static_assert(sizeof(atmosphere_fatal_error_ctx) == 0x450, "Atmosphere AFE2 report size");
+
+/* "AFE2", used by Atmosphere 1.11.2. */
+#define ATMOSPHERE_REBOOT_TO_FATAL_MAGIC 0x32454641
 /* "AFE0" */
 #define ATMOSPHERE_REBOOT_TO_FATAL_MAGIC_0 0x30454641
 

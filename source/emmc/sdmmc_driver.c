@@ -29,6 +29,8 @@
 #include "../utils/types.h"
 #include "../utils/util.h"
 #include "../utils/log.h"
+#include "../utils/ddr_trace.h"
+#include "sdmmc_tuning.h"
 
 #define DPRINTF(...)
 
@@ -48,9 +50,9 @@ int sdmmc_get_io_power(sdmmc_t *sdmmc)
 	u32 p = sdmmc->regs->pwrcon;
 	if (!(p & SDHCI_POWER_ON))
 		return SDMMC_POWER_OFF;
-	if (p & SDHCI_POWER_180)
+	if ((p & ~SDHCI_POWER_MASK) == SDHCI_POWER_180)
 		return SDMMC_POWER_1_8;
-	if (p & SDHCI_POWER_330)
+	if ((p & ~SDHCI_POWER_MASK) == SDHCI_POWER_330)
 		return SDMMC_POWER_3_3;
 	return -1;
 }
@@ -664,6 +666,7 @@ static int _sdmmc_tuning_execute_once(sdmmc_t *sdmmc, u32 cmd, u32 tap)
 typedef struct _sdmmc_manual_tuning_t
 {
 	u32 result[8];
+	u32 raw[4];
 	u32 num_iter;
 	u32 iter_done;
 } sdmmc_manual_tuning_t;
@@ -682,23 +685,23 @@ static void _sdmmc_manual_tuning_log(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *tuni
 
 	Log("[%u] iter %u/%u map %08X %08X %08X %08X\n", _sdmmc_tuning_log_id, tuning->iter_done, tuning->num_iter, tuning->result[0], tuning->result[1], tuning->result[2], tuning->result[3]);
 
-	for (u32 i = 0; i < tuning->num_iter; i++)
+	for (u32 i = 0; i < tuning->iter_done; i++)
 	{
-		u32 iter_end = i == (tuning->num_iter - 1) ? 1 : 0;
+		bool iter_end = i == tuning->iter_done - 1;
 		u32 stable = tuning->result[i / 32] & (1u << (i % 32));
 
-		if (stable && !iter_end)
+		if (stable)
 		{
 			if (tap_start == SDMMC_INVALID_TAP)
 				tap_start = i;
 
 			win_size++;
 		}
-		else if (tap_start != SDMMC_INVALID_TAP)
+		if ((!stable || iter_end) && tap_start != SDMMC_INVALID_TAP)
 		{
-			u32 tap_end = !iter_end ? (i - 1) : i;
+			u32 tap_end = stable ? i : i - 1;
 
-			Log("[%u] win %u-%u sz %u mid %u\n", _sdmmc_tuning_log_id, tap_start, tap_end, win_size + iter_end, (tap_start + tap_end) / 2);
+			Log("[%u] win %u-%u sz %u mid %u\n", _sdmmc_tuning_log_id, tap_start, tap_end, win_size, (tap_start + tap_end) / 2);
 
 			tap_start = SDMMC_INVALID_TAP;
 			win_size  = 0;
@@ -724,41 +727,10 @@ static void _sdmmc_manual_tuning_log(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *tuni
 
 static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *tuning)
 {
-	u32 tap_start = SDMMC_INVALID_TAP;
-	u32 win_size  = 0;
-	u32 best_tap  = 0;
-	u32 best_size = 0;
-
-	for (u32 i = 0; i < tuning->num_iter; i++)
-	{
-		u32 iter_end = i == (tuning->num_iter - 1) ? 1 : 0;
-		u32 stable = tuning->result[i / 32] & (1u << (i % 32));
-		if (stable && !iter_end)
-		{
-			if (tap_start == SDMMC_INVALID_TAP)
-				tap_start = i;
-
-			win_size++;
-		}
-		else
-		{
-			if (tap_start != SDMMC_INVALID_TAP)
-			{
-				u32 tap_end = !iter_end ? (i - 1) : i;
-
-				if (win_size > best_size)
-				{
-					best_tap  = (tap_start + tap_end) / 2;
-					best_size = win_size + iter_end;
-				}
-
-				tap_start = SDMMC_INVALID_TAP;
-				win_size  = 0;
-			}
-		}
-	}
-
-	int pass = best_tap && best_size >= SDMMC_SAMPLE_WIN_SIZE_MIN;
+	u32 best_size;
+	u32 best_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &best_size);
+	int pass = best_size >= SDMMC_SAMPLE_WIN_SIZE_MIN;
+	ddr_trace_tuning(tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size);
 
 	_sdmmc_manual_tuning_log(sdmmc, tuning, best_tap, best_size, pass);
 
@@ -778,6 +750,13 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 
 static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 {
+	static bool first = true;
+	ddr_trace_stage(DdrSweep, 0);
+	if (first) {
+		ddr_trace_host(DdrInitialTune, sdmmc);
+		first = false;
+	}
+	ddr_trace_host(DdrLatestTune, sdmmc);
 	sdmmc_manual_tuning_t manual_tuning = { 0 };
 	manual_tuning.num_iter = 128;
 
@@ -790,10 +769,12 @@ static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 
 	for (u32 i = 0; i < manual_tuning.num_iter; i++)
 	{
-		_sdmmc_tuning_execute_once(sdmmc, cmd, i);
+		int completed = _sdmmc_tuning_execute_once(sdmmc, cmd, i);
 
 		u32 sampled = (sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK) ? 1 : 0;
-		manual_tuning.result[i / 32] |= sampled << (i % 32);
+		manual_tuning.raw[i / 32] |= sampled << (i % 32);
+		if (completed && sampled)
+			manual_tuning.result[i / 32] |= 1u << (i % 32);
 
 		manual_tuning.iter_done = i + 1;
 
@@ -1546,15 +1527,16 @@ void sdmmc_end(sdmmc_t *sdmmc)
 {
 	if (!sdmmc->clock_stopped)
 	{
-		_sdmmc_sd_clock_disable(sdmmc);
-		// Disable SDMMC power.
-		_sdmmc_set_io_power(sdmmc, SDMMC_POWER_OFF);
+		if (clock_sdmmc_is_not_reset_and_enabled(sdmmc->id)) {
+			_sdmmc_sd_clock_disable(sdmmc);
+			_sdmmc_set_io_power(sdmmc, SDMMC_POWER_OFF);
+			_sdmmc_commit_changes(sdmmc);
+		}
 
 		// Disable SD card power.
 		if (sdmmc->id == SDMMC_1)
 			sdmmc1_disable_power();
 
-		_sdmmc_commit_changes(sdmmc);
 		clock_sdmmc_disable(sdmmc->id);
 		sdmmc->clock_stopped = 1;
 	}

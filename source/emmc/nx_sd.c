@@ -44,6 +44,12 @@ bool nx_sd_is_ddr200(void)
 
 int nx_sd_init_retry(bool power_cycle)
 {
+#ifdef EMUMMC_FORCE_DDR200
+	if (power_cycle && sd_storage.sdmmc)
+		sdmmc_storage_end(&sd_storage);
+	return sdmmc_storage_init_sd(&sd_storage, &sd_sdmmc, SDMMC_BUS_WIDTH_4,
+		SDHCI_TIMING_UHS_DDR200);
+#else
 	u32 bus_width = SDMMC_BUS_WIDTH_4;
 #ifndef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 	u32 type = SDHCI_TIMING_UHS_SDR104;
@@ -86,10 +92,14 @@ int nx_sd_init_retry(bool power_cycle)
 	}
 
 	return sdmmc_storage_init_sd(&sd_storage, &sd_sdmmc, bus_width, type);
+#endif
 }
 
 bool nx_sd_initialize(bool power_cycle)
 {
+#ifdef EMUMMC_FORCE_DDR200
+	return nx_sd_init_retry(power_cycle);
+#else
 	if (power_cycle)
 		sdmmc_storage_end(&sd_storage);
 
@@ -109,4 +119,5 @@ bool nx_sd_initialize(bool power_cycle)
 	}
 
 	return false;
+#endif
 }

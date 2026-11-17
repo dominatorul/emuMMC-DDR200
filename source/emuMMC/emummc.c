@@ -21,11 +21,13 @@
 #include "emummc.h"
 #include "emummc_ctx.h"
 #include "../utils/fatal.h"
+#include "../utils/ddr_trace.h"
 #include "../utils/log.h"
 #include "../nx/cache.h"
 #include "../soc/clock.h"
 #include "../libs/fatfs/diskio.h"
 #include "../soc/gpio.h"
+#include "../emmc/sd.h"
 
 static bool sdmmc_first_init = false;
 static bool storageSDinitialized = false;
@@ -60,14 +62,15 @@ static bool fat_mounted = false;
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 extern int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf);
 extern int _sd_storage_switch_get(sdmmc_storage_t *storage, void *buf);
+extern int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group, u32 arg);
 extern void _sd_storage_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf);
 
 static bool sdmmc_ddr200_reassert_enabled = true;
 
-static void _ddr200_reassert(void)
+static void _ddr200_reassert(int mmc_id)
 {
     static u8 ddr200_switch_buf[512];
-    u8 dma_save[64];
+    u8 dma_save[512];
     void *dma_scratch = NULL;
 
     if (!sdmmc_ddr200_reassert_enabled || !sd_storage.initialized)
@@ -76,33 +79,62 @@ static void _ddr200_reassert(void)
     if (nx_sd_mode_get() != SD_UHS_DDR208)
         return;
 
-    if ((sd_sdmmc.regs->hostctl2 & 0x7) == UHS_DDR50_BUS_SPEED)
+    ddr_trace_stage(DdrCheckState, mmc_id);
+    const bool cold = !sdmmc_get_sd_power_enabled() ||
+        !clock_sdmmc_is_not_reset_and_enabled(SDMMC_1) ||
+        sdmmc_get_io_power(&sd_sdmmc) != SDMMC_POWER_1_8 ||
+        sdmmc_get_bus_width(&sd_sdmmc) != SDMMC_BUS_WIDTH_4;
+    if (!cold && (sd_sdmmc.regs->hostctl2 & 0x7) == UHS_DDR50_BUS_SPEED)
         return;
 
+    ddr_trace_reassert();
+    ddr_trace_host(DdrReassert, &sd_sdmmc);
     if (_current_accessor != NULL)
     {
         int dma_idx = sdmmc_calculate_fitting_dma_index(_current_accessor, 1);
-        dma_scratch = &_current_accessor->parent->dmaBuffers[dma_idx].device_addr_buffer[0];
+        sdmmc_dma_buffer_t *dma = &_current_accessor->parent->dmaBuffers[dma_idx];
+        if (!dma->device_addr_buffer || dma->device_addr_buffer_size < sizeof(dma_save))
+            fatal_abort(Fatal_DdrReassert);
+        dma_scratch = dma->device_addr_buffer;
+        armDCacheFlush(dma_scratch, sizeof(dma_save));
         memcpy(dma_save, dma_scratch, sizeof(dma_save));
     }
 
-    sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_DISABLE);
-    sdmmc_ddr200_restore_host_cfg(&sd_sdmmc);
-    clock_sdmmc_invalidate_clock_source(SDMMC_1);
-
-    int ok = _sd_storage_switch_get(&sd_storage, ddr200_switch_buf);
-
-    if (ok)
+    int ok;
+    if (cold)
     {
-        u16 current_limit = ddr200_switch_buf[7] | (ddr200_switch_buf[6] << 8);
-        _sd_storage_set_current_limit(&sd_storage, current_limit, ddr200_switch_buf);
-
-        ok = _sd_storage_enable_DDR200(&sd_storage, ddr200_switch_buf);
+        sdmmc_end(&sd_sdmmc);
+        sd_storage.initialized = 0;
+        clock_sdmmc_invalidate_clock_source(SDMMC_1);
+        ok = nx_sd_initialize(false);
     }
+    else
+    {
+        sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_DISABLE);
+        sdmmc_ddr200_restore_host_cfg(&sd_sdmmc);
+        clock_sdmmc_invalidate_clock_source(SDMMC_1);
 
-    sd_storage.csd.busspeed = ok ? 200 : 104;
+        ddr_trace_stage(DdrReadFunctions, mmc_id);
+        ok = _sd_storage_switch_get(&sd_storage, ddr200_switch_buf);
+        if (ok)
+        {
+            ddr_trace_card(ddr200_switch_buf, false);
+            u16 current_limit = ddr200_switch_buf[7] | (ddr200_switch_buf[6] << 8);
+            _sd_storage_set_current_limit(&sd_storage, current_limit, ddr200_switch_buf);
 
-    sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_ENABLE);
+            /* The vendor DDR200 switch in Hekate and L4T starts with Access
+               Mode at SDR12. Native FS may have selected SDR104. */
+            ddr_trace_stage(DdrSetSdr12, mmc_id);
+            ok = sdmmc_setup_clock(&sd_sdmmc, SDHCI_TIMING_UHS_SDR12) &&
+                _sd_storage_switch(&sd_storage, ddr200_switch_buf, SD_SWITCH_SET, 0, UHS_SDR12_BUS_SPEED) &&
+                (ddr200_switch_buf[16] & 0xF) == UHS_SDR12_BUS_SPEED;
+            if (ok)
+                ok = _sd_storage_enable_DDR200(&sd_storage, ddr200_switch_buf);
+        }
+
+        sd_storage.csd.busspeed = ok ? 200 : 0;
+        sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_ENABLE);
+    }
 
     if (dma_scratch != NULL)
     {
@@ -111,12 +143,19 @@ static void _ddr200_reassert(void)
     }
 
     if (!ok)
+    {
+#ifdef EMUMMC_FORCE_DDR200
+        fatal_abort(Fatal_DdrReassert);
+#else
+        sd_storage.csd.busspeed = 104;
         sdmmc_ddr200_reassert_enabled = false;
+#endif
+    }
 
     Log("Reasserting\n");
 }
 #else
-#define _ddr200_reassert() ((void)0)
+#define _ddr200_reassert(mmc_id) ((void)(mmc_id))
 #endif
 
 
@@ -140,6 +179,7 @@ static void _sdmmc_ensure_initialized(void)
         sdmmc_initialize();
         sdmmc_first_init = true;
     }
+#ifndef EMUMMC_FORCE_DDR200
     else
     {
         // The boot sysmodule will eventually kill power to SD.
@@ -154,6 +194,7 @@ static void _sdmmc_ensure_initialized(void)
             }
         }
     }
+#endif
 }
 
 static void _file_based_update_filename(char *outFilename, unsigned int sd_path_len, unsigned int part_idx)
@@ -298,7 +339,11 @@ bool sdmmc_initialize(void)
 {
     if (!storageSDinitialized)
     {
+#ifdef EMUMMC_FORCE_DDR200
+        int retries = 1;
+#else
         int retries = 3;
+#endif
         while (retries)
         {
             if (nx_sd_initialize(false))
@@ -480,7 +525,16 @@ uint64_t sdmmc_wrapper_controller_open(int mmc_id)
         if (mmc_id == FS_SDMMC_SD)
             mutex_lock_handler(FS_SDMMC_EMMC); // Recursive Mutex, handler will lock SD as well if custom_driver
 
+        bool trace_open = mmc_id == FS_SDMMC_SD && sd_storage.initialized;
+        if (trace_open) {
+            ddr_trace_stage(DdrNativeOpen, mmc_id);
+            ddr_trace_host(DdrBeforeOpen, &sd_sdmmc);
+        }
         result = _this->vtab->sdmmc_accessor_controller_open(_this);
+        if (trace_open) {
+            ddr_trace_stage(DdrNativeOpen, result);
+            ddr_trace_host(DdrAfterOpen, &sd_sdmmc);
+        }
 
         // Unlock eMMC.
         if (mmc_id == FS_SDMMC_SD)
@@ -540,6 +594,8 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
             _sdmmc_ensure_device_attached();
             // Make sure we're still initialized if boot killed sd card power.
             _sdmmc_ensure_initialized();
+            _ddr200_reassert(mmc_id);
+            ddr_trace_stage(DdrRead, mmc_id);
         }
 
         if (mmc_id == FS_SDMMC_EMMC)
@@ -547,24 +603,22 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
             // Call hekates driver.
             if (emummc_read_write_inner(buf, sector, num_sectors, false))
             {
+                ddr_trace_io(false);
                 mutex_unlock_handler(mmc_id);
                 return 0;
             }
 
+#ifdef EMUMMC_FORCE_DDR200
+            fatal_abort(Fatal_DdrRead);
+#endif
             mutex_unlock_handler(mmc_id);
             return FS_READ_WRITE_ERROR;
         }
 
         if (mmc_id == FS_SDMMC_SD)
         {
-            _ddr200_reassert();
-
-            bool dump_requested = !gpio_read(GPIO_PORT_X, GPIO_PIN_6);
-
-            if (dump_requested) {
-                // Log("Reassert count: %u\n", reassertCount);
-                ViewLog();
-            }
+            if (!gpio_read(GPIO_PORT_X, GPIO_PIN_6) && !gpio_read(GPIO_PORT_X, GPIO_PIN_7))
+                fatal_abort(Fatal_DdrSnapshot);
 
             static bool first_sd_read = true;
             if (first_sd_read)
@@ -584,10 +638,14 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
             // Call hekate's driver.
             if (sdmmc_storage_read(&sd_storage, sector, num_sectors, buf))
             {
+                ddr_trace_io(false);
                 mutex_unlock_handler(mmc_id);
                 return 0;
             }
 
+#ifdef EMUMMC_FORCE_DDR200
+            fatal_abort(Fatal_DdrRead);
+#endif
             mutex_unlock_handler(mmc_id);
             return FS_READ_WRITE_ERROR;
         }
@@ -613,14 +671,23 @@ uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_s
         {
             mutex_lock_handler(mmc_id);
             _current_accessor = _this;
+            _sdmmc_ensure_device_attached();
+            if (!sdmmc_first_init)
+                fatal_abort(Fatal_DdrWrite);
+            _ddr200_reassert(mmc_id);
+            ddr_trace_stage(DdrWrite, mmc_id);
 
             // Call hekates driver.
             if (emummc_read_write_inner(buf, sector, num_sectors, true))
             {
+                ddr_trace_io(true);
                 mutex_unlock_handler(mmc_id);
                 return 0;
             }
 
+#ifdef EMUMMC_FORCE_DDR200
+            fatal_abort(Fatal_DdrWrite);
+#endif
             mutex_unlock_handler(mmc_id);
             return FS_READ_WRITE_ERROR;
         }
@@ -631,15 +698,22 @@ uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_s
             _current_accessor = _this;
             _sdmmc_ensure_device_attached();
 
-            _ddr200_reassert();
+            if (!sdmmc_first_init)
+                fatal_abort(Fatal_DdrWrite);
+            _ddr200_reassert(mmc_id);
+            ddr_trace_stage(DdrWrite, mmc_id);
 
             // Call hekates driver.
             if (sdmmc_storage_write(&sd_storage, sector, num_sectors, buf))
             {
+                ddr_trace_io(true);
                 mutex_unlock_handler(mmc_id);
                 return 0;
             }
 
+#ifdef EMUMMC_FORCE_DDR200
+            fatal_abort(Fatal_DdrWrite);
+#endif
             mutex_unlock_handler(mmc_id);
             return FS_READ_WRITE_ERROR;
         }

@@ -26,6 +26,8 @@
 #include "../utils/util.h"
 #include "../utils/fatal.h"
 #include "../utils/log.h"
+#include "../utils/ddr_trace.h"
+#include "../soc/clock.h"
 #include "../emuMMC/emummc.h"
 
 #define DPRINTF(fmt, ...) Log(fmt, ##__VA_ARGS__)
@@ -284,14 +286,13 @@ static int _sdmmc_storage_readwrite_ex(sdmmc_storage_t *storage, u32 *blkcnt_out
 
 int sdmmc_storage_end(sdmmc_storage_t *storage)
 {
-	if (!_sdmmc_storage_go_idle_state(storage))
-		return 0;
-
+	int idle = clock_sdmmc_is_not_reset_and_enabled(storage->sdmmc->id) &&
+		_sdmmc_storage_go_idle_state(storage);
 	sdmmc_end(storage->sdmmc);
 
 	storage->initialized = 0;
 
-	return 1;
+	return idle;
 }
 
 static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf, u32 is_write)
@@ -321,6 +322,11 @@ reinit_try:
 			msleep(50);
 		} while (retries);
 
+#ifdef EMUMMC_FORCE_DDR200
+		/* Do not downgrade or clobber a pending write via initialization DMA. */
+		if (!first_reinit || is_write)
+			return 0;
+#endif
 		// Disk IO failure! Reinit SD Card to a lower speed.
 		if (storage->sdmmc->id == SDMMC_1)
 		{
@@ -1049,7 +1055,7 @@ int _sd_storage_switch_get(sdmmc_storage_t *storage, void *buf)
 int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group, u32 arg)
 {
 	sdmmc_cmd_t cmdbuf;
-	u32 switchcmd = mode << 31 | 0x00FFFFFF;
+	u32 switchcmd = (u32)mode << 31 | 0x00FFFFFF;
 	switchcmd &= ~(0xF << (group * 4));
 	switchcmd |= arg << (group * 4);
 	sdmmc_init_cmd(&cmdbuf, SD_SWITCH, switchcmd, SDMMC_RSP_TYPE_1, 0);
@@ -1141,6 +1147,7 @@ int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf)
 {
 	u32 cmd_system = UHS_DDR200_BUS_SPEED;
 
+	ddr_trace_stage(DdrCheckFunction, 0);
 	if (!_sd_storage_switch(storage, buf, SD_SWITCH_CHECK, SD_SWITCH_GRP_CMDSYS, cmd_system))
 		return 0;
 
@@ -1159,13 +1166,16 @@ DPRINTF("[SD] card max current over limit\n");
 		return 0;
 	}
 
+	ddr_trace_stage(DdrSetFunction, 0);
 	if (!_sd_storage_switch(storage, buf, SD_SWITCH_SET, SD_SWITCH_GRP_CMDSYS, cmd_system))
 		return 0;
+	ddr_trace_card(buf, true);
 
 	if (system_out != ((buf[16] >> 4) & 0xF))
 		return 0;
 DPRINTF("[SD] card accepted DDR200\n");
 
+	ddr_trace_stage(DdrSetClock, 0);
 	if (!sdmmc_setup_clock(storage->sdmmc, SDHCI_TIMING_UHS_DDR200))
 		return 0;
 DPRINTF("[SD] after setup clock DDR200\n");
@@ -1174,6 +1184,7 @@ DPRINTF("[SD] after setup clock DDR200\n");
 		return 0;
 DPRINTF("[SD] after tuning DDR200\n");
 
+	ddr_trace_stage(DdrCheckStatus, 0);
 	return _sdmmc_storage_check_status(storage);
 }
 #endif
@@ -1185,6 +1196,7 @@ int _sd_storage_enable_uhs_low_volt(sdmmc_storage_t *storage, u32 type, u8 *buf)
 
 	if (!_sd_storage_switch_get(storage, buf))
 		return 0;
+	ddr_trace_card(buf, false);
 	//gfx_hexdump(0, (u8 *)buf, 64);
 
 	u8  access_mode = buf[13];
@@ -1204,12 +1216,17 @@ DPRINTF("[SD] access: %02X, current: %02X\n", access_mode, current_limit);
 	{
 		if (cmd_system & SD_MODE_UHS_DDR200)
 		{
+			if (!_sd_storage_enable_DDR200(storage, buf))
+				return 0;
 			storage->csd.busspeed = 200;
-
-			return _sd_storage_enable_DDR200(storage, buf);
+			return 1;
 		}
 
+#ifdef EMUMMC_FORCE_DDR200
+		return 0;
+#else
 		type = SDHCI_TIMING_UHS_SDR104;
+#endif
 	}
 #endif
 
@@ -1364,6 +1381,7 @@ static bool _sdmmc_storage_get_low_voltage_support(u32 bus_width, u32 type)
 
 int sdmmc_storage_init_sd(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type)
 {
+	ddr_trace_stage(DdrInit, 0);
 	u8 buf[512];
 	int is_version_1 = 0;
 
@@ -1390,6 +1408,10 @@ DPRINTF("[SD] after send if cond\n");
 
 	if (!_sd_storage_get_op_cond(storage, is_version_1, bus_low_voltage_support))
 		return 0;
+#ifdef EMUMMC_FORCE_DDR200
+	if (!storage->is_low_voltage)
+		return 0;
+#endif
 DPRINTF("[SD] got op cond\n");
 
 	if (!_sdmmc_storage_get_cid(storage, storage->raw_cid))
@@ -1486,7 +1508,12 @@ DPRINTF("[SD] enabled HS\n");
 		}
 	}
 
+#ifdef EMUMMC_FORCE_DDR200
+	if (storage->csd.busspeed != 200 || sdmmc_get_bus_width(sdmmc) != SDMMC_BUS_WIDTH_4)
+		return 0;
+#endif
 	storage->initialized = 1;
+	ddr_trace_stage(DdrReady, storage->csd.busspeed);
 
 	return 1;
 }
