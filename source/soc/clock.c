@@ -325,9 +325,9 @@ static int _clock_sdmmc_config_clock_host(u32 *pclock, u32 id, u32 val)
 		divisor = 3;  // 2.5 div.
 		_clock_enable_pllc4();
 		break;
-	case 333000:
+	case SDMMC_DDR200_RECOVERY_SRC_KHZ:
 		source = SDMMC_CLOCK_SRC_PLLC4_OUT0;
-		*pclock = 332800;
+		*pclock = 2 * SDMMC_DDR200_RECOVERY_CARD_KHZ;
 		divisor = 4;  // 3 div.
 		_clock_enable_pllc4();
 		break;

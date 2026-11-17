@@ -11,6 +11,9 @@ static u32 snapshots[DdrSnapshotCount][SnapshotWords];
 static u32 first_maps[8], latest_maps[8];
 static u32 stage, detail, reads, writes, attempts, sweeps;
 static u32 first_window, latest_window, first_card[2], latest_card[2];
+static u32 first_khz, latest_khz, ready_khz, io_errors;
+static u32 last_full_window, last_reduced_window;
+static u64 first_io_error[3], latest_io_error[3];
 
 /* The SD and NAND mutexes serialize these calls. Fatal reports are captured
    on the failing thread, with no filesystem calls in the reporting path. */
@@ -18,6 +21,8 @@ void ddr_trace_stage(enum DdrStage next, u32 info)
 {
     stage = next;
     detail = info;
+    if (next == DdrReady)
+        ready_khz = info;
 }
 
 void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
@@ -53,14 +58,20 @@ void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
     memcpy(snapshots[slot], values, sizeof(values));
 }
 
-void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 tap, u32 width)
+void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 tap, u32 width, u32 khz)
 {
     /* 9 bits for count (128 is valid), then 8 for tap, then width. */
     latest_window = count | (tap << 9) | (width << 17);
+    latest_khz = khz;
+    if (khz == SDMMC_DDR200_RECOVERY_CARD_KHZ)
+        last_reduced_window = latest_window;
+    else
+        last_full_window = latest_window;
     memcpy(latest_maps, raw, 4 * sizeof(u32));
     memcpy(latest_maps + 4, complete, 4 * sizeof(u32));
     if (++sweeps == 1) {
         first_window = latest_window;
+        first_khz = khz;
         memcpy(first_maps, latest_maps, sizeof(first_maps));
     }
 }
@@ -82,20 +93,34 @@ void ddr_trace_io(bool write)
     else ++reads;
 }
 
+void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
+{
+    latest_io_error[0] = ((u64)host->command_failure << 32) | command;
+    latest_io_error[1] = ((u64)host->divisor << 32) | host->command_irq;
+    latest_io_error[2] = ((u64)host->regs->prnsts << 32) | blocks;
+    if (++io_errors == 1)
+        memcpy(first_io_error, latest_io_error, sizeof(first_io_error));
+}
+
 void ddr_trace_reassert(void) { ++attempts; }
 
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x4444523230300006ull;
+    ctx->gprs[0] = 0x4444523230300007ull;
     ctx->gprs[1] = ((u64)stage << 32) | detail;
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
     ctx->gprs[4] = ((u64)first_window << 32) | latest_window;
     ctx->gprs[5] = ((u64)first_card[0] << 32) | first_card[1];
     ctx->gprs[6] = ((u64)latest_card[0] << 32) | latest_card[1];
+    ctx->gprs[7] = ((u64)first_khz << 32) | latest_khz;
     memcpy(&ctx->gprs[8], first_maps, sizeof(first_maps));
     memcpy(&ctx->gprs[12], latest_maps, sizeof(latest_maps));
+    ctx->gprs[16] = ((u64)io_errors << 32) | ready_khz;
+    memcpy(&ctx->gprs[17], first_io_error, sizeof(first_io_error));
+    memcpy(&ctx->gprs[20], latest_io_error, sizeof(latest_io_error));
+    ctx->gprs[23] = ((u64)last_full_window << 32) | last_reduced_window;
     /* Use reserved report space while leaving actual stack lengths zero. */
     _Static_assert(sizeof(snapshots) <= sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump), "trace too large");
     memcpy(ctx->stack_trace, snapshots, sizeof(ctx->stack_trace));

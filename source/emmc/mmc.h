@@ -117,7 +117,7 @@ a valid command will clear it (with a delay of one command)
 c : clear by read
 */
 
-#define R1_OUT_OF_RANGE		(1 << 31)	/* er, c */
+#define R1_OUT_OF_RANGE		(1u << 31)	/* er, c */
 #define R1_ADDRESS_ERROR	(1 << 30)	/* erx, c */
 #define R1_BLOCK_LEN_ERROR	(1 << 29)	/* er, c */
 #define R1_ERASE_SEQ_ERROR      (1 << 28)	/* er, c */

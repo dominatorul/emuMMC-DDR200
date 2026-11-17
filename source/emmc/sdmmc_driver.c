@@ -284,7 +284,7 @@ static void _sdmmc_reset_all(sdmmc_t *sdmmc)
 		;
 }
 
-int sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type)
+static int _sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type, u32 source_override)
 {
 	// Disable the SD clock if it was enabled, and reenable it later.
 	bool should_enable_sd_clock = false;
@@ -353,6 +353,8 @@ int sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type)
 	u32 clock;
 	u16 divisor;
 	clock_sdmmc_get_card_clock_div(&clock, &divisor, type);
+	if (source_override)
+		clock = source_override;
 	clock_sdmmc_config_clock_source(&clock, sdmmc->id, clock);
 	sdmmc->divisor = (clock + divisor - 1) / divisor;
 
@@ -374,6 +376,19 @@ int sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type)
 		return _sdmmc_dll_cal_execute(sdmmc);
 	return 1;
 }
+
+int sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type)
+{
+	return _sdmmc_setup_clock(sdmmc, type, 0);
+}
+
+#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+int sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced)
+{
+	return _sdmmc_setup_clock(sdmmc, SDHCI_TIMING_UHS_DDR200,
+		reduced ? SDMMC_DDR200_RECOVERY_SRC_KHZ : 0);
+}
+#endif
 
 static void _sdmmc_card_clock_enable(sdmmc_t *sdmmc)
 {
@@ -730,7 +745,7 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 	u32 best_size;
 	u32 best_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &best_size);
 	int pass = best_size >= SDMMC_SAMPLE_WIN_SIZE_MIN;
-	ddr_trace_tuning(tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size);
+	ddr_trace_tuning(tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size, sdmmc->divisor);
 
 	_sdmmc_manual_tuning_log(sdmmc, tuning, best_tap, best_size, pass);
 
@@ -751,7 +766,7 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 {
 	static bool first = true;
-	ddr_trace_stage(DdrSweep, 0);
+	ddr_trace_stage(DdrSweep, sdmmc->divisor);
 	if (first) {
 		ddr_trace_host(DdrInitialTune, sdmmc);
 		first = false;
@@ -784,7 +799,7 @@ static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 
 	int res = _sdmmc_manual_tuning_set_tap(sdmmc, &manual_tuning);
 	if (!res)
-		sdmmc->regs->hostctl2 &= ~SDHCI_CTRL_EXEC_TUNING;
+		sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
 
 	return res;
 }
@@ -946,6 +961,7 @@ DPRINTF("norintsts %08X, errintsts %08X\n", norintsts, errintsts);
 	// Check for error interrupt.
 	if (norintsts & SDHCI_INT_ERROR)
 	{
+		sdmmc->command_irq = ((u32)errintsts << 16) | norintsts;
 		sdmmc->regs->errintsts = errintsts;
 		return SDMMC_MASKINT_ERROR;
 	}
@@ -1121,6 +1137,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 
 static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *blkcnt_out)
 {
+	sdmmc->command_failure = DdrCommandInhibit;
 	int has_req_or_check_busy = req || cmd->check_busy;
 	if (!_sdmmc_wait_cmd_data_inhibit(sdmmc, has_req_or_check_busy))
 		return 0;
@@ -1129,6 +1146,7 @@ static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_
 	bool is_data_present = false;
 	if (req)
 	{
+		sdmmc->command_failure = DdrCommandDmaSetup;
 		if (!_sdmmc_config_dma(sdmmc, &blkcnt, req))
 			return 0;
 
@@ -1154,6 +1172,7 @@ static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_
 
 	_sdmmc_enable_interrupts(sdmmc);
 
+	sdmmc->command_failure = DdrCommandResponse;
 	if (!_sdmmc_send_cmd(sdmmc, cmd, is_data_present))
 		return 0;
 
@@ -1168,8 +1187,10 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 			result = _sdmmc_cache_rsp(sdmmc, sdmmc->rsp, 0x10, cmd->rsp_type);
 		}
 
-		if (req && result)
+		if (req && result) {
+			sdmmc->command_failure = DdrCommandTransfer;
 			result = _sdmmc_update_dma(sdmmc);
+		}
 	}
 
 	_sdmmc_mask_interrupts(sdmmc);
@@ -1202,8 +1223,10 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 				sdmmc->rsp3 = sdmmc->regs->rspreg3;
 		}
 
-		if (cmd->check_busy || req)
+		if (cmd->check_busy || req) {
+			sdmmc->command_failure = DdrCommandBusy;
 			return _sdmmc_wait_card_busy(sdmmc);
+		}
 	}
 
 	return result;
@@ -1552,6 +1575,8 @@ void sdmmc_init_cmd(sdmmc_cmd_t *cmdbuf, u16 cmd, u32 arg, u32 rsp_type, u32 che
 
 int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *blkcnt_out)
 {
+	sdmmc->command_failure = DdrCommandClock;
+	sdmmc->command_irq = 0;
 	if (!sdmmc->card_clock_enabled)
 		return 0;
 

@@ -36,6 +36,11 @@ sdmmc_accessor_t *_current_accessor = NULL;
 bool sdmmc_memcpy_buf = false;
 extern bool custom_driver;
 
+#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+/* Keep the last stable DDR200 profile across native FS reopen and suspend. */
+static bool sd_ddr200_reduced;
+#endif
+
 static inline u32 unstuff_bits(u32 *resp, u32 start, u32 size)
 {
 	const u32 mask = (size < 32 ? 1 << size : 0) - 1;
@@ -275,8 +280,15 @@ static int _sdmmc_storage_readwrite_ex(sdmmc_storage_t *storage, u32 *blkcnt_out
 
 	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, blkcnt_out))
 	{
+		sdmmc_t *host = storage->sdmmc;
+		u32 failure = host->command_failure;
+		u32 irq = host->command_irq;
+		if (host->id == SDMMC_1)
+			ddr_trace_io_error(host, cmdbuf.cmd, num_sectors);
 		sdmmc_stop_transmission(storage->sdmmc, &tmp);
 		_sdmmc_storage_get_status(storage, &tmp, 0);
+		host->command_failure = failure;
+		host->command_irq = irq;
 
 		return 0;
 	}
@@ -326,6 +338,12 @@ reinit_try:
 		/* Do not downgrade or clobber a pending write via initialization DMA. */
 		if (!first_reinit || is_write)
 			return 0;
+		/* A setup failure will not be fixed by changing the card clock. */
+		if (storage->sdmmc->command_failure == DdrCommandDmaSetup)
+			return 0;
+		if (storage->sdmmc->id == SDMMC_1 && storage->csd.busspeed == 200 &&
+		    storage->sdmmc->command_failure >= DdrCommandResponse)
+			sd_ddr200_reduced = true;
 #endif
 		// Disk IO failure! Reinit SD Card to a lower speed.
 		if (storage->sdmmc->id == SDMMC_1)
@@ -1143,6 +1161,29 @@ DPRINTF("[SD] card max current over limit\n");
 }
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+static int _sd_storage_train_DDR200(sdmmc_storage_t *storage)
+{
+	sdmmc_t *host = storage->sdmmc;
+	for (unsigned attempt = 0; attempt < 2; ++attempt) {
+		ddr_trace_stage(DdrSetClock, sd_ddr200_reduced);
+		if (!sdmmc_setup_ddr200_clock(host, sd_ddr200_reduced))
+			return 0;
+		/* Changing the source keeps the card in DDR200 and the host in
+		   DDR50 signaling. Each clock needs its own measured passing tap. */
+		if (sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK)) {
+			ddr_trace_stage(DdrCheckStatus, host->divisor);
+			if (_sdmmc_storage_check_status(storage)) {
+				ddr_trace_stage(DdrReady, host->divisor);
+				return 1;
+			}
+		}
+		if (sd_ddr200_reduced)
+			break;
+		sd_ddr200_reduced = true;
+	}
+	return 0;
+}
+
 int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf)
 {
 	u32 cmd_system = UHS_DDR200_BUS_SPEED;
@@ -1175,17 +1216,7 @@ DPRINTF("[SD] card max current over limit\n");
 		return 0;
 DPRINTF("[SD] card accepted DDR200\n");
 
-	ddr_trace_stage(DdrSetClock, 0);
-	if (!sdmmc_setup_clock(storage->sdmmc, SDHCI_TIMING_UHS_DDR200))
-		return 0;
-DPRINTF("[SD] after setup clock DDR200\n");
-
-	if (!sdmmc_tuning_execute(storage->sdmmc, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK))
-		return 0;
-DPRINTF("[SD] after tuning DDR200\n");
-
-	ddr_trace_stage(DdrCheckStatus, 0);
-	return _sdmmc_storage_check_status(storage);
+	return _sd_storage_train_DDR200(storage);
 }
 #endif
 
@@ -1513,7 +1544,7 @@ DPRINTF("[SD] enabled HS\n");
 		return 0;
 #endif
 	storage->initialized = 1;
-	ddr_trace_stage(DdrReady, storage->csd.busspeed);
+	ddr_trace_stage(DdrReady, sdmmc->divisor);
 
 	return 1;
 }

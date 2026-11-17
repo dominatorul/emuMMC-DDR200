@@ -201,6 +201,8 @@
 #ifndef EMUMMC_DDR200_SRC_KHZ
 #define EMUMMC_DDR200_SRC_KHZ 400000
 #endif
+#define SDMMC_DDR200_RECOVERY_SRC_KHZ 333000
+#define SDMMC_DDR200_RECOVERY_CARD_KHZ 166400
 
 #define SDMMC_HW_TAP_TUNING       0x100
 #define SDMMC_INVALID_TAP         0x100
@@ -228,6 +230,8 @@ typedef struct _sdmmc_t
 	int venclkctl_set;
 	u32 venclkctl_tap;
 	u32 expected_rsp_type;
+	u32 command_irq;
+	u32 command_failure;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
 	u32 rsp[4];
@@ -262,6 +266,9 @@ u32  sdmmc_get_bus_width(sdmmc_t *sdmmc);
 void sdmmc_set_bus_width(sdmmc_t *sdmmc, u32 bus_width);
 void sdmmc_save_tap_value(sdmmc_t *sdmmc);
 int  sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type);
+#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+int  sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced);
+#endif
 void sdmmc_card_clock_powersave(sdmmc_t *sdmmc, int powersave_enable);
 int  sdmmc_get_rsp(sdmmc_t *sdmmc, u32 *rsp, u32 size, u32 type);
 int  sdmmc_tuning_execute(sdmmc_t *sdmmc, u32 type, u32 cmd);

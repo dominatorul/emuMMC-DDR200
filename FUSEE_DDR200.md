@@ -10,6 +10,13 @@ The last Hekate test, report `0000000000a49f0b`, reached DDR200, completed
 The center moved from tap 40 to 33 and the measured width dropped from 17 to 5.
 The log showed changes in clock source, host mode, divider and tap.
 
+Fusee report `0000000000bf143a` ended with `DD200063` after 3,102 reads, 81
+writes, three reassert attempts and five completed sweeps. CMD6 confirmed
+command system 14 and Access Mode 0. Initial and final sweeps had identical SD
+clock, host mode, pad, pinmux and calibration values. The window again shrank
+from 17 taps at center 40 to 5 taps at center 33. This narrowed window persists
+after resetting Access Mode and using the official Fusee boot path.
+
 Hekate and L4T use CMD6 vendor command-system function 14 with the Access Mode
 group at SDR12. Native FS can configure that group during SD open. The new build
 returns the host and card to low-clock SDR12 before reselecting DDR200 during
@@ -18,7 +25,17 @@ forces a fresh DDR200 initialization. Recovery preserves the 512-byte DMA
 scratch sector. The capture includes the original and latest sweeps, card CMD6
 status, registers before and after native open, and the reassert entry state.
 
-Use **More Configs → Fusee DDR200 debug (1.11.2)**. The entry chainloads the
+The driver tries 199.68 MHz first. If the sweep or card status check fails, it
+repeats tuning with the original fork's 166.4 MHz clock setting in the same
+vendor DDR200 mode. A read that repeatedly fails during command response or
+transfer recovery can also retry using this clock, after one full DDR200 card
+reinitialization. A successful reduced clock setting is retained through
+subsequent reopens and resume for that boot. Both clocks require eight passing
+taps and a valid card status response. The updated trace saves the measured
+clock and window at each rate plus the first and latest failed data commands
+and interrupt status, before command cleanup overwrites that status.
+
+Use **More Configs → Fusee DDR200 recovery (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
@@ -30,3 +47,11 @@ Decode this build's report with `python3 tools/read-ddr-trace.py report_*.bin`
 using a report from the Fusee test. `DD200062` means DDR200 recovery failed.
 `DD200063` and `DD200064` identify read and write failure, `DD200065` is a manual
 snapshot, and `DD200066` is a clock lock or clock ownership error.
+
+Host regression check for tuning and read recovery:
+
+    clang -std=gnu2x -O1 -g -ffunction-sections -fdata-sections \
+        -fsanitize=address,undefined -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT \
+        -DEMUMMC_FORCE_DDR200 -DINNER_HEAP_SIZE=0x8000 tests/test_ddr200_recovery.c \
+        -Wl,--gc-sections -o /tmp/test_ddr200_recovery
+    UBSAN_OPTIONS=halt_on_error=1 /tmp/test_ddr200_recovery

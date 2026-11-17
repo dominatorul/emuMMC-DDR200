@@ -12,6 +12,8 @@ STAGES = (
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
+COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
+                    'command response', 'DMA transfer', 'card busy')
 REGISTERS = (
     'flags', 'CAR.source', 'CAR.pllc4_base', 'CAR.pllc4_misc', 'CAR.reset_l', 'CAR.enable_l',
     'pad.drive', 'pad.loopback', 'pinmux.clk', 'pinmux.cmd', 'pinmux.dat0', 'card.power_gpio',
@@ -27,25 +29,42 @@ def decode(path):
         raise ValueError(f'{path} is too short for a DDR200 trace')
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
-    if magic != 0x32454641 or gprs[0] != 0x4444523230300006:
+    if magic != 0x32454641 or gprs[0] not in (0x4444523230300006, 0x4444523230300007):
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
+    has_rates = gprs[0] == 0x4444523230300007
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
     print(f'Completed reads {gprs[2] >> 32}, writes {gprs[2] & 0xFFFFFFFF}')
     print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {gprs[3] & 0xFFFFFFFF}')
 
-    for label, window, mode, offset in (
-        ('Initial', gprs[4] >> 32, gprs[5], 0x50),
-        ('Latest', gprs[4] & 0xFFFFFFFF, gprs[6], 0x70),
+    for label, window, mode, offset, khz in (
+        ('Initial', gprs[4] >> 32, gprs[5], 0x50, gprs[7] >> 32),
+        ('Latest', gprs[4] & 0xFFFFFFFF, gprs[6], 0x70, gprs[7] & 0xFFFFFFFF),
     ):
-        print(f'{label} sweep: {window & 0x1FF} taps, center {(window >> 9) & 0xFF}, width {window >> 17}')
+        rate = f' at {khz / 1000:.2f} MHz' if has_rates else ''
+        print(f'{label} sweep{rate}: {window & 0x1FF} taps, center {(window >> 9) & 0xFF}, width {window >> 17}')
         for name, word in (('query', mode >> 32), ('set DDR200', mode & 0xFFFFFFFF)):
             print(f'  CMD6 {name}: command system {word >> 28:#x}, access mode {(word >> 24) & 0xF:#x}, '
                   f'group 2 support {word & 0xFFFF:#06x}, access support {(word >> 16) & 0xFF:#04x}')
         vals = struct.unpack_from('<8I', data, offset)
         print('  Comparator map: ' + ' '.join(f'{v:08X}' for v in vals[:4]))
         print('  Completed and passing: ' + ' '.join(f'{v:08X}' for v in vals[4:]))
+
+    if has_rates:
+        print(f'Last verified DDR200 clock {(gprs[16] & 0xFFFFFFFF) / 1000:.2f} MHz')
+        for name, val in (('Full rate', gprs[23] >> 32), ('Reduced clock', gprs[23] & 0xFFFFFFFF)):
+            if val:
+                print(f'{name} latest window: center {(val >> 9) & 0xFF}, width {val >> 17}')
+        print(f'Failed data commands {gprs[16] >> 32}')
+        if gprs[16] >> 32:
+            for label, start in (('First', 17), ('Latest', 20)):
+                op, rate_irq, state = gprs[start:start + 3]
+                phase = op >> 32
+                print(f'{label} failure: CMD{op & 0xFFFFFFFF}, '
+                      f'{COMMAND_FAILURES[phase] if phase < len(COMMAND_FAILURES) else phase}, '
+                      f'{(rate_irq >> 32) / 1000:.2f} MHz, error {(rate_irq >> 16) & 0xFFFF:04X}, '
+                      f'IRQ {rate_irq & 0xFFFF:04X}, present state {state >> 32:08X}, blocks {state & 0xFFFFFFFF}')
 
     # AFE2 stack-trace and stack-dump regions carry the snapshots.
     states = {}
