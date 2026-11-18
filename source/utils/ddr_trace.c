@@ -9,7 +9,7 @@
 #include "../soc/pinmux.h"
 #include "../soc/t210.h"
 
-enum { SnapshotWords = 24 };
+enum { SnapshotWords = 24, SweepHistoryLength = 8 };
 static _Atomic u32 snapshots[DdrSnapshotCount][SnapshotWords];
 static _Atomic u32 power_pins[DdrSnapshotCount][3];
 static _Atomic u32 first_maps[8], latest_maps[8];
@@ -20,6 +20,9 @@ static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
 static _Atomic u32 last_full_window, last_reduced_window;
 static _Atomic u32 boot_power_recoveries;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
+static _Atomic u64 first_error_hw, latest_error_hw;
+static _Atomic u32 read_recovery_attempts, read_recovery_successes, read_recovery_tap;
+static _Atomic u32 sweep_history[SweepHistoryLength];
 /* SD commands include both the SD filesystem and emulated NAND. The outer
    FS counters select only SD filesystem I/O, including mutex wait time. */
 enum { PerfCalls, PerfBlocks, PerfElapsed, PerfDma, PerfBounce, PerfErrors, PerfFields };
@@ -86,6 +89,10 @@ void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 ta
         atomic_store_explicit(&latest_maps[i], raw[i], memory_order_relaxed);
         atomic_store_explicit(&latest_maps[i + 4], complete[i], memory_order_relaxed);
     }
+    /* Each entry includes the reassert and failed-command counts when sampled. */
+    sweep_history[sweeps % SweepHistoryLength] = tap | (width << 8) |
+        ((u32)(khz == SDMMC_DDR200_RECOVERY_CARD_KHZ) << 16) |
+        (MIN(attempts, 127u) << 17) | (MIN(io_errors, 255u) << 24);
     if (++sweeps == 1) {
         first_window = latest_window;
         first_khz = khz;
@@ -118,9 +125,23 @@ void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
     latest_io_error[0] = ((u64)host->command_failure << 32) | command;
     latest_io_error[1] = ((u64)host->divisor << 32) | host->command_irq;
     latest_io_error[2] = ((u64)host->regs->prnsts << 32) | blocks;
-    if (++io_errors == 1)
+    latest_error_hw = ((u64)host->regs->venclkctl << 32) |
+        ((u32)host->regs->hostctl2 << 16) | host->command_auto_stop_error;
+    if (++io_errors == 1) {
         for (u32 i = 0; i < 3; ++i)
             first_io_error[i] = latest_io_error[i];
+        first_error_hw = latest_error_hw;
+    }
+}
+
+void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded)
+{
+    if (succeeded) {
+        read_recovery_tap = (host->regs->venclkctl >> 16) & 0xFF;
+        ++read_recovery_successes;
+    } else {
+        ++read_recovery_attempts;
+    }
 }
 
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
@@ -165,7 +186,7 @@ void ddr_trace_boot_power(void)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x444452323030000Aull;
+    ctx->gprs[0] = 0x444452323030000Bull;
     ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
@@ -186,6 +207,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     /* Use reserved report space while leaving actual stack lengths zero. */
     ddr_watchdog_report(&ctx->gprs[24]);
     ctx->gprs[28] = boot_power_recoveries;
+    ctx->gprs[29] = first_error_hw;
+    ctx->gprs[30] = latest_error_hw;
+    ctx->gprs[31] = ((u64)read_recovery_tap << 56) |
+        ((u64)MIN(read_recovery_successes, 0xFFFFFFu) << 32) | read_recovery_attempts;
     u32 saved[DdrSnapshotCount][SnapshotWords];
     for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
         saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
@@ -213,7 +238,12 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     u32 clocks[5];
     for (u32 i = 0; i < 5; ++i)
         clocks[i] = atomic_load_explicit(&perf_clock[i], memory_order_relaxed);
-    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks) <= sizeof(ctx->tls), "performance trace too large");
+    u32 history[SweepHistoryLength];
+    for (u32 i = 0; i < SweepHistoryLength; ++i)
+        history[i] = atomic_load_explicit(&sweep_history[i], memory_order_relaxed);
+    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks) + sizeof(history)
+        <= sizeof(ctx->tls), "performance and sweep trace too large");
     memcpy(ctx->tls + sizeof(pins), performance, sizeof(performance));
     memcpy(ctx->tls + sizeof(pins) + sizeof(performance), clocks, sizeof(clocks));
+    memcpy(ctx->tls + sizeof(pins) + sizeof(performance) + sizeof(clocks), history, sizeof(history));
 }

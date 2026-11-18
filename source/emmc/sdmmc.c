@@ -37,8 +37,10 @@ bool sdmmc_memcpy_buf = false;
 extern bool custom_driver;
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+#ifndef EMUMMC_FORCE_DDR200
 /* Keep the last stable DDR200 profile across native FS reopen and suspend. */
 static bool sd_ddr200_reduced;
+#endif
 static int _sd_storage_train_DDR200(sdmmc_storage_t *storage);
 #endif
 
@@ -308,6 +310,48 @@ int sdmmc_storage_end(sdmmc_storage_t *storage)
 	return idle;
 }
 
+#ifdef EMUMMC_FORCE_DDR200
+static bool _sd_storage_ddr200_ready_for_retry(const sdmmc_storage_t *storage)
+{
+	sdmmc_t *host = storage->sdmmc;
+	return host->id == SDMMC_1 && storage->csd.busspeed == 200 &&
+		sdmmc_get_sd_power_enabled() && clock_sdmmc_is_not_reset_and_enabled(SDMMC_1) &&
+		(host->regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED &&
+		sdmmc_get_io_power(host) == SDMMC_POWER_1_8 &&
+		sdmmc_get_bus_width(host) == SDMMC_BUS_WIDTH_4;
+}
+
+static bool _sdmmc_read_timing_error(const sdmmc_t *host)
+{
+	return host->command_failure == DdrCommandTransfer &&
+		((host->command_irq >> 16) & (SDHCI_ERR_INT_DATA_CRC | SDHCI_ERR_INT_DATA_END_BIT));
+}
+
+static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
+{
+	sdmmc_t *host = storage->sdmmc;
+	ddr_trace_read_recovery(host, false);
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+	int tuned = _sd_storage_train_DDR200(storage);
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+	if (!tuned)
+		return 0;
+
+	/* A passing tuning pattern is necessary, then the original read verifies
+	   the tap under normal DMA and clock gating. */
+	for (u32 attempt = 0; ; ++attempt) {
+		if (_sdmmc_storage_readwrite_ex(storage, blocks, sector, count, buf, 0)) {
+			ddr_trace_read_recovery(host, true);
+			return 1;
+		}
+		if (attempt == host->ddr200_retry_count || !_sdmmc_read_timing_error(host) ||
+		    !_sd_storage_ddr200_ready_for_retry(storage))
+			return 0;
+		sdmmc_set_ddr200_tap(host, host->ddr200_retry_taps[attempt]);
+	}
+}
+#endif
+
 static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf, u32 is_write)
 {
 	u8 *bbuf = (u8 *)buf;
@@ -322,42 +366,39 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 	while (sct_total)
 	{
 		u32 blkcnt = 0;
+		u32 count = MIN(sct_total, 0xFFFF);
+#ifdef EMUMMC_FORCE_DDR200
+		sdmmc_t *host = storage->sdmmc;
+#endif
 		// Retry 5 times if failed.
 		u32 retries = 5;
 		do
 		{
+#ifndef EMUMMC_FORCE_DDR200
 reinit_try:
-			if (_sdmmc_storage_readwrite_ex(storage, &blkcnt, sct_off, MIN(sct_total, 0xFFFF), bbuf, is_write))
+#endif
+			if (_sdmmc_storage_readwrite_ex(storage, &blkcnt, sct_off, count, bbuf, is_write))
 				goto out;
-			else
-				retries--;
+#ifdef EMUMMC_FORCE_DDR200
+			if (!is_write && _sdmmc_read_timing_error(host) && _sd_storage_ddr200_ready_for_retry(storage))
+				break;
+#endif
+			retries--;
 
 			msleep(50);
 		} while (retries);
 
 #ifdef EMUMMC_FORCE_DDR200
-		/* PCV owns the PMIC after startup. Retry only reads, and retune an
-		   already powered DDR200 card without resetting voltage or power. */
-		sdmmc_t *host = storage->sdmmc;
-		if (!first_reinit || is_write || host->id != SDMMC_1 ||
-		    storage->csd.busspeed != 200 || host->command_failure < DdrCommandResponse ||
-		    !sdmmc_get_sd_power_enabled() || !clock_sdmmc_is_not_reset_and_enabled(SDMMC_1) ||
-		    (host->regs->hostctl2 & 7) != UHS_DDR50_BUS_SPEED ||
-		    sdmmc_get_io_power(host) != SDMMC_POWER_1_8 ||
-		    sdmmc_get_bus_width(host) != SDMMC_BUS_WIDTH_4)
+		/* PCV owns card power after startup. Keep recovery to a single
+		   retune of the powered card and retry only read transfers. */
+		if (!first_reinit || is_write || host->command_failure < DdrCommandResponse ||
+		    !_sd_storage_ddr200_ready_for_retry(storage))
 			return 0;
-
-		sd_ddr200_reduced = true;
-		sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-		int tuned = _sd_storage_train_DDR200(storage);
-		sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
-		if (!tuned)
-			return 0;
-
 		blkcnt = 0;
-		retries = 3;
 		first_reinit = false;
-		goto reinit_try;
+		if (!_sd_storage_retry_DDR200_read(storage, &blkcnt, sct_off, count, bbuf))
+			return 0;
+		goto out;
 #else
 		// Disk IO failure! Reinit SD Card to a lower speed.
 		if (storage->sdmmc->id == SDMMC_1)
@@ -380,6 +421,7 @@ reinit_try:
 				bbuf = (u8 *)buf;
 				sct_off = sector;
 				sct_total = num_sectors;
+				count = MIN(sct_total, 0xFFFF);
 
 				goto reinit_try;
 			}
@@ -1176,27 +1218,36 @@ DPRINTF("[SD] card max current over limit\n");
 }
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
-static int _sd_storage_train_DDR200(sdmmc_storage_t *storage)
+static int _sd_storage_train_DDR200_clock(sdmmc_storage_t *storage, bool reduced)
 {
 	sdmmc_t *host = storage->sdmmc;
-	for (unsigned attempt = 0; attempt < 2; ++attempt) {
-		ddr_trace_stage(DdrSetClock, sd_ddr200_reduced);
-		if (!sdmmc_setup_ddr200_clock(host, sd_ddr200_reduced))
-			return 0;
-		/* Changing the source keeps the card in DDR200 and the host in
-		   DDR50 signaling. Each clock needs its own measured passing tap. */
-		if (sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK)) {
-			ddr_trace_stage(DdrCheckStatus, host->divisor);
-			if (_sdmmc_storage_check_status(storage)) {
-				ddr_trace_stage(DdrReady, host->divisor);
-				return 1;
-			}
-		}
-		if (sd_ddr200_reduced)
-			break;
-		sd_ddr200_reduced = true;
-	}
-	return 0;
+	ddr_trace_stage(DdrSetClock, reduced);
+	if (!sdmmc_setup_ddr200_clock(host, reduced) ||
+	    !sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK))
+		return 0;
+	ddr_trace_stage(DdrCheckStatus, host->divisor);
+	if (!_sdmmc_storage_check_status(storage))
+		return 0;
+	ddr_trace_stage(DdrReady, host->divisor);
+	return 1;
+}
+
+static int _sd_storage_train_DDR200(sdmmc_storage_t *storage)
+{
+#ifdef EMUMMC_FORCE_DDR200
+	if (_sd_storage_train_DDR200_clock(storage, false))
+		return 1;
+
+	/* Native FS can leave different pad state. Restore the same settings
+	   used by reassertion, then give full rate one fresh sweep. */
+	sdmmc_ddr200_restore_host_cfg(storage->sdmmc);
+	return _sd_storage_train_DDR200_clock(storage, false);
+#else
+	if (!sd_ddr200_reduced && _sd_storage_train_DDR200_clock(storage, false))
+		return 1;
+	sd_ddr200_reduced = true;
+	return _sd_storage_train_DDR200_clock(storage, true);
+#endif
 }
 
 int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf)

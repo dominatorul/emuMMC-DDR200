@@ -740,6 +740,17 @@ static void _sdmmc_manual_tuning_log(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *tuni
 	_sdmmc_tuning_log_id++;
 }
 
+void sdmmc_set_ddr200_tap(sdmmc_t *sdmmc, u32 tap)
+{
+	u16 clock = sdmmc->regs->clkcon;
+	sdmmc->regs->clkcon &= ~SDHCI_CLOCK_CARD_EN;
+	sdmmc->regs->ventunctl0 &= ~TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
+	sdmmc->regs->venclkctl = (sdmmc->regs->venclkctl & 0xFF00FFFF) | (tap << 16);
+	sdmmc->regs->ventunctl0 |= TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
+	sdmmc->regs->clkcon = clock;
+	_sdmmc_commit_changes(sdmmc);
+}
+
 static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *tuning)
 {
 	u32 best_size;
@@ -749,17 +760,24 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 
 	_sdmmc_manual_tuning_log(sdmmc, tuning, best_tap, best_size, pass);
 
+	sdmmc->ddr200_retry_count = 0;
 	if (!pass)
 		return 0;
 
-	sdmmc->regs->clkcon     &= ~SDHCI_CLOCK_CARD_EN;
-	sdmmc->regs->ventunctl0 &= ~TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
-
-	sdmmc->regs->venclkctl   = (sdmmc->regs->venclkctl & 0xFF00FFFF) | (best_tap << 16);
-
-	sdmmc->regs->ventunctl0 |=  TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
-	sdmmc->regs->clkcon     |= SDHCI_CLOCK_CARD_EN;
-
+#ifdef EMUMMC_FORCE_DDR200
+	/* On a read CRC error, try a separate passing window first, then two
+	   interior taps from the winning window. Keep the eight-tap minimum. */
+	u32 start = best_tap - (best_size - 1) / 2;
+	for (u32 tap = start; tap < start + best_size; ++tap)
+		tuning->result[tap / 32] &= ~(1u << (tap % 32));
+	u32 other_size;
+	u32 other_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &other_size);
+	if (other_size >= SDMMC_SAMPLE_WIN_SIZE_MIN)
+		sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = other_tap;
+	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = best_tap - best_size / 4;
+	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = best_tap + best_size / 4;
+#endif
+	sdmmc_set_ddr200_tap(sdmmc, best_tap);
 	return 1;
 }
 
@@ -962,6 +980,8 @@ DPRINTF("norintsts %08X, errintsts %08X\n", norintsts, errintsts);
 	if (norintsts & SDHCI_INT_ERROR)
 	{
 		sdmmc->command_irq = ((u32)errintsts << 16) | norintsts;
+		if (errintsts & SDHCI_ERR_INT_AUTO_CMD_ERR)
+			sdmmc->command_auto_stop_error = sdmmc->regs->acmd12errsts;
 		sdmmc->regs->errintsts = errintsts;
 		return SDMMC_MASKINT_ERROR;
 	}
@@ -1587,6 +1607,7 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 {
 	sdmmc->command_failure = DdrCommandClock;
 	sdmmc->command_irq = 0;
+	sdmmc->command_auto_stop_error = 0;
 	if (!sdmmc->card_clock_enabled)
 		return 0;
 	bool sample = sdmmc->id == SDMMC_1 && req && req->blksize == 512 &&

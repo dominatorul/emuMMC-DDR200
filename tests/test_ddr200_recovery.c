@@ -6,7 +6,11 @@ static t210_sdmmc_t regs;
 static sdmmc_t host = { .regs = &regs, .id = SDMMC_1, .divisor = 199680 };
 static sdmmc_storage_t card = { .sdmmc = &host, .initialized = 1 };
 static unsigned full_setups, reduced_setups, card_checks, io_errors;
-static bool full_tunes, reduced_tunes, full_status, read_after_retune, powered;
+static unsigned tap_changes, recovery_attempts, recovery_successes;
+static bool full_tunes, full_status, powered;
+static bool train_after_restore;
+static unsigned host_restores;
+static u32 accepted_tap;
 static u32 io_failure;
 
 int sdmmc_setup_ddr200_clock(sdmmc_t *target, bool reduced)
@@ -22,7 +26,27 @@ int sdmmc_tuning_execute(sdmmc_t *target, u32 timing, u32 command)
 {
     assert(target == &host && timing == SDHCI_TIMING_UHS_DDR200);
     assert(command == MMC_SEND_TUNING_BLOCK);
-    return target->divisor == 166400 ? reduced_tunes : full_tunes;
+    assert(target->divisor == 199680 && !host.powersave_enabled);
+    host.ddr200_retry_taps[0] = 85;
+    host.ddr200_retry_taps[1] = 36;
+    host.ddr200_retry_taps[2] = 44;
+    host.ddr200_retry_count = 3;
+    regs.venclkctl = 40 << 16;
+    return full_tunes || (train_after_restore && host_restores);
+}
+
+void sdmmc_ddr200_restore_host_cfg(sdmmc_t *target)
+{
+    assert(target == &host && !host.powersave_enabled);
+    ++host_restores;
+}
+
+void sdmmc_set_ddr200_tap(sdmmc_t *target, u32 tap)
+{
+    assert(target == &host && host.powersave_enabled);
+    assert(tap_changes < 3 && tap == host.ddr200_retry_taps[tap_changes]);
+    ++tap_changes;
+    regs.venclkctl = tap << 16;
 }
 
 void sdmmc_init_cmd(sdmmc_cmd_t *cmd, u16 code, u32 arg, u32 response, u32 busy)
@@ -38,7 +62,7 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *request, u
         ++card_checks;
         return host.divisor == 166400 || full_status;
     }
-    if (read_after_retune && reduced_setups && !request->is_write) {
+    if (accepted_tap == regs.venclkctl >> 16 && full_setups && !request->is_write) {
         *blocks = 1;
         return 1;
     }
@@ -82,16 +106,27 @@ void ddr_trace_io_error(const sdmmc_t *target, u32 cmd, u32 blocks)
     ++io_errors;
 }
 
+void ddr_trace_read_recovery(const sdmmc_t *target, bool succeeded)
+{
+    assert(target == &host);
+    if (succeeded) ++recovery_successes;
+    else ++recovery_attempts;
+}
+
 static void reset(void)
 {
     host.divisor = 199680;
     regs.hostctl2 = UHS_DDR50_BUS_SPEED;
+    regs.venclkctl = 40 << 16;
     host.powersave_enabled = SDMMC_POWER_SAVE_ENABLE;
     card.csd.busspeed = 200;
-    sd_ddr200_reduced = false;
+    host.ddr200_retry_count = 0;
     full_setups = reduced_setups = card_checks = io_errors = 0;
-    full_tunes = reduced_tunes = full_status = true;
-    read_after_retune = false;
+    tap_changes = recovery_attempts = recovery_successes = 0;
+    host_restores = 0;
+    full_tunes = full_status = true;
+    train_after_restore = false;
+    accepted_tap = SDMMC_INVALID_TAP;
     powered = true;
     io_failure = DdrCommandTransfer;
 }
@@ -99,49 +134,66 @@ static void reset(void)
 int main(void)
 {
     reset();
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
     assert(_sd_storage_train_DDR200(&card));
     assert(full_setups == 1 && reduced_setups == 0 && card_checks == 1);
 
     reset();
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
     full_tunes = false;
-    assert(_sd_storage_train_DDR200(&card));
-    assert(full_setups == 1 && reduced_setups == 1 && host.divisor == 166400);
-    assert(_sd_storage_train_DDR200(&card));
-    assert(full_setups == 1 && reduced_setups == 2);
-
-    reset();
-    full_tunes = reduced_tunes = false;
     assert(!_sd_storage_train_DDR200(&card));
-    assert(full_setups == 1 && reduced_setups == 1 && card_checks == 0);
+    assert(full_setups == 2 && reduced_setups == 0 && card_checks == 0 && host_restores == 1);
 
     reset();
-    full_status = false;
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    full_tunes = false;
+    train_after_restore = true;
     assert(_sd_storage_train_DDR200(&card));
-    assert(reduced_setups == 1 && card_checks == 2);
+    assert(full_setups == 2 && reduced_setups == 0 && card_checks == 1 && host_restores == 1);
+
+    reset();
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    full_status = false;
+    assert(!_sd_storage_train_DDR200(&card));
+    assert(full_setups == 2 && reduced_setups == 0 && card_checks == 2 && host_restores == 1);
 
     u8 buffer[512] = {0};
     reset();
-    read_after_retune = true;
+    accepted_tap = 40;
     assert(_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reduced_setups == 1 && io_errors == 5 && host.powersave_enabled);
+    assert(full_setups == 1 && reduced_setups == 0 && io_errors == 1);
+    assert(recovery_attempts == 1 && recovery_successes == 1 && tap_changes == 0);
+
+    reset();
+    accepted_tap = 36;
+    assert(_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
+    assert(full_setups == 1 && reduced_setups == 0 && io_errors == 3);
+    assert(recovery_attempts == 1 && recovery_successes == 1 && tap_changes == 2);
+    assert(regs.venclkctl >> 16 == 36 && host.powersave_enabled);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reduced_setups == 1 && io_errors == 8 && host.powersave_enabled);
+    assert(full_setups == 1 && reduced_setups == 0 && io_errors == 5 && host.powersave_enabled);
+    assert(recovery_attempts == 1 && !recovery_successes && tap_changes == 3);
+
+    reset();
+    full_tunes = false;
+    assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
+    assert(full_setups == 2 && reduced_setups == 0 && io_errors == 1 && tap_changes == 0);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 1));
-    assert(reduced_setups == 0 && !sd_ddr200_reduced);
+    assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts);
 
     reset();
     io_failure = DdrCommandDmaSetup;
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reduced_setups == 0 && !sd_ddr200_reduced);
+    assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts);
 
     reset();
     powered = false;
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reduced_setups == 0 && !sd_ddr200_reduced);
+    assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts);
 
-    puts("DDR200 recovery: powered read retune, bounded retry, and no raw SD reinitialization passed");
+    puts("DDR200 recovery: full-rate retraining, alternate taps, and bounded read-only recovery passed");
 }

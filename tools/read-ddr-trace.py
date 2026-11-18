@@ -16,6 +16,8 @@ SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native 
 PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
 PERF_TOTALS = struct.Struct('<18Q')
 PERF_CLOCK = struct.Struct('<5I')
+SWEEP_OFFSET = PERF_OFFSET + PERF_TOTALS.size + PERF_CLOCK.size
+SWEEP_HISTORY = struct.Struct('<8I')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
@@ -59,12 +61,14 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9, 10):
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9, 10, 11):
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
-    if trace_version >= 10 and len(data) < PERF_OFFSET + PERF_TOTALS.size + PERF_CLOCK.size:
+    if trace_version >= 10 and len(data) < SWEEP_OFFSET:
         raise ValueError(f'{path} is too short for a performance trace')
+    if trace_version >= 11 and len(data) < SWEEP_OFFSET + SWEEP_HISTORY.size:
+        raise ValueError(f'{path} is too short for a sweep history')
     has_rates = trace_version >= 7
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
@@ -74,7 +78,8 @@ def decode(path):
     if stage == STAGES.index('native SD power recovery') and gprs[1] & 0xFFFFFFFF == 0x218:
         print('  Native SDMMC ResultNoDevice (0x218)')
     print(f'Completed reads {gprs[2] >> 32}, writes {gprs[2] & 0xFFFFFFFF}')
-    print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {gprs[3] & 0xFFFFFFFF}')
+    sweeps = gprs[3] & 0xFFFFFFFF
+    print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {sweeps}')
 
     for label, window, mode, offset, khz in (
         ('Initial', gprs[4] >> 32, gprs[5], 0x50, gprs[7] >> 32),
@@ -103,6 +108,24 @@ def decode(path):
                       f'{COMMAND_FAILURES[phase] if phase < len(COMMAND_FAILURES) else phase}, '
                       f'{(rate_irq >> 32) / 1000:.2f} MHz, error {(rate_irq >> 16) & 0xFFFF:04X}, '
                       f'IRQ {rate_irq & 0xFFFF:04X}, present state {state >> 32:08X}, blocks {state & 0xFFFFFFFF}')
+                if trace_version >= 11:
+                    hw = gprs[29 if label == 'First' else 30]
+                    print(f'  Tap {(hw >> 48) & 0xFF}, host control 2 {(hw >> 16) & 0xFFFF:04X}, '
+                          f'Auto CMD12 status {hw & 0xFFFF:04X}')
+
+    if trace_version >= 11:
+        attempts = gprs[31] & 0xFFFFFFFF
+        recovered = (gprs[31] >> 32) & 0xFFFFFF
+        print(f'Full-rate read recoveries {recovered}/{attempts} successful')
+        if recovered:
+            print(f'Last recovered read passed at tap {gprs[31] >> 56}')
+        history = SWEEP_HISTORY.unpack_from(data, SWEEP_OFFSET)
+        for i in range(max(0, sweeps - len(history)), sweeps):
+            entry = history[i % len(history)]
+            clock = '166.40 MHz recovery' if entry & (1 << 16) else 'full rate'
+            print(f'Sweep {i + 1} at {clock}: center {entry & 0xFF}, '
+                  f'width {(entry >> 8) & 0xFF}, reassertions {(entry >> 17) & 0x7F}, '
+                  f'data errors {entry >> 24}')
 
     if trace_version >= 8:
         if trace_version >= 9:

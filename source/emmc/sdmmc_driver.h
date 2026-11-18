@@ -232,6 +232,9 @@ typedef struct _sdmmc_t
 	u32 expected_rsp_type;
 	u32 command_irq;
 	u32 command_failure;
+	u16 command_auto_stop_error;
+	u8 ddr200_retry_taps[3];
+	u8 ddr200_retry_count;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
 	u32 dma_boundaries_left;
@@ -269,6 +272,7 @@ void sdmmc_save_tap_value(sdmmc_t *sdmmc);
 int  sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type);
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 int  sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced);
+void sdmmc_set_ddr200_tap(sdmmc_t *sdmmc, u32 tap);
 #endif
 void sdmmc_card_clock_powersave(sdmmc_t *sdmmc, int powersave_enable);
 int  sdmmc_get_rsp(sdmmc_t *sdmmc, u32 *rsp, u32 size, u32 type);
