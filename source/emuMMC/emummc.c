@@ -22,6 +22,7 @@
 #include "emummc_ctx.h"
 #include "../utils/fatal.h"
 #include "../utils/ddr_trace.h"
+#include "../utils/ddr_watchdog.h"
 #include "../utils/log.h"
 #include "../nx/cache.h"
 #include "../soc/clock.h"
@@ -400,14 +401,20 @@ sdmmc_accessor_t *sdmmc_accessor_get(int mmc_id)
 
 void mutex_lock_handler(int mmc_id)
 {
-    if (custom_driver)
+    uintptr_t thread = (uintptr_t)armGetTls();
+    if (custom_driver) {
+        ddr_watchdog_phase(thread, DdrOpWaitSd);
         lock_mutex(sd_mutex);
+    }
 
+    ddr_watchdog_phase(thread, DdrOpWaitNand);
     lock_mutex(nand_mutex);
+    ddr_watchdog_phase(thread, DdrOpRunning);
 }
 
 void mutex_unlock_handler(int mmc_id)
 {
+    ddr_watchdog_phase((uintptr_t)armGetTls(), DdrOpUnlock);
     unlock_mutex(nand_mutex);
 
     if (custom_driver)
@@ -513,7 +520,7 @@ static uint64_t emummc_read_write_inner(void *buf, unsigned int sector, unsigned
 }
 
 // Controller open wrapper
-uint64_t sdmmc_wrapper_controller_open(int mmc_id)
+static uint64_t controller_open(int mmc_id)
 {
     uint64_t result;
     sdmmc_accessor_t *_this;
@@ -547,7 +554,7 @@ uint64_t sdmmc_wrapper_controller_open(int mmc_id)
 }
 
 // Controller close wrapper
-uint64_t sdmmc_wrapper_controller_close(int mmc_id)
+static uint64_t controller_close(int mmc_id)
 {
     sdmmc_accessor_t *_this;
     _this = sdmmc_accessor_get(mmc_id);
@@ -576,7 +583,7 @@ uint64_t sdmmc_wrapper_controller_close(int mmc_id)
 }
 
 // FS read wrapper.
-uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned int sector, unsigned int num_sectors)
+static uint64_t controller_read(void *buf, uint64_t bufSize, int mmc_id, unsigned int sector, unsigned int num_sectors)
 {
     sdmmc_accessor_t *_this;
     uint64_t read_res;
@@ -617,9 +624,6 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
 
         if (mmc_id == FS_SDMMC_SD)
         {
-            if (!gpio_read(GPIO_PORT_X, GPIO_PIN_6) && !gpio_read(GPIO_PORT_X, GPIO_PIN_7))
-                fatal_abort(Fatal_DdrSnapshot);
-
             static bool first_sd_read = true;
             if (first_sd_read)
             {
@@ -658,7 +662,7 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
 }
 
 // FS write wrapper.
-uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_sectors, void *buf, uint64_t bufSize)
+static uint64_t controller_write(int mmc_id, unsigned int sector, unsigned int num_sectors, void *buf, uint64_t bufSize)
 {
     sdmmc_accessor_t *_this;
     uint64_t write_res;
@@ -723,4 +727,36 @@ uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_s
     }
 
     fatal_abort(Fatal_WriteNoAccessor);
+}
+
+uint64_t sdmmc_wrapper_controller_open(int mmc_id)
+{
+    u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpOpen, mmc_id);
+    u64 result = controller_open(mmc_id);
+    ddr_watchdog_leave(slot);
+    return result;
+}
+
+uint64_t sdmmc_wrapper_controller_close(int mmc_id)
+{
+    u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpClose, mmc_id);
+    u64 result = controller_close(mmc_id);
+    ddr_watchdog_leave(slot);
+    return result;
+}
+
+uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned int sector, unsigned int num_sectors)
+{
+    u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpRead, mmc_id);
+    u64 result = controller_read(buf, bufSize, mmc_id, sector, num_sectors);
+    ddr_watchdog_leave(slot);
+    return result;
+}
+
+uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_sectors, void *buf, uint64_t bufSize)
+{
+    u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpWrite, mmc_id);
+    u64 result = controller_write(mmc_id, sector, num_sectors, buf, bufSize);
+    ddr_watchdog_leave(slot);
+    return result;
 }

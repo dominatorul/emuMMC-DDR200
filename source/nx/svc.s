@@ -69,6 +69,11 @@ SVC_BEGIN svcStartThread
 	RET
 SVC_END
 
+SVC_BEGIN svcSleepThread
+	SVC 0xB
+	RET
+SVC_END
+
 SVC_BEGIN svcExitThread
 	SVC 0xA
 	RET

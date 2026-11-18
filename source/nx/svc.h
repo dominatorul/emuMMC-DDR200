@@ -119,6 +119,7 @@ Result svcCreateThread(Handle* out, void* entry, void* arg, void* stack_top, int
  * @note Syscall number 0x09.
  */
 Result svcStartThread(Handle handle);
+void svcSleepThread(s64 nanoseconds);
 
 /**
  * @brief Exits the current thread.

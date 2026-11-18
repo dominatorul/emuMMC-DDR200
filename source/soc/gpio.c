@@ -86,6 +86,11 @@ void gpio_write(u32 port, u32 pins, int high)
 	(void)GPIO(port_offset); // Commit the write.
 }
 
+volatile const u32 *gpio_input_register(u32 port)
+{
+	return &GPIO(GPIO_IN_OFFSET(port));
+}
+
 int gpio_read(u32 port, u32 pins)
 {
 	u32 port_offset = GPIO_IN_OFFSET(port);

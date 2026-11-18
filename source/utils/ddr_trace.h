@@ -6,7 +6,7 @@
 enum DdrSnapshot { DdrInitialTune, DdrLatestTune, DdrBeforeOpen, DdrAfterOpen, DdrReassert, DdrSnapshotCount };
 enum DdrStage { DdrBoot, DdrInit, DdrReady, DdrNativeOpen, DdrCheckState,
     DdrReadFunctions, DdrCheckFunction, DdrSetFunction, DdrSetClock, DdrSweep,
-    DdrCheckStatus, DdrRead, DdrWrite, DdrSetSdr12 };
+    DdrCheckStatus, DdrRead, DdrWrite, DdrSetSdr12, DdrDma };
 enum DdrCommandFailure { DdrCommandClock = 1, DdrCommandInhibit, DdrCommandDmaSetup,
     DdrCommandResponse, DdrCommandTransfer, DdrCommandBusy };
 

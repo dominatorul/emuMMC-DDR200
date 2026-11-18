@@ -1,26 +1,28 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <string.h>
+#include <stdatomic.h>
 #include "ddr_trace.h"
+#include "ddr_watchdog.h"
 #include "util.h"
 #include "../soc/clock.h"
 #include "../soc/pinmux.h"
 #include "../soc/t210.h"
 
 enum { SnapshotWords = 24 };
-static u32 snapshots[DdrSnapshotCount][SnapshotWords];
-static u32 first_maps[8], latest_maps[8];
-static u32 stage, detail, reads, writes, attempts, sweeps;
-static u32 first_window, latest_window, first_card[2], latest_card[2];
-static u32 first_khz, latest_khz, ready_khz, io_errors;
-static u32 last_full_window, last_reduced_window;
-static u64 first_io_error[3], latest_io_error[3];
+static _Atomic u32 snapshots[DdrSnapshotCount][SnapshotWords];
+static _Atomic u32 first_maps[8], latest_maps[8];
+static _Atomic u64 checkpoint;
+static _Atomic u32 reads, writes, attempts, sweeps;
+static _Atomic u32 first_window, latest_window, first_card[2], latest_card[2];
+static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
+static _Atomic u32 last_full_window, last_reduced_window;
+static _Atomic u64 first_io_error[3], latest_io_error[3];
 
-/* The SD and NAND mutexes serialize these calls. Fatal reports are captured
-   on the failing thread, with no filesystem calls in the reporting path. */
+/* SD operations serialize trace writes. Atomic reads let a watchdog capture
+   the current trace even while a worker owns both storage mutexes. */
 void ddr_trace_stage(enum DdrStage next, u32 info)
 {
-    stage = next;
-    detail = info;
+    atomic_store_explicit(&checkpoint, ((u64)next << 32) | info, memory_order_relaxed);
     if (next == DdrReady)
         ready_khz = info;
 }
@@ -55,7 +57,9 @@ void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
         live ? regs->venmiscctl : 0,
         live ? ((u32)regs->errintsts << 16) | regs->norintsts : 0,
     };
-    memcpy(snapshots[slot], values, sizeof(values));
+    for (u32 i = 1; i < SnapshotWords; ++i)
+        atomic_store_explicit(&snapshots[slot][i], values[i], memory_order_relaxed);
+    atomic_store_explicit(&snapshots[slot][0], values[0], memory_order_release);
 }
 
 void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 tap, u32 width, u32 khz)
@@ -67,12 +71,17 @@ void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 ta
         last_reduced_window = latest_window;
     else
         last_full_window = latest_window;
-    memcpy(latest_maps, raw, 4 * sizeof(u32));
-    memcpy(latest_maps + 4, complete, 4 * sizeof(u32));
+    for (u32 i = 0; i < 4; ++i) {
+        atomic_store_explicit(&latest_maps[i], raw[i], memory_order_relaxed);
+        atomic_store_explicit(&latest_maps[i + 4], complete[i], memory_order_relaxed);
+    }
     if (++sweeps == 1) {
         first_window = latest_window;
         first_khz = khz;
-        memcpy(first_maps, latest_maps, sizeof(first_maps));
+        for (u32 i = 0; i < 4; ++i) {
+            atomic_store_explicit(&first_maps[i], raw[i], memory_order_relaxed);
+            atomic_store_explicit(&first_maps[i + 4], complete[i], memory_order_relaxed);
+        }
     }
 }
 
@@ -99,7 +108,8 @@ void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
     latest_io_error[1] = ((u64)host->divisor << 32) | host->command_irq;
     latest_io_error[2] = ((u64)host->regs->prnsts << 32) | blocks;
     if (++io_errors == 1)
-        memcpy(first_io_error, latest_io_error, sizeof(first_io_error));
+        for (u32 i = 0; i < 3; ++i)
+            first_io_error[i] = latest_io_error[i];
 }
 
 void ddr_trace_reassert(void) { ++attempts; }
@@ -107,23 +117,34 @@ void ddr_trace_reassert(void) { ++attempts; }
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x4444523230300007ull;
-    ctx->gprs[1] = ((u64)stage << 32) | detail;
+    ctx->gprs[0] = 0x4444523230300008ull;
+    ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
     ctx->gprs[4] = ((u64)first_window << 32) | latest_window;
     ctx->gprs[5] = ((u64)first_card[0] << 32) | first_card[1];
     ctx->gprs[6] = ((u64)latest_card[0] << 32) | latest_card[1];
     ctx->gprs[7] = ((u64)first_khz << 32) | latest_khz;
-    memcpy(&ctx->gprs[8], first_maps, sizeof(first_maps));
-    memcpy(&ctx->gprs[12], latest_maps, sizeof(latest_maps));
+    for (u32 i = 0; i < 4; ++i) {
+        ctx->gprs[8 + i] = ((u64)first_maps[2 * i + 1] << 32) | first_maps[2 * i];
+        ctx->gprs[12 + i] = ((u64)latest_maps[2 * i + 1] << 32) | latest_maps[2 * i];
+    }
     ctx->gprs[16] = ((u64)io_errors << 32) | ready_khz;
-    memcpy(&ctx->gprs[17], first_io_error, sizeof(first_io_error));
-    memcpy(&ctx->gprs[20], latest_io_error, sizeof(latest_io_error));
+    for (u32 i = 0; i < 3; ++i) {
+        ctx->gprs[17 + i] = first_io_error[i];
+        ctx->gprs[20 + i] = latest_io_error[i];
+    }
     ctx->gprs[23] = ((u64)last_full_window << 32) | last_reduced_window;
     /* Use reserved report space while leaving actual stack lengths zero. */
-    _Static_assert(sizeof(snapshots) <= sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump), "trace too large");
-    memcpy(ctx->stack_trace, snapshots, sizeof(ctx->stack_trace));
-    memcpy(ctx->stack_dump, (const u8 *)snapshots + sizeof(ctx->stack_trace),
-        sizeof(snapshots) - sizeof(ctx->stack_trace));
+    ddr_watchdog_report(&ctx->gprs[24]);
+    u32 saved[DdrSnapshotCount][SnapshotWords];
+    for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
+        saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
+        for (u32 i = 1; i < SnapshotWords; ++i)
+            saved[slot][i] = atomic_load_explicit(&snapshots[slot][i], memory_order_relaxed);
+    }
+    _Static_assert(sizeof(saved) <= sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump), "trace too large");
+    memcpy(ctx->stack_trace, saved, sizeof(ctx->stack_trace));
+    memcpy(ctx->stack_dump, (const u8 *)saved + sizeof(ctx->stack_trace),
+        sizeof(saved) - sizeof(ctx->stack_trace));
 }

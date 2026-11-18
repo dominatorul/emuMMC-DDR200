@@ -10,10 +10,14 @@ STAGES = (
     'boot', 'card initialization', 'ready', 'native SD open', 'host state check',
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
+    'DMA polling',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
+OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
+OP_PHASES = ('none', 'entering', 'waiting on SD mutex', 'waiting on NAND mutex',
+             'inside operation', 'releasing mutexes')
 REGISTERS = (
     'flags', 'CAR.source', 'CAR.pllc4_base', 'CAR.pllc4_misc', 'CAR.reset_l', 'CAR.enable_l',
     'pad.drive', 'pad.loopback', 'pinmux.clk', 'pinmux.cmd', 'pinmux.dat0', 'card.power_gpio',
@@ -29,12 +33,14 @@ def decode(path):
         raise ValueError(f'{path} is too short for a DDR200 trace')
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
-    if magic != 0x32454641 or gprs[0] not in (0x4444523230300006, 0x4444523230300007):
+    if magic != 0x32454641 or gprs[0] not in (0x4444523230300006, 0x4444523230300007, 0x4444523230300008):
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
-    has_rates = gprs[0] == 0x4444523230300007
+    has_rates = gprs[0] >= 0x4444523230300007
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
+    if stage == STAGES.index('DMA polling'):
+        print(f'  CMD{(gprs[1] >> 16) & 0xFFFF}, blocks {gprs[1] & 0xFFFF}')
     print(f'Completed reads {gprs[2] >> 32}, writes {gprs[2] & 0xFFFFFFFF}')
     print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {gprs[3] & 0xFFFFFFFF}')
 
@@ -65,6 +71,16 @@ def decode(path):
                       f'{COMMAND_FAILURES[phase] if phase < len(COMMAND_FAILURES) else phase}, '
                       f'{(rate_irq >> 32) / 1000:.2f} MHz, error {(rate_irq >> 16) & 0xFFFF:04X}, '
                       f'IRQ {rate_irq & 0xFFFF:04X}, present state {state >> 32:08X}, blocks {state & 0xFFFFFFFF}')
+
+    if gprs[0] == 0x4444523230300008:
+        op, phase, age, depth = gprs[24:28]
+        if depth:
+            kind = op >> 16
+            print(f'Oldest active wrapper: {OPERATIONS[kind] if kind < len(OPERATIONS) else kind}, '
+                  f'MMC ID {op & 0xFFFF}, {OP_PHASES[phase] if phase < len(OP_PHASES) else phase}, '
+                  f'{age / 1000000:.3f}s, nesting {depth}')
+        else:
+            print('No active SDMMC wrapper at the time of the report')
 
     # AFE2 stack-trace and stack-dump regions carry the snapshots.
     states = {}

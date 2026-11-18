@@ -234,6 +234,7 @@ typedef struct _sdmmc_t
 	u32 command_failure;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
+	u32 dma_boundaries_left;
 	u32 rsp[4];
 	u32 rsp3;
 	int t210b01;

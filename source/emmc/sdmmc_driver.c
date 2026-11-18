@@ -1074,6 +1074,7 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
     sdmmc->regs->admaaddr_hi = (admaaddr >> 32) & 0xFFFFFFFFF;
 
 	sdmmc->dma_addr_next = (admaaddr + 0x80000) & 0xFFFFFFFFFFF80000;
+	sdmmc->dma_boundaries_left = ((admaaddr & 0x7FFFF) + (u64)blkcnt * req->blksize) / 0x80000;
 
 	sdmmc->regs->blksize = req->blksize | 0x7000; // DMA 512KB (Detects A18 carry out).
 	sdmmc->regs->blkcnt = blkcnt;
@@ -1096,40 +1097,35 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 
 static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 {
-	u16 blkcnt = 0;
-	do
-	{
-		blkcnt = sdmmc->regs->blkcnt;
-		u64 timeout = get_tmr_ms() + 1500;
-		do
-		{
-			int result = 0;
-			while (true)
-			{
-				u16 intr = 0;
-				result = _sdmmc_check_mask_interrupt(sdmmc, &intr,
-					SDHCI_INT_DATA_END | SDHCI_INT_DMA_END);
-				if (result < 0)
-					break;
-
-				if (intr & SDHCI_INT_DATA_END)
-					return 1; // Transfer complete.
-
-				if (intr & SDHCI_INT_DMA_END)
-				{
-					// Update DMA.
-					sdmmc->regs->admaaddr = sdmmc->dma_addr_next & 0xFFFFFFFFF;
-					sdmmc->regs->admaaddr_hi = (sdmmc->dma_addr_next >> 32) & 0xFFFFFFFFF;
-					sdmmc->dma_addr_next += 0x80000;
-				}
+	u16 remaining = sdmmc->regs->blkcnt;
+	u64 now = get_tmr_ms();
+	u64 deadline = now + 5000;
+	u64 stalled = now + 1500;
+	while (now < deadline && now < stalled) {
+		u16 intr;
+		int result = _sdmmc_check_mask_interrupt(sdmmc, &intr,
+			SDHCI_INT_DATA_END | SDHCI_INT_DMA_END);
+		if (result == SDMMC_MASKINT_ERROR)
+			break;
+		if (intr & SDHCI_INT_DATA_END)
+			return 1;
+		if (intr & SDHCI_INT_DMA_END) {
+			if (!sdmmc->dma_boundaries_left) {
+				sdmmc->command_irq = intr;
+				break;
 			}
-			if (result != SDMMC_MASKINT_NOERROR)
-			{
-				_sdmmc_reset(sdmmc);
-				return 0;
-			}
-		} while (get_tmr_ms() < timeout);
-	} while (sdmmc->regs->blkcnt != blkcnt);
+			--sdmmc->dma_boundaries_left;
+			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
+			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
+			sdmmc->dma_addr_next += 0x80000;
+		}
+		now = get_tmr_ms();
+		u16 next_remaining = sdmmc->regs->blkcnt;
+		if (next_remaining < remaining) {
+			remaining = next_remaining;
+			stalled = now + 1500;
+		}
+	}
 
 	_sdmmc_reset(sdmmc);
 	return 0;
@@ -1189,6 +1185,8 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 
 		if (req && result) {
 			sdmmc->command_failure = DdrCommandTransfer;
+			if (sdmmc->id == SDMMC_1)
+				ddr_trace_stage(DdrDma, ((u32)cmd->cmd << 16) | blkcnt);
 			result = _sdmmc_update_dma(sdmmc);
 		}
 	}

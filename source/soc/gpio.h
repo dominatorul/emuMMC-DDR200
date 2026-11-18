@@ -87,6 +87,7 @@ void gpio_config(u32 port, u32 pins, int mode);
 void gpio_output_enable(u32 port, u32 pins, int enable);
 void gpio_write(u32 port, u32 pins, int high);
 int  gpio_read(u32 port, u32 pins);
+volatile const u32 *gpio_input_register(u32 port);
 int  gpio_interrupt_status(u32 port, u32 pins);
 void gpio_interrupt_enable(u32 port, u32 pins, int enable);
 void gpio_interrupt_level(u32 port, u32 pins, int high, int edge, int delta);

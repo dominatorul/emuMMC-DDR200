@@ -42,7 +42,9 @@ enum FatalReason
     Fatal_DdrRead = 0x63,
     Fatal_DdrWrite = 0x64,
     Fatal_DdrSnapshot = 0x65,
-    Fatal_DdrPll = 0x66
+    Fatal_DdrPll = 0x66,
+    Fatal_DdrStalled = 0x67,
+    Fatal_DdrWatchdog = 0x68
 };
 
 #define AMS_FATAL_ERROR_MAX_STACKTRACE 0x20

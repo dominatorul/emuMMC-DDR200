@@ -35,18 +35,27 @@ taps and a valid card status response. The updated trace saves the measured
 clock and window at each rate plus the first and latest failed data commands
 and interrupt status, before command cleanup overwrites that status.
 
-Use **More Configs → Fusee DDR200 recovery (1.11.2)**. The entry chainloads the
+The recovery build reached the Nintendo logo but did not produce a new report
+after 30 seconds. This revision adds an independent watchdog. It saves a report
+if an SDMMC wrapper takes 15 active seconds, including time waiting for either
+storage mutex. It also caps SDMA polling at 5 seconds overall and 1.5 seconds
+without block progress. Boundary interrupts can advance only through the
+programmed transfer length. The active DDR200 clock policy is the same.
+
+Use **More Configs → Fusee DDR200 stall trace (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
-report automatically. Holding both volume buttons can request a report on
-the next SD read. If HOME loads, test sleep and wake once. Console testing is
+report automatically. If the logo still hangs, release both volume buttons and
+then hold them together for three seconds to capture a report independently of
+SD I/O. If HOME loads, test sleep and wake once. Console testing is
 needed to verify DDR200 boot and resume.
 
 Decode this build's report with `python3 tools/read-ddr-trace.py report_*.bin`
 using a report from the Fusee test. `DD200062` means DDR200 recovery failed.
 `DD200063` and `DD200064` identify read and write failure, `DD200065` is a manual
-snapshot, and `DD200066` is a clock lock or clock ownership error.
+snapshot, `DD200066` is a clock lock or clock ownership error, `DD200067` is an
+operation timeout and `DD200068` is a watchdog setup failure.
 
 Host regression check for tuning and read recovery:
 

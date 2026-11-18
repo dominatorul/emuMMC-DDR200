@@ -16,12 +16,17 @@
  */
 
 #include <string.h>
+#include <stdatomic.h>
 #include "fatal.h"
 #include "ddr_trace.h"
 #include "../nx/cache.h"
 
 void __attribute__((noreturn)) fatal_abort(enum FatalReason abortReason)
 {
+    static atomic_flag claimed = ATOMIC_FLAG_INIT;
+    if (atomic_flag_test_and_set(&claimed))
+        while (true)
+            svcSleepThread(100000000);
     _Alignas(4096) static atmosphere_fatal_error_ctx error_ctx;
     memset(&error_ctx, 0, sizeof(atmosphere_fatal_error_ctx));
 

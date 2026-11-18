@@ -28,6 +28,8 @@
 #include "emuMMC/emummc_ctx.h"
 #include "FS/FS_offsets.h"
 #include "utils/fatal.h"
+#include "utils/ddr_watchdog.h"
+#include "soc/gpio.h"
 
 // Prototypes
 void __init();
@@ -433,4 +435,5 @@ void __init()
 
     clock_enable_i2c5();
     i2c_init();
+    ddr_watchdog_start(gpio_input_register(GPIO_PORT_X));
 }
