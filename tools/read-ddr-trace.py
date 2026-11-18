@@ -31,7 +31,7 @@ POLICY_SWEEPS = {
 }
 RATES = ('unavailable', 'SDR104', '166.40 MHz DDR200', '199.68 MHz DDR200')
 MATRIX_PHASES = ('noise floor', 'clock gating', 'free-running clock', 'stream',
-                 'idle', 'driver strength', 'throughput')
+                 'idle', 'driver strength', 'throughput', 'CMD6 settling')
 MATRIX_STATES = ('pending', 'running', 'complete', 'skipped', 'interrupted')
 MATRIX_FLAGS = ('DMA window or sector range unavailable', 'full-rate transfer failed',
                 'reduced-rate transfer failed', '30-second idle not reached',

@@ -40,20 +40,23 @@ to restore the previous DDR200 rate. Both wake paths preserve DMA scratch.
 
 ## Matrix
 
-The diagnostic boots with the release runtime policy and starts the matrix
-20 seconds after the first successful native DDR200 handoff. Hold Volume
-Down by itself to skip or end it. It compares five repeated scans per clock, gating
+The diagnostic boots with the release runtime policy. Its first step runs
+on a normal SD filesystem request at least 20 seconds after the first
+successful native DDR200 handoff. Upcoming requests advance the experiment.
+Hold Volume Down by itself during SD activity to skip or end it.
+It compares five repeated scans per clock, gating
 between tap samples versus leaving the clock on, and the 0, 10 and 100 ms
 settling targets after a confirmed DDR200 switch. The report measures each
 settling scan's start relative to the switch. Later scans may start after
 their target as earlier scans finish.
 
-The worker reads 64 MiB in 8 MiB slices at each clock, samples during the
+The diagnostic reads 64 MiB in 8 MiB slices at each clock, samples during the
 load and after idle, and times up to 256 MiB of sequential reading at each
 clock. It logs the card's driver strength and power limits from CMD6
-and tests advertised standard driver strengths. Read slices share the normal
-storage locks and command timeouts. Each clock's 30-second quiet period runs
-outside those locks. The report identifies shortened load tests and idle
+and tests advertised standard driver strengths. It runs the CMD6 changes
+after the read comparisons. Each step uses the caller's storage locks and a
+250 ms command budget. The next request after an idle interval captures the
+idle sweep. The report identifies shortened load tests and idle
 periods if the system keeps using the card. Matching reads protect the
 normal profile while the experiment changes clocks.
 
@@ -68,8 +71,8 @@ attribute a reversible change to heat or rail droop.
 
 ## Console test
 
-1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs and
-   leave it at HOME for about two minutes.
+1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs. Wait
+   30 seconds at HOME, then run SDBench to drive the matrix.
 2. Hold **Volume + and Volume −** together for three seconds, then reconnect
    in SD UMS. Collect the new file from `atmosphere/fatal_errors`.
 3. Boot **Fusee DDR200 (release policy)** and record the read and write

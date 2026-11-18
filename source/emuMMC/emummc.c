@@ -69,6 +69,11 @@ static bool wait_for_native;
 static u64 boot_power_deadline;
 static u32 boot_power_recoveries;
 
+#ifdef EMUMMC_DDR200_MATRIX
+static u64 matrix_next_step;
+static bool matrix_finished;
+#endif
+
 static bool _ddr200_power_ready(void)
 {
     return sdmmc_get_sd_power_enabled() &&
@@ -141,8 +146,8 @@ static bool _ddr200_reassert(int mmc_id)
     if (resuming)
         ddr_trace_power(DdrPowerReasserted, ready);
 #ifdef EMUMMC_DDR200_MATRIX
-    if (ready && sd_storage.ddr.rate >= DdrRateReduced)
-        ddr_watchdog_arm_matrix();
+    if (ready && sd_storage.ddr.rate >= DdrRateReduced && !matrix_next_step)
+        matrix_next_step = get_tmr_us() + 20000000;
 #endif
     return ready;
 }
@@ -392,43 +397,20 @@ void mutex_unlock_handler(int mmc_id)
 }
 
 #ifdef EMUMMC_DDR200_MATRIX
-static void _ddr200_matrix_worker(void *unused)
+static void _ddr200_matrix_poll(void)
 {
-    (void)unused;
-    for (;;) {
-        svcSleepThread(10000000);
-        mutex_lock_handler(FS_SDMMC_SD);
-        sdmmc_accessor_t *previous = _current_accessor;
-        _current_accessor = sdmmc_accessor_get(FS_SDMMC_SD);
-        bool more = false;
-        if (ddr_watchdog_volume_down()) {
-            sd_storage.ddr.matrix_active = false;
-            ddr_trace_matrix(DdrMatrixSkipped, 0, 0);
-        } else if (!native_sd_opened || native_sd_transitions || wait_for_native ||
-                   !_current_accessor || !_ddr200_power_ready()) {
-            sd_storage.ddr.matrix_active = false;
-            ddr_trace_matrix(DdrMatrixInterrupted, 0, 1u << 5);
-        } else {
-            more = sdmmc_ddr200_matrix_step(&sd_storage);
-        }
-        _current_accessor = previous;
-        mutex_unlock_handler(FS_SDMMC_SD);
-        if (!more)
-            svcExitThread();
+    if (matrix_finished || !matrix_next_step)
+        return;
+    if (ddr_watchdog_volume_down()) {
+        matrix_finished = true;
+        sd_storage.ddr.matrix_active = false;
+        ddr_trace_matrix(DdrMatrixSkipped, 0, 0);
+        return;
     }
-}
-
-void emummc_start_ddr200_matrix(void)
-{
-    static _Alignas(16) u8 stack[0x4000];
-    Handle thread;
-    Result result = svcCreateThread(&thread, _ddr200_matrix_worker, NULL, stack + sizeof(stack), 54, 3);
-    if (!result) {
-        result = svcStartThread(thread);
-        svcCloseHandle(thread);
-    }
-    if (result)
-        ddr_trace_matrix(DdrMatrixInterrupted, 0, result);
+    if (get_tmr_us() < matrix_next_step)
+        return;
+    matrix_finished = !sdmmc_ddr200_matrix_step(&sd_storage);
+    matrix_next_step = get_tmr_us() + 20000;
 }
 #endif
 
@@ -640,8 +622,15 @@ static bool _sdmmc_prepare_io(int mmc_id, sdmmc_accessor_t *accessor)
             _sdmmc_ensure_device_attached();
             if (!_sdmmc_ensure_initialized())
                 return false;
-            if (_ddr200_reassert(mmc_id))
+            if (_ddr200_reassert(mmc_id)) {
+#ifdef EMUMMC_DDR200_MATRIX
+                if (mmc_id == FS_SDMMC_SD)
+                    _ddr200_matrix_poll();
+                if (!sdmmc_ddr200_profile_ready(&sd_storage))
+                    return false;
+#endif
                 return mmc_id != FS_SDMMC_EMMC || _file_based_ensure_mounted();
+            }
         }
         bool pending = native_sd_transitions ||
             (wait_for_native && (!native_sd_opened || !_ddr200_power_ready()));

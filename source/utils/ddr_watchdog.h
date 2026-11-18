@@ -12,6 +12,3 @@ void ddr_watchdog_phase(uintptr_t thread, enum DdrOpPhase phase);
 void ddr_watchdog_leave(u32 slot);
 void ddr_watchdog_report(u64 *out);
 bool ddr_watchdog_volume_down(void);
-#ifdef EMUMMC_DDR200_MATRIX
-void ddr_watchdog_arm_matrix(void);
-#endif

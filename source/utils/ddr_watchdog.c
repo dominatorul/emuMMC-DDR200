@@ -3,10 +3,6 @@
 #include <stddef.h>
 #include "ddr_watchdog.h"
 #include "fatal.h"
-#ifdef EMUMMC_DDR200_MATRIX
-#include "../emuMMC/emummc.h"
-#include "ddr_trace.h"
-#endif
 
 #define OP_TIMEOUT_US 15000000u
 #define BUTTON_HOLD_US 3000000u
@@ -30,16 +26,6 @@ typedef struct {
 static op_slot_t slots[SlotCount];
 static _Alignas(16) u8 watchdog_stack[0x4000];
 static _Atomic(volatile const u32 *) button_input;
-
-#ifdef EMUMMC_DDR200_MATRIX
-static _Atomic u64 matrix_start_at;
-
-void ddr_watchdog_arm_matrix(void)
-{
-    u64 unarmed = 0;
-    atomic_compare_exchange_strong(&matrix_start_at, &unarmed, get_tmr_us() + 20000000);
-}
-#endif
 
 bool ddr_watchdog_volume_down(void)
 {
@@ -136,9 +122,6 @@ static void watchdog_entry(void *unused)
 {
     (void)unused;
     u64 last_poll = get_tmr_us(), pressed_at = 0;
-#ifdef EMUMMC_DDR200_MATRIX
-    bool matrix_started_or_skipped = false;
-#endif
     bool released = false;
     const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
     for (;;) {
@@ -157,18 +140,6 @@ static void watchdog_entry(void *unused)
 
         /* Volume buttons X6/X7 are active low. Arm after both are released. */
         u32 volume = *input & VOLUME_PINS;
-#ifdef EMUMMC_DDR200_MATRIX
-        u64 start_at = atomic_load(&matrix_start_at);
-        if (start_at && !matrix_started_or_skipped) {
-            if (volume == VOLUME_UP_PIN) {
-                ddr_trace_matrix(DdrMatrixSkipped, 0, 0);
-                matrix_started_or_skipped = true;
-            } else if (volume == VOLUME_PINS && now >= start_at) {
-                matrix_started_or_skipped = true;
-                emummc_start_ddr200_matrix();
-            }
-        }
-#endif
         if (volume) {
             if (volume == VOLUME_PINS)
                 released = true;

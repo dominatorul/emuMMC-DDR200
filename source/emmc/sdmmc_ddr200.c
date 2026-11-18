@@ -518,7 +518,7 @@ void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed)
 
 #ifdef EMUMMC_DDR200_MATRIX
 enum MatrixPhase {
-    MatrixNoise, MatrixGated, MatrixFree, MatrixLoad, MatrixIdle, MatrixDrive, MatrixSpeed
+    MatrixNoise, MatrixGated, MatrixFree, MatrixLoad, MatrixIdle, MatrixDrive, MatrixSpeed, MatrixSettle
 };
 enum {
     MatrixSliceBlocks = 8 * 1024 * 1024 / 512,
@@ -544,7 +544,7 @@ static struct {
     unsigned noise_count, drive;
     u32 blocks, details;
     u64 idle_begin;
-    bool reduced, settled, started;
+    bool reduced, started;
 } matrix;
 
 static bool matrix_sweep(sdmmc_storage_t *storage, u8 kind, bool gated)
@@ -720,8 +720,13 @@ static bool finish_matrix(sdmmc_storage_t *storage, enum DdrMatrixStage state)
 
 static bool next_matrix_rate(sdmmc_storage_t *storage)
 {
-    if (matrix.reduced)
+    if (matrix.phase == MatrixDrive || matrix.phase == MatrixSettle)
         return finish_matrix(storage, DdrMatrixComplete);
+    if (matrix.reduced) {
+        matrix.reduced = false;
+        matrix.phase = MatrixDrive;
+        return true;
+    }
     matrix.reduced = true;
     matrix.phase = MatrixNoise;
     matrix.noise_count = matrix.blocks = 0;
@@ -756,7 +761,7 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
         }
     }
 
-    u64 old = begin_budget(host, 1800000);
+    u64 old = begin_budget(host, 250000);
     if (!matrix_set_rate(storage)) {
         matrix.details |= MatrixUnavailable;
         if (storage->ddr.rate >= DdrRateReduced) {
@@ -770,12 +775,6 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
     bool more = true;
     switch (matrix.phase) {
         case MatrixNoise:
-            if (!matrix.reduced && !matrix.settled) {
-                matrix.settled = true;
-                if (!matrix_probe_cmd6(storage))
-                    more = finish_matrix(storage, DdrMatrixInterrupted);
-                break;
-            }
             matrix_sweep(storage, DdrSweepNoise, false);
             if (++matrix.noise_count == 5)
                 matrix.phase = MatrixGated;
@@ -818,16 +817,19 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
         }
         case MatrixIdle:
             matrix_sweep(storage, DdrSweepIdle, false);
-            matrix.phase = matrix.reduced ? MatrixSpeed : MatrixDrive;
+            matrix.phase = MatrixSpeed;
             break;
         case MatrixDrive:
             if (!matrix_drive_strength(storage))
-                matrix.phase = MatrixSpeed;
+                matrix.phase = MatrixSettle;
             if (!storage->ddr.ready) {
                 storage->ddr.ready = true;
                 if (!sdmmc_ddr200_recover(storage, 0, true))
                     more = finish_matrix(storage, DdrMatrixInterrupted);
             }
+            break;
+        case MatrixSettle:
+            more = finish_matrix(storage, matrix_probe_cmd6(storage) ? DdrMatrixComplete : DdrMatrixInterrupted);
             break;
     }
     host->deadline_us = old;
