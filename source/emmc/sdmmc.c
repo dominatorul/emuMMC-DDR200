@@ -280,6 +280,14 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 		.buf = buf, .num_sectors = num_sectors, .blksize = 512,
 		.is_write = is_write, .is_multi_block = 1, .auto_command = SdmmcAutoStop,
 	};
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	u64 previous_deadline = host->deadline_us;
+	if (host->read_ahead_dma != SdmmcDmaDefault) {
+		host->deadline_us = get_tmr_us() + 200000;
+		if (previous_deadline)
+			host->deadline_us = MIN(previous_deadline, host->deadline_us);
+	}
+#endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
 	bool test_counted = host->id == SDMMC_1 && !is_write && num_sectors >= DdrVerifyBlocks &&
 		host->divisor == 199680 && storage->ddr.rate == DdrRateFull &&
@@ -293,6 +301,10 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 		req.auto_command = SdmmcAutoBlockCount;
 #endif
 	bool ok = sdmmc_execute_cmd(host, &cmd, &req, blkcnt_out);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	/* A speculative DMA timeout must leave time for CMD12 and CMD13. */
+	host->deadline_us = previous_deadline;
+#endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
 	if (test_counted) {
 		if (req.auto_command == SdmmcAutoBlockCount && !ok)
@@ -306,6 +318,11 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 
 	u32 failure = host->command_failure;
 	u32 irq = host->command_irq;
+	u16 auto_stop_error = host->command_auto_stop_error;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	sdmmc_dma_progress_t progress = host->dma_progress;
+	u32 resumes = host->dma_resumes;
+#endif
 	if (host->id == SDMMC_1)
 		ddr_trace_io_error(host, cmd.cmd, num_sectors);
 	if (failure >= DdrCommandResponse && !stop_failed_transfer(storage)) {
@@ -314,6 +331,11 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 	}
 	host->command_failure = failure;
 	host->command_irq = irq;
+	host->command_auto_stop_error = auto_stop_error;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	host->dma_progress = progress;
+	host->dma_resumes = resumes;
+#endif
 	return 0;
 }
 

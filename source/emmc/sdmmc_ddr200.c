@@ -53,14 +53,6 @@ static u64 begin_budget(sdmmc_t *host, u64 budget)
     return old;
 }
 
-static u64 checksum(const u8 *data)
-{
-    u64 value = 14695981039346656037ull;
-    for (size_t i = 0; i < DdrVerifyBytes; ++i)
-        value = (value ^ data[i]) * 1099511628211ull;
-    return value;
-}
-
 static bool probe_read(sdmmc_storage_t *storage, char *dma, u32 sector, unsigned tap, u64 *hash)
 {
     u32 done = 0;
@@ -69,31 +61,40 @@ static bool probe_read(sdmmc_storage_t *storage, char *dma, u32 sector, unsigned
         !sdmmc_storage_transfer(storage, &done, sector, DdrVerifyBlocks, dma, 0) ||
         done != DdrVerifyBlocks)
         return false;
-    *hash = checksum((const u8 *)dma);
+    *hash = ddr_data_checksum((const u8 *)dma, DdrVerifyBytes);
     return true;
 }
 
-static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsigned tap, u32 used[4])
+static int verification_neighbor(ddr_eye_t eye, int tap, int guard, const u32 used[4])
+{
+    int left = eye.left + guard;
+    int right = eye.right - guard;
+    if (tap - 1 >= left && tap - 1 <= right && !ddr_tap_passes(used, tap - 1))
+        return tap - 1;
+    if (tap + 1 >= left && tap + 1 <= right && !ddr_tap_passes(used, tap + 1))
+        return tap + 1;
+    return ddr_pick_tap_in_range(left, right, used, false);
+}
+
+static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsigned tap,
+    unsigned guard, u32 used[4])
 {
     if (!storage->has_sector_access || storage->sec_cnt < DdrVerifyBlocks)
         return false;
-    unsigned neighbor = eye.left;
-    while (neighbor <= eye.right && (neighbor == tap || ddr_tap_passes(used, neighbor)))
-        ++neighbor;
-    if (neighbor > eye.right)
+    exclude_tap(used, tap);
+    int neighbor = verification_neighbor(eye, tap, guard, used);
+    /* A seven-tap eye has only one tap with a three-tap guard. The
+       secondary data probe can use the next margin, leaving the primary guarded. */
+    if (neighbor < 0)
+        neighbor = verification_neighbor(eye, tap, guard - 1, used);
+    if (neighbor < 0)
         return false;
-    /* Prefer a nearby interior tap for the second data read. */
-    if (tap > eye.left && !ddr_tap_passes(used, tap - 1))
-        neighbor = tap - 1;
-    else if (tap < eye.right && !ddr_tap_passes(used, tap + 1))
-        neighbor = tap + 1;
 
     char *dma = borrow_dma(DdrVerifyBlocks, verify_backup);
     if (!dma)
         return false;
     sector = MIN(sector, storage->sec_cnt - DdrVerifyBlocks);
     storage->sdmmc->regs->hostctl2 |= SDHCI_CTRL_TUNED_CLK;
-    exclude_tap(used, tap);
     u64 first, second;
     bool ok = probe_read(storage, dma, sector, tap, &first);
     if (ok) {
@@ -190,8 +191,7 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
                     applied = tap;
                 break;
             }
-            exclude_tap(tried, tap);
-            if (verify_tap(storage, eye, sector, tap, tried)) {
+            if (verify_tap(storage, eye, sector, tap, guard, tried)) {
                 applied = tap;
                 if (narrow) {
                     policy->narrow_verified_tap = tap;

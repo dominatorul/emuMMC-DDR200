@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read the original-driver Fusee diagnostic from an Atmosphère AFE2 report."""
+"""Read the emuMMC DDR200 diagnostic from an Atmosphère AFE2 report."""
 
 import struct
 import sys
@@ -41,6 +41,10 @@ POWER_EVENTS = ('paired native close started', 'SDR104 before native close', 'na
                 'native SD opened', 'DDR200 reassertion after native close', 'retained DDR200 verified')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
+DMA_SAMPLES = ('SDMA reference slices', 'ADMA2 primary', 'SDMA 512 KiB boundary',
+               'SDMA 256 KiB boundary', 'ADMA2 alternate', 'Last failed read')
+DMA_MODES = ('unconfigured DMA', 'SDMA 512 KiB', 'SDMA 256 KiB', 'ADMA2')
+DMA_RESULTS = ('unavailable', 'passed', 'command failed', 'data mismatch')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
 OP_PHASES = ('none', 'entering', 'waiting on SD mutex', 'waiting on NAND mutex',
              'inside operation', 'releasing mutexes')
@@ -99,6 +103,34 @@ def print_sweeps(data, sweeps, full_khz, trace_version):
               f'at {khz / 1000:.2f} MHz: center {tap}, width {width}{interval}, '
               f'reassertions {(sample >> 16) & 0xFF}, data errors {(sample >> 24) & 0xFF}, '
               f'CPU temperature {temperature}, SD I/O setting {volts}')
+
+
+def print_dma_comparison(data, offset):
+    print('DDR200 DMA comparison')
+    caps, config = struct.unpack_from('<QQ', data, offset + (len(DMA_SAMPLES) + 1) * 16)
+    if config >> 32:
+        supported = (config & 0xFF) >= 3 and (caps & 0x80000) and ((config >> 16) & 0x3000) == 0x3000
+        print(f'  Host ADMA2 availability {bool(supported)}, capabilities {caps:#010x}, '
+              f'Host Control 2 {(config >> 16) & 0xFFFF:#06x}')
+    for i, label in enumerate(DMA_SAMPLES):
+        elapsed, blocks, remaining, mode, status, restarts, tap, left, right, adma_error = struct.unpack_from(
+            '<IHHBBHBBBB', data, offset + i * 16)
+        result = status & 0x7F
+        if not result:
+            continue
+        outcome = DMA_RESULTS[result] if result < len(DMA_RESULTS) else f'result {result}'
+        engine = DMA_MODES[mode] if mode < len(DMA_MODES) else f'mode {mode}'
+        eye = f', eye {left}–{right} ({right - left + 1})' if left <= right else ''
+        timing = f', {elapsed} us' if elapsed else ''
+        progress = f', blocks remaining register {remaining}' if status & 0x80 else ''
+        error = f', ADMA error register {adma_error:#04x}' if adma_error else ''
+        print(f'  {label}: {outcome}, {engine}, tap {tap}{eye}, '
+              f'{blocks / 2:.1f} KiB{timing}, {restarts} SDMA restarts{progress}{error}')
+    elapsed, blocks = struct.unpack_from('<QQ', data, offset + len(DMA_SAMPLES) * 16)
+    if elapsed:
+        print(f'  ADMA2 commands averaged {blocks * 512 / elapsed:.2f} MB/s across {blocks / 2048:.2f} MiB')
+    if not any(data[offset:offset + 16]):
+        print('  No same-sector comparison recorded. It requires ADMA2, a guarded 8+ tap eye and sequential reads.')
 
 
 def print_policy_trace(data, gprs):
@@ -183,7 +215,10 @@ def print_policy_trace(data, gprs):
             flags = (state >> 24) & 0xFF
             print(f'Auto CMD23 completed {gprs[5] >> 48} reads, host version field {flags & 0x3F}, '
                   f'card support {bool(flags & 0x40)}, disabled after failure {bool(flags & 0x80)}')
-    runtime_capacity = 48 - matrix_capacity
+    dma_capacity = len(DMA_SAMPLES) + 2 if perf_version >= 22 else 0
+    if dma_capacity:
+        print_dma_comparison(data, 0x150 + (48 - dma_capacity) * 16)
+    runtime_capacity = 48 - matrix_capacity - dma_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
         ('Matrix', gprs[4] >> 32, matrix_capacity, runtime_capacity),
@@ -226,8 +261,8 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 21:
-        raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 22:
+        raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
     if trace_version >= 10 and len(data) < LEGACY_SWEEP_OFFSET:

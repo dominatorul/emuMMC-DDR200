@@ -549,6 +549,17 @@ static int _sdmmc_wait_cmd_data_inhibit(sdmmc_t *sdmmc, bool wait_dat)
 	return 1;
 }
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static void _sdmmc_capture_dma_error(sdmmc_t *sdmmc)
+{
+	if (!sdmmc->dma_progress.blocks)
+		return;
+	sdmmc->dma_progress.remaining = sdmmc->regs->blkcnt;
+	sdmmc->dma_progress.adma_error = sdmmc->dma_progress.mode == SdmmcDmaAdma2 ? sdmmc->regs->admaerr : 0;
+	sdmmc->dma_progress.sampled = true;
+}
+#endif
+
 static int _sdmmc_wait_card_busy(sdmmc_t *sdmmc)
 {
 	_sdmmc_commit_changes(sdmmc);
@@ -557,6 +568,9 @@ static int _sdmmc_wait_card_busy(sdmmc_t *sdmmc)
 	while (!(sdmmc->regs->prnsts & SDHCI_DATA_0_LVL_MASK))
 		if (get_tmr_ms() > timeout)
 		{
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+			_sdmmc_capture_dma_error(sdmmc);
+#endif
 			_sdmmc_reset(sdmmc);
 			return 0;
 		}
@@ -1009,6 +1023,10 @@ static void _sdmmc_enable_interrupts(sdmmc_t *sdmmc)
 {
 	sdmmc->regs->norintstsen |= SDHCI_INT_DMA_END | SDHCI_INT_DATA_END | SDHCI_INT_RESPONSE;
 	sdmmc->regs->errintstsen |= SDHCI_ERR_INT_ALL_EXCEPT_ADMA_BUSPWR;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	if (sdmmc->dma_progress.mode == SdmmcDmaAdma2)
+		sdmmc->regs->errintstsen |= SDHCI_ERR_INT_ADMA_ERROR;
+#endif
 	sdmmc->regs->norintsts = sdmmc->regs->norintsts;
 	sdmmc->regs->errintsts = sdmmc->regs->errintsts;
 }
@@ -1057,6 +1075,9 @@ static int _sdmmc_wait_response(sdmmc_t *sdmmc)
 			break;
 		if (result != SDMMC_MASKINT_NOERROR || get_tmr_ms() > timeout)
 		{
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+			_sdmmc_capture_dma_error(sdmmc);
+#endif
 			_sdmmc_reset(sdmmc);
 			return 0;
 		}
@@ -1129,16 +1150,21 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	if (blkcnt >= 0xFFFF)
 		blkcnt = 0xFFFF;
 
-	u64 admaaddr = 0;
+	u64 dma_address = 0;
 #ifdef EMUMMC_DDR200_READ_AHEAD
 	if (sdmmc->id == SDMMC_1 && !req->is_write && req->blksize == 512)
-		admaaddr = sdmmc_read_ahead_dma(req->buf, blkcnt);
+		dma_address = sdmmc_read_ahead_dma(req->buf, blkcnt);
 #endif
-	if (admaaddr)
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	enum SdmmcDmaMode mode = dma_address ? sdmmc->read_ahead_dma : SdmmcDmaDefault;
+	if (mode == SdmmcDmaDefault)
+		mode = SdmmcDmaSdma512;
+#endif
+	if (dma_address)
 		sdmmc_memcpy_buf = false;
 	else
-		admaaddr = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
-	if (!admaaddr)
+		dma_address = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
+	if (!dma_address)
 	{
 		/* The caller's buffer is outside the mapped windows. Keep DMA
 		   inside a mapped buffer. The storage loop handles partial transfers. */
@@ -1150,7 +1176,7 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 			if (!pool->device_addr_buffer || !address || (address & 7) || blocks <= capacity)
 				continue;
 			capacity = blocks;
-			admaaddr = address;
+			dma_address = address;
 			sdmmc->last_dma_idx = i;
 			if (capacity == blkcnt)
 				break;
@@ -1162,16 +1188,40 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	}
 
 	// Check alignment.
-	if (admaaddr & 7)
+	if (dma_address & 7)
 		return 0;
 
-    sdmmc->regs->admaaddr = admaaddr & 0xFFFFFFFFF;
-    sdmmc->regs->admaaddr_hi = (admaaddr >> 32) & 0xFFFFFFFFF;
+	u32 boundary = 512 * 1024;
+	u16 boundary_bits = 7 << 12;
+	u64 address_register = dma_address;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	sdmmc->dma_progress.mode = mode;
+	sdmmc->dma_progress.blocks = blkcnt;
+	if (mode == SdmmcDmaSdma256) {
+		boundary = 256 * 1024;
+		boundary_bits = 6 << 12;
+	} else if (mode == SdmmcDmaAdma2) {
+		if (!sdmmc_adma2_supported(sdmmc))
+			return 0;
+		address_register = sdmmc_read_ahead_adma_table(dma_address, blkcnt * req->blksize);
+		if (!address_register)
+			return 0;
+		/* Version 4 selects ADMA2 with bit 4. Host Control 2
+		   already enables the 64-bit address and 16-byte descriptor. */
+		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | SDHCI_CTRL_ADMA32;
+	}
+#endif
+	sdmmc->regs->admaaddr = (u32)address_register;
+	sdmmc->regs->admaaddr_hi = (u32)(address_register >> 32);
 
-	sdmmc->dma_addr_next = (admaaddr + 0x80000) & 0xFFFFFFFFFFF80000;
-	sdmmc->dma_boundaries_left = ((admaaddr & 0x7FFFF) + (u64)blkcnt * req->blksize) / 0x80000;
-
-	sdmmc->regs->blksize = req->blksize | 0x7000; // DMA 512KB (Detects A18 carry out).
+	sdmmc->dma_boundary_bytes = boundary;
+	sdmmc->dma_addr_next = (dma_address + boundary) & ~((u64)boundary - 1);
+	sdmmc->dma_boundaries_left = ((dma_address & (boundary - 1)) + (u64)blkcnt * req->blksize) / boundary;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	if (mode == SdmmcDmaAdma2)
+		sdmmc->dma_boundaries_left = 0;
+#endif
+	sdmmc->regs->blksize = req->blksize | boundary_bits;
 	sdmmc->regs->blkcnt = blkcnt;
 
 	if (blkcnt_out)
@@ -1220,7 +1270,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 			++sdmmc->dma_resumes;
 			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
-			sdmmc->dma_addr_next += 0x80000;
+			sdmmc->dma_addr_next += sdmmc->dma_boundary_bytes;
 		}
 		/* Keep the boundary interrupt hot path to one status read.
 		   A short cadence is enough for timeout and progress checks. */
@@ -1234,6 +1284,9 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 		}
 	}
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	_sdmmc_capture_dma_error(sdmmc);
+#endif
 	_sdmmc_reset(sdmmc);
 	return 0;
 }
@@ -1697,6 +1750,9 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	sdmmc->command_irq = 0;
 	sdmmc->command_auto_stop_error = 0;
 	sdmmc->dma_resumes = 0;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	sdmmc->dma_progress = (sdmmc_dma_progress_t){0};
+#endif
 	if (!sdmmc->card_clock_enabled)
 		return 0;
 	bool sample = sdmmc->id == SDMMC_1 && req && req->blksize == 512 &&
@@ -1717,7 +1773,18 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 		usleep((8000 + sdmmc->divisor - 1) / sdmmc->divisor);
 	}
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	bool may_use_adma = req && sdmmc->read_ahead_dma == SdmmcDmaAdma2;
+	u8 dma_select = may_use_adma ? sdmmc->regs->hostctl & SDHCI_CTRL_DMA_MASK : 0;
+	u16 adma_irq = may_use_adma ? sdmmc->regs->errintstsen & SDHCI_ERR_INT_ADMA_ERROR : 0;
+#endif
 	int result = _sdmmc_execute_cmd_inner(sdmmc, cmd, req, blkcnt_out, sample ? &dma_us : NULL);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	if (sdmmc->dma_progress.mode == SdmmcDmaAdma2) {
+		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | dma_select;
+		sdmmc->regs->errintstsen = (sdmmc->regs->errintstsen & ~SDHCI_ERR_INT_ADMA_ERROR) | adma_irq;
+	}
+#endif
 	usleep((8000 + sdmmc->divisor - 1) / sdmmc->divisor);
 
 	if (should_disable_sd_clock)

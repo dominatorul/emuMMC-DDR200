@@ -20,7 +20,7 @@ static unsigned counted_reads;
 static bool counted_reads_disabled;
 #endif
 static unsigned no_ready, hint_scans, switched_to_stock, log_events;
-static bool stop_ok, inconsistent, verify_rejected;
+static bool stop_ok, inconsistent, verify_rejected, verify_guarded_only;
 static bool card_retained_ddr;
 static unsigned rejected_sdr_checks, retained_restorations;
 static char flow[256];
@@ -116,6 +116,10 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     if (!req) {
         assert(cmd->cmd == MMC_SEND_STATUS && cmd->arg == card.rca << 16);
         event('S');
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        host.dma_progress = (sdmmc_dma_progress_t){0};
+        host.dma_resumes = 0;
+#endif
         if (no_ready) {
             --no_ready;
             status_word &= ~R1_READY_FOR_DATA;
@@ -158,7 +162,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
         if (verifies < sizeof(verify_taps) / sizeof(verify_taps[0]))
             verify_taps[verifies] = tap;
         ++verifies;
-        if (!verify_rejected) {
+        bool guarded = tap >= full_eye.left + DdrTapMargin && tap + DdrTapMargin <= full_eye.right;
+        if (!verify_rejected && (!verify_guarded_only || host.divisor != 199680 || guarded)) {
             memset(req->buf, inconsistent && verifies % 2 == 0 ? 0x22 : 0x11, DdrVerifyBytes);
             *done = DdrVerifyBlocks;
             return 1;
@@ -173,6 +178,15 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     event('F');
     host.command_failure = DdrCommandTransfer;
     host.command_irq = 0x01208000;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (host.read_ahead_dma != SdmmcDmaDefault) {
+        assert(host.deadline_us == now + 199999 && req->auto_command == SdmmcAutoStop);
+        host.dma_progress = (sdmmc_dma_progress_t){host.read_ahead_dma,
+            req->num_sectors, 128, 0, true};
+        host.dma_resumes = 3;
+        now = host.deadline_us + 1;
+    }
+#endif
     return 0;
 }
 
@@ -186,6 +200,10 @@ int sdmmc_get_rsp(sdmmc_t *target, u32 *rsp, u32 size, u32 type)
 int sdmmc_stop_transmission(sdmmc_t *target, u32 *rsp)
 {
     assert(target == &host && rsp);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (host.read_ahead_dma != SdmmcDmaDefault)
+        assert(host.deadline_us > now);
+#endif
     event('A');
     ++stops;
     return stop_ok;
@@ -303,7 +321,7 @@ static void reset(void)
     hint_scans = switched_to_stock = log_events = cursor = 0;
     stop_ok = true;
     reject_type_c = false;
-    inconsistent = verify_rejected = card_retained_ddr = false;
+    inconsistent = verify_rejected = verify_guarded_only = card_retained_ddr = false;
     rejected_sdr_checks = retained_restorations = 0;
     flow[0] = 0;
 #ifdef EMUMMC_DDR200_MATRIX
@@ -350,6 +368,16 @@ int main(void)
     test_eye_model();
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    reset();
+    host.read_ahead_dma = SdmmcDmaSdma512;
+    fail_reads = no_ready = 1;
+    u32 completed = 0;
+    assert(!sdmmc_storage_transfer(&card, &completed, 1024, 4096, window, 0));
+    assert(strcmp(flow, "FASSR") == 0 && stops == 1 && resets == 1);
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && !host.deadline_us);
+    assert(host.dma_progress.sampled && host.dma_progress.remaining == 128 && host.dma_resumes == 3);
+#endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
     reset();
     u32 transferred;
@@ -430,6 +458,14 @@ int main(void)
     assert(verify_taps[0] == 32 && verify_taps[1] != 32 && verify_taps[1] != 36);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
+
+    reset();
+    full_eye = (ddr_eye_t){29, 36};
+    verify_guarded_only = true;
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false));
+    assert(card.ddr.rate == DdrRateFull && card.ddr.ready && tap_readback(&host) == 32);
+    assert(verifies == 2 && verify_taps[0] == 32 && verify_taps[1] == 33 && !stops);
 
     reset();
     fail_reads = 1;

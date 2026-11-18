@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #pragma once
 
+#include <stddef.h>
 #include "../utils/types.h"
 
 enum DdrRate { DdrRateUnknown, DdrRateSdr104, DdrRateReduced, DdrRateFull };
@@ -54,6 +55,14 @@ typedef struct {
 static inline unsigned ddr_eye_width(ddr_eye_t eye)
 {
     return eye.left <= eye.right ? eye.right - eye.left + 1u : 0;
+}
+
+static inline u64 ddr_data_checksum(const u8 *data, size_t bytes)
+{
+    u64 value = 14695981039346656037ull;
+    for (size_t i = 0; i < bytes; ++i)
+        value = (value ^ data[i]) * 1099511628211ull;
+    return value;
 }
 
 static inline bool ddr_tap_passes(const u32 map[4], unsigned tap)

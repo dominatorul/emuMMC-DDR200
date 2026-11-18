@@ -117,6 +117,9 @@ int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, v
 #ifdef EMUMMC_DDR200_READ_AHEAD
 bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out);
 u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+u64 sdmmc_read_ahead_adma_table(u64 dma, u32 bytes);
+#endif
 void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks);
 void sdmmc_read_ahead_reset(void);
 #endif

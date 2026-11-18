@@ -18,7 +18,7 @@ Result svcMapDeviceAddressSpaceAligned(Handle das, Handle process, u64 address, 
     u64 device_address, u32 permission)
 {
     ++maps;
-    assert(das && process == current_process && address == (uintptr_t)read_buffer);
+    assert(das && process == current_process && address == (uintptr_t)read_window.data);
     assert(size == ReadAheadBytes && (address & 4095) == 0);
     assert(((address ^ device_address) & (DeviceAlignment - 1)) == 0 && permission == Perm_W);
     return map_ok ? 0 : 0xd401;
@@ -29,7 +29,7 @@ Result svcUnmapDeviceAddressSpace(Handle das, Handle process, u64 address, u64 s
 {
     ++unmaps;
     assert(das == read_ahead.das && process == current_process &&
-        address == (uintptr_t)read_buffer && size == ReadAheadBytes && device_address == read_ahead.dma);
+        address == (uintptr_t)read_window.data && size == ReadAheadBytes && device_address == read_ahead.dma);
     return 0;
 }
 
@@ -48,7 +48,7 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector,
     u32 blocks, void *buf, u32 write)
 {
-    assert(storage == &card && buf == read_buffer && blocks == ReadAheadBlocks && !write);
+    assert(storage == &card && buf == read_window.data && blocks == ReadAheadBlocks && !write);
     assert(sdmmc_read_ahead_dma(buf, blocks) != 0 && host.deadline_us > time_us);
     ++transfers;
     if (!transfer_ok)
@@ -94,7 +94,7 @@ int main(void)
     assert(!read_sectors(1, 5120) && transfers == 1);
 
     sdmmc_read_ahead_reset();
-    assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_buffer, ReadAheadBlocks));
+    assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_window.data, ReadAheadBlocks));
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 43});
     assert(!read_sectors(2, 0));
     assert(read_sectors(2, 1024) && maps == 2 && transfers == 2);

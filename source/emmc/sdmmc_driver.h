@@ -212,6 +212,7 @@
 #define SDMMC_SAMPLE_WIN_SIZE_MIN 8
 
 #define SDHCI_CAN_64BIT 0x10000000
+#define SDHCI_CAN_ADMA2 0x00080000
 
 /*! SDMMC Low power features. */
 #define SDMMC_POWER_SAVE_DISABLE 0
@@ -219,6 +220,29 @@
 
 /*! Helper for SWITCH command argument. */
 #define SDMMC_SWITCH(mode, index, value) (((mode) << 24) | ((index) << 16) | ((value) << 8))
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+enum SdmmcDmaMode { SdmmcDmaDefault, SdmmcDmaSdma512, SdmmcDmaSdma256, SdmmcDmaAdma2 };
+
+enum {
+    SdmmcAdmaChunk = 32 * 1024,
+    SdmmcAdmaTransferValid = 0x21,
+    SdmmcAdmaEnd = 2,
+};
+
+typedef struct {
+    u16 attributes, length;
+    u32 address_low, address_high, reserved;
+} sdmmc_adma2_descriptor_t;
+_Static_assert(sizeof(sdmmc_adma2_descriptor_t) == 16, "SDHCI v4 ADMA2 descriptor");
+
+typedef struct {
+    enum SdmmcDmaMode mode;
+    u16 blocks, remaining;
+    u8 adma_error;
+    bool sampled;
+} sdmmc_dma_progress_t;
+#endif
 
 /*! SDMMC controller context. */
 typedef struct _sdmmc_t
@@ -243,14 +267,28 @@ typedef struct _sdmmc_t
 	u64 deadline_us;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
+	u32 dma_boundary_bytes;
 	u32 dma_boundaries_left;
 	u32 dma_resumes;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	enum SdmmcDmaMode read_ahead_dma;
+	sdmmc_dma_progress_t dma_progress;
+#endif
 	u32 rsp[4];
 	u32 rsp3;
 	int t210b01;
 	u32 autocal_sts;
 	int autocal_fallback;
 } sdmmc_t;
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static inline bool sdmmc_adma2_supported(const sdmmc_t *host)
+{
+	const u16 addressing = SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN;
+	return host->id == SDMMC_1 && (host->regs->hcver & 0xff) >= 3 &&
+		(host->regs->capareg & SDHCI_CAN_ADMA2) && (host->regs->hostctl2 & addressing) == addressing;
+}
+#endif
 
 /*! SDMMC command. */
 typedef struct _sdmmc_cmd_t

@@ -36,6 +36,16 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);
 
 #include "../emmc/ddr200_policy.h"
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+enum DdrDmaSample { DdrDmaReference, DdrDmaBaseline, DdrDmaSdma512, DdrDmaSdma256,
+    DdrDmaAlternate, DdrDmaLastError, DdrDmaTotals, DdrDmaHost, DdrDmaSamples };
+enum DdrDmaResult { DdrDmaOk = 1, DdrDmaFailed, DdrDmaMismatch };
+
+void ddr_trace_dma_begin(void);
+void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye_t eye,
+    u64 elapsed, u32 blocks, u32 resumes, enum DdrDmaResult result);
+#endif
+
 enum DdrSweepKind {
     DdrSweepInitial, DdrSweepHandoff, DdrSweepTrack, DdrSweepRecovery, DdrSweepUpgrade, DdrSweepLadder,
     DdrSweepPower,
