@@ -19,7 +19,7 @@ Result svcMapDeviceAddressSpaceAligned(Handle das, Handle process, u64 address, 
     ++maps;
     assert(das && process == current_process && address == (uintptr_t)read_buffer);
     assert(size == ReadAheadBytes && (address & 4095) == 0);
-    assert(((address ^ device_address) & (ReadAheadBytes - 1)) == 0 && permission == Perm_W);
+    assert(((address ^ device_address) & (DeviceAlignment - 1)) == 0 && permission == Perm_W);
     return map_ok ? 0 : 0xd401;
 }
 
@@ -92,7 +92,7 @@ int main(void)
     assert(!read_sectors(1, 7168));
 
     sdmmc_read_ahead_reset();
-    assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_buffer, 8192));
+    assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_buffer, ReadAheadBlocks));
     transfer_ok = true;
     assert(!read_sectors(2, 0) && !read_sectors(2, 1024));
     assert(read_sectors(2, 2048) && maps == 2 && transfers == 3);

@@ -7,10 +7,11 @@
 #include "../utils/util.h"
 
 enum {
-    ReadAheadBytes = 4 * 1024 * 1024,
+    ReadAheadBytes = 2 * 1024 * 1024,
     ReadAheadBlocks = ReadAheadBytes / 512,
     ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadRunIn = 1024 * 1024 / 512,
+    DeviceAlignment = 4 * 1024 * 1024,
 };
 
 static _Alignas(0x1000) u8 read_buffer[ReadAheadBytes];
@@ -39,7 +40,7 @@ static bool map_read_buffer(Handle das)
     const u64 bases[] = {0x04000000, 0x10000000, 0x20000000};
     u64 address = (uintptr_t)read_buffer;
     for (unsigned i = 0; i < sizeof(bases) / sizeof(bases[0]); ++i) {
-        u64 dma = bases[i] | (address & (ReadAheadBytes - 1));
+        u64 dma = bases[i] | (address & (DeviceAlignment - 1));
         Result rc = svcMapDeviceAddressSpaceAligned(das, current_process, address, sizeof(read_buffer),
             dma, Perm_W);
         ddr_trace_read_ahead_map(rc);
