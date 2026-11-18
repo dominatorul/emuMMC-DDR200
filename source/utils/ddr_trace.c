@@ -37,6 +37,7 @@ static _Atomic u64 first_failure[2], last_failure[2];
 static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
 static _Atomic u64 large_read_blocks, large_read_us, large_read_dma_us, large_read_copied;
+static _Atomic u32 large_read_commands, large_read_restarts, largest_read;
 #endif
 static _Atomic u64 matrix_status;
 static _Atomic u64 bus_registers, clock_registers;
@@ -179,6 +180,10 @@ void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool cop
         large_read_blocks += blocks;
         large_read_us += elapsed;
         large_read_dma_us += dma;
+        ++large_read_commands;
+        large_read_restarts += host->dma_resumes;
+        if (blocks > largest_read)
+            largest_read = blocks;
         if (copied)
             large_read_copied += blocks;
     }
@@ -226,7 +231,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
-    ctx->gprs[0] = 0x4444523230300010ull;
+    ctx->gprs[0] = 0x4444523230300011ull;
 #else
     ctx->gprs[0] = 0x444452323030000full;
 #endif
@@ -259,6 +264,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[29] = clock_registers;
     ctx->gprs[30] = ladder | ((u64)function_status << 32);
     ctx->gprs[31] = matrix_status;
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+    ctx->gprs[2] = ((u64)large_read_commands << 32) | large_read_restarts;
+    ctx->gprs[31] = largest_read;
+#endif
     ctx->afsr0 = native_before >> 16;
     ctx->afsr1 = native_after >> 16;
     ctx->esr = (MIN(recovery_attempts, 0xffffu) << 16) | MIN(recovery_passed, 0xffffu);

@@ -156,7 +156,8 @@ def print_policy_trace(data, gprs):
             result = f'{blocks * 512 / usec:.2f} MB/s' if usec else 'unavailable'
             print(f'{label} MHz timed read {result}, {blocks * 512 / 1048576:.2f}/256 MiB '
                   f'in {usec / 1e6:.3f}s of active commands')
-    if (gprs[0] & 0xFF) == 16:
+    perf_version = gprs[0] & 0xFF
+    if perf_version >= 16:
         blocks, usec = gprs[22] & 0xFFFFFFFF, gprs[22] >> 32
         copied, dma_us = gprs[23] & 0xFFFFFFFF, gprs[23] >> 32
         if blocks and usec and dma_us:
@@ -164,6 +165,10 @@ def print_policy_trace(data, gprs):
                   f'across {blocks / 2048:.2f} MiB')
             print(f'DMA wait {dma_us / usec:.1%} of command time, DMA-window rate '
                   f'{blocks * 512 / dma_us:.2f} MB/s, bounce-buffer data {copied / blocks:.1%}')
+        if perf_version >= 17 and gprs[2] >> 32:
+            commands, restarts = gprs[2] >> 32, gprs[2] & 0xFFFFFFFF
+            print(f'{commands} large CMD18 reads, average {blocks / (2 * commands):.1f} KiB, '
+                  f'maximum {gprs[31] / 2:.1f} KiB, {restarts} SDMA boundary restarts')
     runtime_capacity = 48 - matrix_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -207,7 +212,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 16:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 17:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

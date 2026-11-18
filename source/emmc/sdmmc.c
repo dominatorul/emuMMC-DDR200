@@ -55,42 +55,21 @@ static inline u32 unstuff_bits(u32 *resp, u32 start, u32 size)
 // FS DMA calculations.
 intptr_t sdmmc_calculate_dma_addr(sdmmc_accessor_t *_this, void *buf, unsigned int num_sectors)
 {
-    int dma_buf_idx = 0;
-    char *_buf = (char *)buf;
-    char *actual_buf_start = _buf;
-    char *actual_buf_end = &_buf[512 * num_sectors];
-    char *dma_buffer_start = _this->parent->dmaBuffers[0].device_addr_buffer;
-
-    if (dma_buffer_start <= _buf && actual_buf_end <= &dma_buffer_start[_this->parent->dmaBuffers[0].device_addr_buffer_size])
-    {
-        dma_buf_idx = 0;
-    }
-    else
-    {
-        dma_buffer_start = _this->parent->dmaBuffers[1].device_addr_buffer;
-        if (dma_buffer_start <= actual_buf_start && actual_buf_end <= &dma_buffer_start[_this->parent->dmaBuffers[1].device_addr_buffer_size])
-        {
-            dma_buf_idx = 1;
-        }
-        else
-        {
-            dma_buffer_start = _this->parent->dmaBuffers[2].device_addr_buffer;
-            if (dma_buffer_start <= actual_buf_start && actual_buf_end <= &dma_buffer_start[_this->parent->dmaBuffers[2].device_addr_buffer_size])
-            {
-                dma_buf_idx = 2;
-            }
-            else
-            {
-                // If buffer is on a random heap
-                return 0;
-            }
+    uintptr_t address = (uintptr_t)buf;
+    u64 bytes = (u64)num_sectors * 512;
+    for (unsigned i = 0; i < 3; ++i) {
+        const sdmmc_dma_buffer_t *pool = &_this->parent->dmaBuffers[i];
+        uintptr_t start = (uintptr_t)pool->device_addr_buffer;
+        uintptr_t dma = (uintptr_t)pool->device_addr_buffer_masked;
+        if (!start || !dma || address < start || bytes > pool->device_addr_buffer_size)
+            continue;
+        uintptr_t offset = address - start;
+        if (offset <= pool->device_addr_buffer_size - bytes) {
+            sdmmc_memcpy_buf = false;
+            return (intptr_t)(dma + offset);
         }
     }
-
-	sdmmc_memcpy_buf = false;
-
-    intptr_t admaaddr = (intptr_t)&_this->parent->dmaBuffers[dma_buf_idx].device_addr_buffer_masked[actual_buf_start - dma_buffer_start];
-    return admaaddr;
+    return 0;
 }
 
 int sdmmc_calculate_dma_index(sdmmc_accessor_t *_this, void *buf, unsigned int num_sectors)

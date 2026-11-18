@@ -1117,7 +1117,8 @@ int sdmmc_stop_transmission(sdmmc_t *sdmmc, u32 *rsp)
 
 static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 {
-	if (!req->blksize || !req->num_sectors)
+	if (!req->blksize || !req->num_sectors || !req->buf ||
+	    !_current_accessor || !_current_accessor->parent)
 		return 0;
 
 	u32 blkcnt = req->num_sectors;
@@ -1127,10 +1128,25 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	u64 admaaddr = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
 	if (!admaaddr)
 	{
-		// buf is on a heap
-		int dma_idx = sdmmc_calculate_fitting_dma_index(_current_accessor, blkcnt);
-		admaaddr = (u64)&_current_accessor->parent->dmaBuffers[dma_idx].device_addr_buffer_masked[0];
-		sdmmc->last_dma_idx = dma_idx;
+		/* The caller's buffer is outside the mapped windows. Keep DMA
+		   inside a mapped buffer. The storage loop handles partial transfers. */
+		u32 capacity = 0;
+		for (unsigned i = 0; i < 3; ++i) {
+			const sdmmc_dma_buffer_t *pool = &_current_accessor->parent->dmaBuffers[i];
+			u64 address = (u64)pool->device_addr_buffer_masked;
+			u32 blocks = MIN(pool->device_addr_buffer_size / req->blksize, blkcnt);
+			if (!pool->device_addr_buffer || !address || (address & 7) || blocks <= capacity)
+				continue;
+			capacity = blocks;
+			admaaddr = address;
+			sdmmc->last_dma_idx = i;
+			if (capacity == blkcnt)
+				break;
+		}
+		if (!capacity || (capacity < blkcnt && !req->is_multi_block))
+			return 0;
+		blkcnt = capacity;
+		sdmmc_memcpy_buf = true;
 	}
 
 	// Check alignment.
@@ -1183,6 +1199,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 				break;
 			}
 			--sdmmc->dma_boundaries_left;
+			++sdmmc->dma_resumes;
 			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
 			sdmmc->dma_addr_next += 0x80000;
@@ -1661,6 +1678,7 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	sdmmc->command_failure = DdrCommandClock;
 	sdmmc->command_irq = 0;
 	sdmmc->command_auto_stop_error = 0;
+	sdmmc->dma_resumes = 0;
 	if (!sdmmc->card_clock_enabled)
 		return 0;
 	bool sample = sdmmc->id == SDMMC_1 && req && req->blksize == 512 &&
