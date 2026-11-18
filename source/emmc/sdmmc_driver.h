@@ -278,7 +278,7 @@ typedef struct _sdmmc_t
 	bool prefetch;
 	bool handoff_sdma, wake_sdma;
 	u8 wake_commands;
-	bool wake_pending, wake_monitor;
+	bool wake_pending;
 	sdmmc_dma_progress_t dma_progress;
 #endif
 	u32 rsp[4];

@@ -342,51 +342,47 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write)
 {
+    return storage_transfer_once(storage, done, sector, count, buf, write);
+}
+
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+static int wake_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write)
+{
     sdmmc_t *host = storage->sdmmc;
-    if (host->id == SDMMC_1 && host->wake_commands && !host->handoff_sdma) {
-        bool first = host->wake_commands-- == 8;
-        count = MIN(count, SdmmcAdmaBytes / 512);
+    bool first = host->wake_commands-- == 8;
+    *done = 0;
+    bool ok = storage_transfer_once(storage, done, sector, count, buf, write);
+    if (first || !ok)
+        ddr_trace_wake(WakeCommand, host->dma_progress.mode | (write << 8), ok ? 0 : (host->command_irq ? host->command_irq : host->command_failure));
+    if (ok)
+        return 1;
+    ddr_trace_wake(WakeFirstFailure, host->command_failure, host->command_irq);
+    /* A data CRC error needs timing recovery. A launched write can
+       already have modified the card, so the DMA retries cannot replay it. */
+    if ((host->command_irq >> 16) & SDHCI_ERR_INT_DATA_CRC)
+        return 0;
+    for (unsigned retry = 0; retry < 2 && storage->ddr.ready &&
+         (!write || host->command_failure < DdrCommandResponse); ++retry) {
+        if (!sdmmc_reset_transfer(host))
+            break;
+        bool sdma = retry != 0;
+#ifndef EMUMMC_DDR200_ADMA_READAHEAD_ONLY
+        if (!sdma && sdmmc_adma2_supported(host) && !sdmmc_adma_remap()) {
+            ddr_trace_wake(WakeRetry, SdmmcDmaAdma2, DdrCommandDmaSetup);
+            continue;
+        }
+#endif
         *done = 0;
-        bool ok = storage_transfer_once(storage, done, sector, count, buf, write);
-        if (first || !ok)
-            ddr_trace_wake(WakeCommand, host->dma_progress.mode | (write << 8), ok ? 0 : (host->command_irq ? host->command_irq : host->command_failure));
+        host->wake_sdma = sdma;
+        ok = storage_transfer_once(storage, done, sector, count, buf, write);
+        host->wake_sdma = false;
+        ddr_trace_wake(WakeRetry, host->dma_progress.mode, ok ? 0 : host->command_failure);
         if (ok)
             return 1;
-        ddr_trace_wake(WakeFirstFailure, host->command_failure, host->command_irq);
-        /* A launched write can already have modified the card. Retry only
-           pre-submit writes, or reads after successful CMD12/CMD13 cleanup. */
-        for (unsigned retry = 0; retry < 2 && storage->ddr.ready &&
-             (!write || host->command_failure < DdrCommandResponse); ++retry) {
-            if (!sdmmc_reset_transfer(host))
-                break;
-            bool sdma = retry != 0;
-#ifndef EMUMMC_DDR200_ADMA_READAHEAD_ONLY
-            if (!sdma && sdmmc_adma2_supported(host) && !sdmmc_adma_remap()) {
-                ddr_trace_wake(WakeRetry, SdmmcDmaAdma2, DdrCommandDmaSetup);
-                continue;
-            }
-#endif
-            *done = 0;
-            host->wake_sdma = sdma;
-            ok = storage_transfer_once(storage, done, sector, count, buf, write);
-            host->wake_sdma = false;
-            ddr_trace_wake(WakeRetry, host->dma_progress.mode, ok ? 0 : host->command_failure);
-            if (ok)
-                return 1;
-        }
-        fatal_abort(Fatal_DdrWake);
     }
-#endif
-    int ok = storage_transfer_once(storage, done, sector, count, buf, write);
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (!ok && host->id == SDMMC_1 && host->wake_monitor && !host->handoff_sdma) {
-        ddr_trace_wake(WakeFirstFailure, host->command_failure, host->command_irq);
-        fatal_abort(Fatal_DdrWake);
-    }
-#endif
-    return ok;
+    return 0;
 }
+#endif
 
 int sdmmc_storage_end(sdmmc_storage_t *storage)
 {
@@ -410,7 +406,7 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 	while (num_sectors) {
 		if (sd && !sdmmc_ddr200_before_io(storage, sector, is_write)) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-            if (host->wake_commands || host->wake_monitor) {
+            if (host->wake_commands) {
                 ddr_trace_wake(WakeFailed, WakeCommand, host->command_failure);
                 fatal_abort(Fatal_DdrWake);
             }
@@ -422,24 +418,38 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 		u64 started = get_tmr_us();
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 		u32 failed[4] = {0};
+        bool wake = sd && host->wake_commands;
+        if (wake)
+            count = MIN(count, SdmmcAdmaBytes / 512);
 #endif
-		for (unsigned attempt = 0;
-		     !sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
-		     ++attempt) {
+        for (unsigned attempt = 0;; ++attempt) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+            bool ok = wake && !attempt ?
+                wake_transfer(storage, &blocks, sector, count, bytes, is_write) :
+                sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
+#else
+            bool ok = sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
+#endif
+            if (ok)
+                break;
+
 			/* Retune and verify before any retry. A failed write could have
 			   programmed some blocks, so report its error to FS. */
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 			/* Mapping and descriptor faults have already been logged. A
 			   new sampling tap cannot repair either one. */
 			if (host->command_failure == DdrCommandDmaSetup ||
-			    (host->command_irq >> 16) == SDHCI_ERR_INT_ADMA_ERROR)
-				return 0;
-			if (attempt >= 5 || !sd || !sdmmc_ddr200_retry_io(storage, sector, failed,
-			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0)) || is_write)
+			    (host->command_irq >> 16) == SDHCI_ERR_INT_ADMA_ERROR ||
+                attempt >= 5 || !sd || !sdmmc_ddr200_retry_io(storage, sector, failed,
+			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0)) || is_write) {
+                if (wake)
+                    fatal_abort(Fatal_DdrWake);
+                return 0;
+            }
 #else
 			if (attempt == 3 || !sd || !sdmmc_ddr200_recover(storage, sector, attempt != 0) || is_write)
-#endif
 				return 0;
+#endif
 			blocks = 0;
 		}
 		if (!blocks || blocks > count)

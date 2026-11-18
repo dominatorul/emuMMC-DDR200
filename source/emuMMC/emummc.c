@@ -168,7 +168,6 @@ static bool _ddr200_reassert(int mmc_id)
             fatal_abort(Fatal_DdrWake);
         sd_sdmmc.wake_pending = false;
         sd_sdmmc.wake_commands = 8;
-        sd_sdmmc.wake_monitor = true;
     }
 #endif
     if (resuming)
@@ -632,7 +631,6 @@ static uint64_t controller_close(int mmc_id)
                 ddr_trace_power(DdrPowerClosing, true);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
                 sd_sdmmc.wake_commands = 0;
-                sd_sdmmc.wake_monitor = false;
                 sd_sdmmc.wake_pending = true;
                 ddr_trace_wake(WakeSuspend, 0, 0);
 #endif

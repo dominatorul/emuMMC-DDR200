@@ -25,6 +25,7 @@ enum { RelaxedProbes = 3 };
 static unsigned full_probe_failures, full_data_taps[8], full_data_calls, drop_probes;
 static unsigned handoff_data, wake_remaps, wake_attempts;
 static bool wake_modes[4];
+static bool inject_adma_error;
 bool sdmmc_adma_remap(void) { ++wake_remaps; return true; }
 void fatal_abort(enum FatalReason reason) { (void)reason; __builtin_trap(); }
 static bool reject_handback;
@@ -231,6 +232,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     host.command_failure = DdrCommandTransfer;
     host.command_irq = 0x01208000;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (inject_adma_error)
+        host.command_irq = (SDHCI_ERR_INT_ADMA_ERROR << 16) | 0x8000;
     if (host.prefetch) {
         assert(host.deadline_us == now + 199999 && req->auto_command == SdmmcAutoStop);
         host.dma_progress = (sdmmc_dma_progress_t){.mode = SdmmcDmaAdma2,
@@ -366,6 +369,7 @@ static void reset(void)
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     full_probe_failures = full_data_calls = drop_probes = 0;
     handoff_data = wake_remaps = wake_attempts = 0;
+    inject_adma_error = false;
     reject_handback = false;
     drop_reason = DdrDropUnknown;
 #endif
@@ -447,10 +451,20 @@ int main(void)
     regs.hcver = 3;
     regs.hostctl2 |= SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN;
     fail_reads = 2;
+    inject_adma_error = true;
     u32 retried = 0;
-    assert(sdmmc_storage_transfer(&card, &retried, 0, 16, buf, false));
+    assert(wake_transfer(&card, &retried, 0, 16, buf, false));
     assert(retried == 16 && wake_remaps == 1 && wake_attempts == 3 && host.wake_commands == 7);
     assert(!wake_modes[0] && !wake_modes[1] && wake_modes[2] && !host.wake_sdma);
+    reset();
+    host.wake_commands = 8;
+    regs.venclkctl = 33 << 16;
+    full_eye = (ddr_eye_t){30, 44};
+    fail_reads = 1;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, false));
+    assert(!wake_remaps && host.wake_commands == 7 && card.ddr.rate == DdrRateFull);
+    assert(full_data_calls == 2 && full_data_taps[0] == 33 && full_data_taps[1] != 33);
+    assert(stops == 1 && resets == 1);
     reset();
     host.prefetch = true;
     fail_reads = no_ready = 1;
