@@ -166,8 +166,12 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
     bool narrow = runtime_full && width >= 2 * DdrNarrowMargin + 1 && width < 2 * DdrTapMargin + 1;
     unsigned guard = narrow ? DdrNarrowMargin : DdrTapMargin;
     unsigned applied = SDMMC_INVALID_TAP;
-    if (tracking && !narrow && width >= 2 * DdrTapMargin + 1 &&
-        prior_tap >= eye.left + DdrTapMargin && prior_tap <= eye.right - DdrTapMargin &&
+    bool verified_narrow = policy->ready && policy->narrow && had_eye &&
+        previous.left == eye.left && previous.right == eye.right &&
+        prior_tap == policy->narrow_verified_tap &&
+        started - policy->narrow_verified_at < DdrNarrowVerifyUs;
+    if (tracking && (!narrow || verified_narrow) && width >= 2 * guard + 1 &&
+        prior_tap >= eye.left + guard && prior_tap <= eye.right - guard &&
         (!had_eye || previous.right < eye.right + 3u)) {
         applied = prior_tap;
     } else if (width >= (kind == DdrSweepInitial ? SDMMC_SAMPLE_WIN_SIZE_MIN : DdrRuntimeWidth)) {
@@ -189,6 +193,10 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
             exclude_tap(tried, tap);
             if (verify_tap(storage, eye, sector, tap, tried)) {
                 applied = tap;
+                if (narrow) {
+                    policy->narrow_verified_tap = tap;
+                    policy->narrow_verified_at = get_tmr_us();
+                }
                 break;
             }
         }
@@ -403,7 +411,10 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
         remember_functions(storage, status);
         sdmmc_sd_set_current_limit(storage, policy->power_support, status);
         if (enter_from_sdr104(storage, status)) {
-            ok = train(storage, requested, DdrSweepHandoff, true, 0, -1) ||
+            /* A fresh CMD6 switch starts a new link. The pre-handoff
+               samples can force the tap too far right as the eye contracts. */
+            memset(policy->history, 0, sizeof(policy->history));
+            ok = train(storage, requested, DdrSweepHandoff, false, 0, -1) ||
                 fallback(storage, requested, 0, status);
         }
     } else if (standard) {

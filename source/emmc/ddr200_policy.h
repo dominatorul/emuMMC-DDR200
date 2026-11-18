@@ -14,6 +14,7 @@ enum {
     DdrTrackBusyUs = 500000,
     DdrNarrowTrackBlocks = 64 * 1024,
     DdrNarrowTrackBusyUs = 250000,
+    DdrNarrowVerifyUs = 2000000,
     DdrCoolIdleUs = 5000000,
     DdrCoolBlocks = 256 * 1024,
     DdrMaxUpgrades = 6,
@@ -40,11 +41,13 @@ typedef struct {
     u16 drive_support;
     u16 power_support;
     u8 power;
+    u8 narrow_verified_tap;
     u32 blocks;
     u32 busy_us;
     u64 last_io;
     u64 last_write;
     u64 retry_at;
+    u64 narrow_verified_at;
 } ddr_policy_t;
 
 static inline unsigned ddr_eye_width(ddr_eye_t eye)

@@ -344,8 +344,16 @@ int main(void)
     assert(sdmmc_ddr200_initial(&card, functions) && tap_readback(&host) == 40);
     regs.hostctl2 = UHS_SDR104_BUS_SPEED;
     full_eye = (ddr_eye_t){29, 44};
-    assert(sdmmc_ddr200_handoff(&card) && tap_readback(&host) == 35 && verifies == 2);
+    assert(sdmmc_ddr200_handoff(&card) && tap_readback(&host) == 32 && verifies == 2);
+    assert(card.ddr.history[0].count == 1);
     assert(strchr(flow, 'H'));
+    full_eye = (ddr_eye_t){30, 44};
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false) && tap_readback(&host) == 33);
+    full_eye = (ddr_eye_t){30, 36};
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false) && tap_readback(&host) == 33);
+    assert(card.ddr.rate == DdrRateFull && verifies == 6);
 #ifdef EMUMMC_DDR200_DRIVE_C
     assert(card.ddr.drive == SD_SET_DRIVER_TYPE_C);
     reset();
@@ -405,6 +413,9 @@ int main(void)
         assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
         assert(card.ddr.rate == DdrRateFull && card.ddr.narrow && verifies == 2);
         assert(tap_readback(&host) == 31 && verify_taps[0] != verify_taps[1]);
+        card.ddr.busy_us = DdrNarrowTrackBusyUs;
+        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == 2 && card.ddr.ready);
+        now += DdrNarrowVerifyUs;
         card.ddr.busy_us = DdrNarrowTrackBusyUs;
         assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == 4 && card.ddr.ready);
     }
