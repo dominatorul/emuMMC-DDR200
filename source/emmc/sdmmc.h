@@ -110,9 +110,6 @@ extern sdmmc_accessor_t *_current_accessor;
 extern bool sdmmc_memcpy_buf;
 
 int sdmmc_storage_end(sdmmc_storage_t *storage);
-#ifdef EMUMMC_FORCE_DDR200
-int sdmmc_storage_verify_sd_cid(sdmmc_storage_t *storage);
-#endif
 int sdmmc_storage_read(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf);
 int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf);
 int sdmmc_storage_init_mmc(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type);

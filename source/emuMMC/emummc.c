@@ -69,7 +69,6 @@ extern int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int
 extern void _sd_storage_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf);
 
 static bool sdmmc_ddr200_reassert_enabled = true;
-static bool ddr200_restoring;
 
 static bool _ddr200_power_ready(void)
 {
@@ -82,7 +81,6 @@ static bool _ddr200_power_ready(void)
 #ifdef EMUMMC_FORCE_DDR200
 enum { BootPowerRecoveryLimit = 2, BootPowerWindowUs = 10000000 };
 static bool boot_power_window_closed;
-static bool native_read_reopen_attempted;
 static u64 boot_power_deadline;
 static u32 boot_power_recoveries;
 
@@ -135,25 +133,30 @@ static int _ddr200_native_reopen(void)
 }
 #endif
 
-static int _ddr200_restore(int mmc_id, bool cold, bool read_recovery)
+static void _ddr200_reassert(int mmc_id)
 {
     static u8 ddr200_switch_buf[512];
+    static bool reasserting;
     u8 dma_save[512];
     void *dma_scratch = NULL;
-#ifdef EMUMMC_FORCE_DDR200
-    sdmmc_accessor_t *dma_owner = _current_accessor;
-    mmc_obj_t *dma_parent = dma_owner ? dma_owner->parent : NULL;
-    sdmmc_dma_buffer_t dma_before[3];
-    if (cold && dma_parent)
-        memcpy(dma_before, dma_parent->dmaBuffers, sizeof(dma_before));
-#endif
+
+    if (!sdmmc_ddr200_reassert_enabled || !sd_storage.initialized)
+        return;
+
+    if (nx_sd_mode_get() != SD_UHS_DDR208)
+        return;
+
+    ddr_trace_stage(DdrCheckState, mmc_id);
+    if (reasserting)
+        fatal_abort(Fatal_DdrNativeHost);
+    const bool cold = !_ddr200_power_ready();
+    if (!cold && (sd_sdmmc.regs->hostctl2 & 0x7) == UHS_DDR50_BUS_SPEED)
+        return;
 
     ddr_trace_reassert();
     ddr_trace_host(DdrReassert, &sd_sdmmc);
     if (_current_accessor != NULL)
     {
-        if (!_current_accessor->parent)
-            return 0;
         int dma_idx = sdmmc_calculate_fitting_dma_index(_current_accessor, 1);
         sdmmc_dma_buffer_t *dma = &_current_accessor->parent->dmaBuffers[dma_idx];
         if (!dma->device_addr_buffer || dma->device_addr_buffer_size < sizeof(dma_save))
@@ -163,25 +166,16 @@ static int _ddr200_restore(int mmc_id, bool cold, bool read_recovery)
         memcpy(dma_save, dma_scratch, sizeof(dma_save));
     }
 
-    ddr200_restoring = true;
+    reasserting = true;
 #ifdef EMUMMC_FORCE_DDR200
     int ok;
     if (!boot_power_window_closed && get_tmr_us() >= boot_power_deadline)
         _ddr200_close_boot_power_window();
-    if (cold && !read_recovery && !boot_power_window_closed && !sdmmc_get_sd_power_enabled()) {
+    if (cold && !boot_power_window_closed && !sdmmc_get_sd_power_enabled()) {
         ok = _ddr200_recover_boot_power();
         goto recovered;
     }
     ok = !cold || _ddr200_native_reopen();
-    if (cold && dma_owner &&
-        (_current_accessor != dma_owner || dma_owner->parent != dma_parent ||
-         memcmp(dma_before, dma_parent->dmaBuffers, sizeof(dma_before)))) {
-        /* The failed transfer still owns the original buffer. Reject the
-           recovery if the native close/open replaced its DMA pools. */
-        ddr_trace_stage(DdrCheckDmaBuffers, 0);
-        dma_scratch = NULL;
-        ok = 0;
-    }
     /* Native FS ordinarily reopens in SDR104. If timing is uncertain,
        avoid issuing a CMD6 data transfer using a mismatched host. */
     if (ok && cold && (sd_sdmmc.regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED) {
@@ -205,16 +199,6 @@ static int _ddr200_restore(int mmc_id, bool cold, bool read_recovery)
         sdmmc_ddr200_restore_host_cfg(&sd_sdmmc);
         clock_sdmmc_invalidate_clock_source(SDMMC_1);
 
-#ifdef EMUMMC_FORCE_DDR200
-        if (read_recovery) {
-            ddr_trace_stage(DdrCheckCardIdentity, 0);
-            ok = sdmmc_storage_verify_sd_cid(&sd_storage);
-            if (!ok)
-                goto restore_clock_gate;
-        }
-#else
-        (void)read_recovery;
-#endif
         ddr_trace_stage(DdrReadFunctions, mmc_id);
         ok = _sd_storage_switch_get(&sd_storage, ddr200_switch_buf);
         if (ok)
@@ -233,9 +217,6 @@ static int _ddr200_restore(int mmc_id, bool cold, bool read_recovery)
                 ok = _sd_storage_enable_DDR200(&sd_storage, ddr200_switch_buf);
         }
 
-#ifdef EMUMMC_FORCE_DDR200
-restore_clock_gate:
-#endif
         sd_storage.csd.busspeed = ok ? 200 : 0;
         sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_ENABLE);
     }
@@ -248,25 +229,9 @@ recovered:
         memcpy(dma_scratch, dma_save, sizeof(dma_save));
         armDCacheFlush(dma_scratch, sizeof(dma_save));
     }
+    reasserting = false;
+
     if (!ok)
-        sd_storage.csd.busspeed = 0;
-    ddr200_restoring = false;
-    return ok;
-}
-
-static void _ddr200_reassert(int mmc_id)
-{
-    if (!sdmmc_ddr200_reassert_enabled || !sd_storage.initialized || nx_sd_mode_get() != SD_UHS_DDR208)
-        return;
-
-    ddr_trace_stage(DdrCheckState, mmc_id);
-    if (ddr200_restoring)
-        fatal_abort(Fatal_DdrNativeHost);
-    const bool cold = !_ddr200_power_ready();
-    if (!cold && (sd_sdmmc.regs->hostctl2 & 0x7) == UHS_DDR50_BUS_SPEED)
-        return;
-
-    if (!_ddr200_restore(mmc_id, cold, false))
     {
 #ifdef EMUMMC_FORCE_DDR200
         fatal_abort(Fatal_DdrReassert);
@@ -274,29 +239,10 @@ static void _ddr200_reassert(int mmc_id)
         sd_storage.csd.busspeed = 104;
         sdmmc_ddr200_reassert_enabled = false;
 #endif
-        return;
     }
 
-#ifdef EMUMMC_FORCE_DDR200
-    native_read_reopen_attempted = false;
-#endif
     Log("Reasserting\n");
 }
-
-#ifdef EMUMMC_FORCE_DDR200
-int emummc_ddr200_reopen_for_read(sdmmc_storage_t *storage)
-{
-    /* The storage mutexes already cover this read and its recovery. Reopen
-       once per native handoff, through the regulator owner. */
-    if (storage != &sd_storage || !native_sd_opened || native_read_reopen_attempted ||
-        ddr200_restoring || !_ddr200_power_ready() || !sdmmc_get_sd_inserted())
-        return 0;
-
-    native_read_reopen_attempted = true;
-    ddr_trace_native_read_reopen();
-    return _ddr200_restore(FS_SDMMC_SD, true, true);
-}
-#endif
 #else
 #define _ddr200_reassert(mmc_id) ((void)(mmc_id))
 #endif

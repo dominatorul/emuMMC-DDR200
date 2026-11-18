@@ -48,9 +48,6 @@ typedef void (*_unlock_mutex)(void *mtx);
 
 bool sdmmc_initialize(void);
 void sdmmc_finalize(void);
-#ifdef EMUMMC_FORCE_DDR200
-int emummc_ddr200_reopen_for_read(sdmmc_storage_t *storage);
-#endif
 int sdmmc_nand_get_active_partition_index();
 sdmmc_accessor_t *sdmmc_accessor_get(int mmc_id);
 

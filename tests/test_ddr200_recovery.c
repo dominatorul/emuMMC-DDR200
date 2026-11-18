@@ -10,8 +10,11 @@ static unsigned tap_changes, recovery_attempts, recovery_successes;
 static bool full_tunes, full_status, powered;
 static bool train_after_restore;
 static unsigned host_restores;
-static bool reopen_succeeds, cid_matches;
-static unsigned native_reopens, cid_commands;
+static bool reject_default_mode;
+static unsigned link_resets, switch_commands, data_commands;
+static char scratch[512];
+static mmc_obj_t dma;
+static sdmmc_accessor_t accessor = { .parent = &dma };
 static u32 accepted_tap;
 static u32 io_failure;
 
@@ -28,13 +31,25 @@ int sdmmc_tuning_execute(sdmmc_t *target, u32 timing, u32 command)
 {
     assert(target == &host && timing == SDHCI_TIMING_UHS_DDR200);
     assert(command == MMC_SEND_TUNING_BLOCK);
-    assert(target->divisor == 199680 && !host.powersave_enabled);
+    assert(!host.powersave_enabled);
+    if (target->divisor == 166400) {
+        assert(_current_accessor == &accessor);
+        return 1;
+    }
+    assert(target->divisor == 199680);
     host.ddr200_retry_taps[0] = 85;
     host.ddr200_retry_taps[1] = 36;
     host.ddr200_retry_taps[2] = 44;
     host.ddr200_retry_count = 3;
     regs.venclkctl = 40 << 16;
-    return full_tunes || (train_after_restore && host_restores);
+    return full_tunes || (train_after_restore && host_restores) || switch_commands == 4;
+}
+
+int sdmmc_setup_clock(sdmmc_t *target, u32 timing)
+{
+    assert(target == &host && timing == SDHCI_TIMING_UHS_SDR12 && switch_commands == 2);
+    host.divisor = 25000;
+    return 1;
 }
 
 void sdmmc_ddr200_restore_host_cfg(sdmmc_t *target)
@@ -60,24 +75,24 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *request, u
 {
     assert(target == &host);
     if (!request) {
-        if (cmd->cmd == MMC_SELECT_CARD) {
-            if (!cid_commands) {
-                assert(cmd->arg == 0 && cmd->rsp_type == SDMMC_RSP_TYPE_0);
-            } else {
-                assert(cid_commands == 2 && cmd->arg == (card.rca << 16));
-            }
-            ++cid_commands;
-            return 1;
-        }
-        if (cmd->cmd == MMC_SEND_CID) {
-            assert(cid_commands == 1 && cmd->arg == (card.rca << 16) && cmd->rsp_type == SDMMC_RSP_TYPE_2);
-            ++cid_commands;
-            return 1;
-        }
         assert(cmd->cmd == MMC_SEND_STATUS);
         ++card_checks;
         return host.divisor == 166400 || full_status;
     }
+    if (cmd->cmd == SD_SWITCH) {
+        assert(request->blksize == 64 && !request->is_write && switch_commands < 4);
+        u32 system = switch_commands >= 2 ? 14 : 0;
+        assert(host.divisor == (system ? 25000u : 166400u));
+        assert(cmd->arg == (0x00FFFF0Fu | (system << 4) | ((switch_commands & 1u) << 31)));
+        ++switch_commands;
+        u8 *status = request->buf;
+        memset(status, 0, 64);
+        status[16] = reject_default_mode && switch_commands == 2 ? 0xF0 : system << 4;
+        memset(scratch, 0xAA, sizeof(scratch));
+        return 1;
+    }
+    ++data_commands;
+    assert(host.divisor == 199680);
     if (accepted_tap == regs.venclkctl >> 16 && full_setups && !request->is_write) {
         *blocks = 1;
         return 1;
@@ -89,13 +104,6 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *request, u
 
 int sdmmc_get_rsp(sdmmc_t *target, u32 *response, u32 size, u32 type)
 {
-    if (type == SDMMC_RSP_TYPE_2) {
-        assert(target == &host && size == sizeof(card.raw_cid));
-        memcpy(response, card.raw_cid, size);
-        if (!cid_matches)
-            response[0] ^= 1;
-        return 1;
-    }
     assert(target == &host && size == 4 && type == SDMMC_RSP_TYPE_1);
     *response = R1_STATE_TRAN << 9;
     return 1;
@@ -111,15 +119,6 @@ int sdmmc_stop_transmission(sdmmc_t *target, u32 *response)
 bool nx_sd_initialize(bool cycle) { (void)cycle; assert(false); return false; }
 
 int nx_sd_init_retry(bool cycle) { (void)cycle; assert(false); return 0; }
-int emummc_ddr200_reopen_for_read(sdmmc_storage_t *target)
-{
-    assert(target == &card && host.powersave_enabled && host.divisor == 199680);
-    ++native_reopens;
-    if (!reopen_succeeds)
-        return 0;
-    regs.venclkctl = 40 << 16;
-    return 1;
-}
 int sdmmc_get_sd_power_enabled(void) { return powered; }
 int clock_sdmmc_is_not_reset_and_enabled(u32 id) { assert(id == SDMMC_1); return 1; }
 int sdmmc_get_io_power(sdmmc_t *target) { assert(target == &host); return SDMMC_POWER_1_8; }
@@ -130,6 +129,10 @@ void sdmmc_card_clock_powersave(sdmmc_t *target, int enable)
     target->powersave_enabled = enable;
 }
 void msleep(u64 duration) { assert(duration == 50); }
+void Log(const char *format, ...) { (void)format; }
+void armDCacheFlush(void *address, size_t size) { assert(address == scratch && size == sizeof(scratch)); }
+void ddr_trace_card(const u8 *data, bool selected) { assert(data[16] == 0xE0 && selected); }
+void ddr_trace_link_reset(void) { ++link_resets; }
 void ddr_trace_stage(enum DdrStage next, u32 detail) { (void)next; (void)detail; }
 void ddr_trace_io_error(const sdmmc_t *target, u32 cmd, u32 blocks)
 {
@@ -155,13 +158,13 @@ static void reset(void)
     host.ddr200_retry_count = 0;
     full_setups = reduced_setups = card_checks = io_errors = 0;
     tap_changes = recovery_attempts = recovery_successes = 0;
-    native_reopens = cid_commands = 0;
     host_restores = 0;
+    link_resets = switch_commands = data_commands = 0;
+    reject_default_mode = false;
+    _current_accessor = NULL;
+    card.initialized = 1;
     full_tunes = full_status = true;
     train_after_restore = false;
-    reopen_succeeds = false;
-    cid_matches = true;
-    card.rca = 0xABCD;
     accepted_tap = SDMMC_INVALID_TAP;
     powered = true;
     io_failure = DdrCommandTransfer;
@@ -204,39 +207,45 @@ int main(void)
     accepted_tap = 36;
     assert(_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
     assert(full_setups == 1 && reduced_setups == 0 && io_errors == 3);
-    assert(recovery_attempts == 1 && recovery_successes == 1 && tap_changes == 2 && !native_reopens);
+    assert(recovery_attempts == 1 && recovery_successes == 1 && tap_changes == 2);
     assert(regs.venclkctl >> 16 == 36 && host.powersave_enabled);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
     assert(full_setups == 1 && reduced_setups == 0 && io_errors == 5 && host.powersave_enabled);
-    assert(recovery_attempts == 1 && !recovery_successes && tap_changes == 3 && native_reopens == 1);
+    assert(recovery_attempts == 1 && !recovery_successes && tap_changes == 3);
 
     reset();
     full_tunes = false;
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(full_setups == 2 && reduced_setups == 0 && io_errors == 1 && tap_changes == 0 && native_reopens == 1);
+    assert(full_setups == 2 && reduced_setups == 0 && io_errors == 1 && tap_changes == 0);
 
     reset();
+    dma.dmaBuffers[0].device_addr_buffer = scratch;
+    dma.dmaBuffers[0].device_addr_buffer_size = sizeof(scratch);
+    _current_accessor = &accessor;
+    memset(scratch, 0x63, sizeof(scratch));
     full_tunes = false;
-    reopen_succeeds = true;
     accepted_tap = 40;
     assert(_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(full_setups == 2 && reduced_setups == 0 && io_errors == 1);
-    assert(native_reopens == 1 && recovery_successes == 1 && tap_changes == 0);
+    assert(full_setups == 3 && reduced_setups == 1 && switch_commands == 4 && link_resets == 1);
+    assert(data_commands == 2 && recovery_successes == 1 && host.powersave_enabled && card.initialized);
+    for (unsigned i = 0; i < sizeof(scratch); ++i) assert(scratch[i] == 0x63);
 
     reset();
-    assert(sdmmc_storage_verify_sd_cid(&card));
-    assert(cid_commands == 3 && card_checks == 1);
-
-    reset();
-    cid_matches = false;
-    assert(!sdmmc_storage_verify_sd_cid(&card));
-    assert(cid_commands == 2 && !card_checks);
+    _current_accessor = &accessor;
+    full_tunes = false;
+    reject_default_mode = true;
+    memset(scratch, 0x63, sizeof(scratch));
+    assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
+    assert(data_commands == 1 && switch_commands == 2 && link_resets == 1 && !card.initialized);
+    assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
+    assert(data_commands == 1 && host.powersave_enabled);
+    for (unsigned i = 0; i < sizeof(scratch); ++i) assert(scratch[i] == 0x63);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 1));
-    assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts && !native_reopens);
+    assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts);
 
     reset();
     io_failure = DdrCommandDmaSetup;
@@ -248,5 +257,5 @@ int main(void)
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
     assert(full_setups == 0 && reduced_setups == 0 && io_errors == 5 && !recovery_attempts);
 
-    puts("DDR200 recovery: full-rate retraining, alternate taps, native reopen, and CID checks passed");
+    puts("DDR200 recovery: full-rate taps, CMD6 reset, DMA preservation and rejection of low-rate transfers passed");
 }

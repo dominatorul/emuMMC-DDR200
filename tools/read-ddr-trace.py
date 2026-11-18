@@ -11,14 +11,17 @@ STAGES = (
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
     'DMA polling', 'native SD power recovery', 'early SD power recovery', 'verify SD card identity',
-    'verify DMA buffers after native open',
+    'verify DMA buffers after native open', 'reset DDR200 command system',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
 PERF_TOTALS = struct.Struct('<18Q')
 PERF_CLOCK = struct.Struct('<5I')
-SWEEP_OFFSET = PERF_OFFSET + PERF_TOTALS.size + PERF_CLOCK.size
-SWEEP_HISTORY = struct.Struct('<8I')
+LEGACY_SWEEP_OFFSET = PERF_OFFSET + PERF_TOTALS.size + PERF_CLOCK.size
+LEGACY_SWEEPS = struct.Struct('<8I')
+SWEEP_OFFSET = 0x240
+SWEEP_HISTORY = struct.Struct('<32Q')
+HANDOFF_REGISTERS = ('flags', 'CAR.source', 'host.ctrl2_and_clock', 'vendor.clock')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
@@ -55,6 +58,28 @@ def print_performance(data):
               f'{fs_elapsed / 1e6:.3f}s including lock wait and recovery')
 
 
+def print_sweeps(data, sweeps, full_khz):
+    history = SWEEP_HISTORY.unpack_from(data, SWEEP_OFFSET)
+    omitted = max(0, sweeps - len(history))
+    if omitted:
+        print(f'{omitted} early sweeps exceed the report history capacity')
+    for i in range(omitted, sweeps):
+        sample = history[i % len(history)]
+        tap = sample & 0xFF
+        width = (sample >> 8) & 0xFF
+        start = tap - (width - 1) // 2
+        interval = f', passing taps {start}–{start + width - 1}' if width else ''
+        env = (sample >> 32) & 0xFFFF
+        khz = 166400 if env & 0x200 else full_khz
+        volts = ('off', '1.8 V', '3.3 V', 'unknown')[(env >> 10) & 3]
+        temperature = 'unavailable' if env & 0x1FF == 0x1FF else f'{((env & 0x1FF) - 256) / 2:.1f} °C'
+        time = sample >> 48
+        print(f'Sweep {i + 1} +{time / 100:.2f}s{" or later" if time == 65535 else ""} '
+              f'at {khz / 1000:.2f} MHz: center {tap}, width {width}{interval}, '
+              f'reassertions {(sample >> 16) & 0xFF}, data errors {(sample >> 24) & 0xFF}, '
+              f'CPU temperature {temperature}, SD I/O setting {volts}')
+
+
 def decode(path):
     data = path.read_bytes()
     if len(data) < 0x350:
@@ -62,13 +87,13 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 12:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 13:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
-    if trace_version >= 10 and len(data) < SWEEP_OFFSET:
+    if trace_version >= 10 and len(data) < LEGACY_SWEEP_OFFSET:
         raise ValueError(f'{path} is too short for a performance trace')
-    if trace_version >= 11 and len(data) < SWEEP_OFFSET + SWEEP_HISTORY.size:
+    if 11 <= trace_version <= 12 and len(data) < LEGACY_SWEEP_OFFSET + LEGACY_SWEEPS.size:
         raise ValueError(f'{path} is too short for a sweep history')
     has_rates = trace_version >= 7
     stage = gprs[1] >> 32
@@ -78,6 +103,12 @@ def decode(path):
         print(f'  CMD{(gprs[1] >> 16) & 0xFFFF}, blocks {gprs[1] & 0xFFFF}')
     if stage == STAGES.index('native SD power recovery') and gprs[1] & 0xFFFFFFFF == 0x218:
         print('  Native SDMMC ResultNoDevice (0x218)')
+    if stage == STAGES.index('reset DDR200 command system'):
+        steps = ('prepare command clock', 'check default command system',
+                 'select default command system', 'return host to SDR12 for negotiation')
+        step = gprs[1] & 0xFFFFFFFF
+        if step < len(steps):
+            print(f'  {steps[step]}')
     print(f'Completed reads {gprs[2] >> 32}, writes {gprs[2] & 0xFFFFFFFF}')
     sweeps = gprs[3] & 0xFFFFFFFF
     print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {sweeps}')
@@ -119,10 +150,15 @@ def decode(path):
         recovered = (gprs[31] >> 32) & 0xFFFFFF
         print(f'Full-rate read recoveries {recovered}/{attempts} successful')
         if trace_version >= 12:
-            print(f'Native SD reopens for failed reads {(gprs[31] >> 16) & 0xFFFF}')
+            label = 'CMD6 resets for failed reads' if trace_version >= 13 else 'Native SD reopens for failed reads'
+            print(f'{label} {(gprs[31] >> 16) & 0xFFFF}')
         if recovered:
             print(f'Last recovered read passed at tap {gprs[31] >> 56}')
-        history = SWEEP_HISTORY.unpack_from(data, SWEEP_OFFSET)
+    if trace_version >= 13:
+        first_khz, last_khz = gprs[7] >> 32, gprs[7] & 0xFFFFFFFF
+        print_sweeps(data, sweeps, max(first_khz, last_khz, gprs[16] & 0xFFFFFFFF))
+    elif trace_version >= 11:
+        history = LEGACY_SWEEPS.unpack_from(data, LEGACY_SWEEP_OFFSET)
         for i in range(max(0, sweeps - len(history)), sweeps):
             entry = history[i % len(history)]
             clock = '166.40 MHz recovery' if entry & (1 << 16) else 'full rate'
@@ -150,12 +186,17 @@ def decode(path):
     # AFE2 stack-trace and stack-dump regions carry the snapshots.
     states = {}
     for i, label in enumerate(SNAPSHOTS):
-        values = struct.unpack_from('<24I', data, 0x150 + i * 96)
+        if trace_version >= 13 and i >= 2:
+            names = HANDOFF_REGISTERS
+            values = struct.unpack_from('<4I', data, 0x210 + (i - 2) * 16)
+        else:
+            names = REGISTERS
+            values = struct.unpack_from('<24I', data, 0x150 + i * 96)
         if not values[0] & 1:
             continue
-        states[label] = values
+        states[label] = dict(zip(names, values))
         print(f'{label} (host accessible: {bool(values[0] & 2)}, Mariko: {bool(values[0] & 4)})')
-        for name, val in zip(REGISTERS[1:], values[1:]):
+        for name, val in zip(names[1:], values[1:]):
             print(f'  {name:24s} {val:08X}')
         if trace_version >= 9:
             power, mux, detect = struct.unpack_from('<3I', data, 0x350 + i * 12)
@@ -166,8 +207,9 @@ def decode(path):
         if left not in states or right not in states:
             continue
         print(f'{left} → {right}')
-        for name, before, after in zip(REGISTERS, states[left], states[right]):
-            if before != after:
+        for name, before in states[left].items():
+            after = states[right].get(name)
+            if after is not None and before != after:
                 print(f'  {name:24s} {before:08X} → {after:08X}')
 
 

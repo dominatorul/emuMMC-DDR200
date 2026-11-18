@@ -27,6 +27,7 @@
 #include "../utils/fatal.h"
 #include "../utils/log.h"
 #include "../utils/ddr_trace.h"
+#include "../nx/cache.h"
 #include "../soc/clock.h"
 #include "../emuMMC/emummc.h"
 
@@ -42,6 +43,10 @@ extern bool custom_driver;
 static bool sd_ddr200_reduced;
 #endif
 static int _sd_storage_train_DDR200(sdmmc_storage_t *storage);
+#ifdef EMUMMC_FORCE_DDR200
+int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group, u32 arg);
+int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf);
+#endif
 #endif
 
 static inline u32 unstuff_bits(u32 *resp, u32 start, u32 size)
@@ -266,27 +271,6 @@ static int _sdmmc_storage_check_status(sdmmc_storage_t *storage)
 	return _sdmmc_storage_get_status(storage, &tmp, 0);
 }
 
-#ifdef EMUMMC_FORCE_DDR200
-int sdmmc_storage_verify_sd_cid(sdmmc_storage_t *storage)
-{
-	sdmmc_t *host = storage->sdmmc;
-	sdmmc_cmd_t cmd;
-	u32 cid[4];
-
-	/* CMD10 is addressed and expects the card in standby. Confirm that the
-	   native open selected the same card before using the mounted volume. */
-	sdmmc_init_cmd(&cmd, MMC_SELECT_CARD, 0, SDMMC_RSP_TYPE_0, 0);
-	if (!sdmmc_execute_cmd(host, &cmd, NULL, NULL))
-		return 0;
-	sdmmc_init_cmd(&cmd, MMC_SEND_CID, storage->rca << 16, SDMMC_RSP_TYPE_2, 0);
-	if (!sdmmc_execute_cmd(host, &cmd, NULL, NULL) ||
-	    !sdmmc_get_rsp(host, cid, sizeof(cid), SDMMC_RSP_TYPE_2) ||
-	    memcmp(cid, storage->raw_cid, sizeof(cid)))
-		return 0;
-	return _sdmmc_storage_select_card(storage) && _sdmmc_storage_check_status(storage);
-}
-#endif
-
 static int _sdmmc_storage_readwrite_ex(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors, void *buf, u32 is_write)
 {
 	u32 tmp = 0;
@@ -348,11 +332,54 @@ static bool _sdmmc_read_timing_error(const sdmmc_t *host)
 		((host->command_irq >> 16) & (SDHCI_ERR_INT_DATA_CRC | SDHCI_ERR_INT_DATA_END_BIT));
 }
 
+static int _sd_storage_reset_DDR200_link(sdmmc_storage_t *storage)
+{
+	sdmmc_t *host = storage->sdmmc;
+	if (!_current_accessor || !_current_accessor->parent)
+		return 0;
+	int index = sdmmc_calculate_fitting_dma_index(_current_accessor, 1);
+	sdmmc_dma_buffer_t *pool = &_current_accessor->parent->dmaBuffers[index];
+	u8 saved[512], status[64];
+	if (!pool->device_addr_buffer || pool->device_addr_buffer_size < sizeof(saved))
+		return 0;
+
+	/* CMD6 falls back to this DMA sector for its local status buffer. */
+	armDCacheFlush(pool->device_addr_buffer, sizeof(saved));
+	memcpy(saved, pool->device_addr_buffer, sizeof(saved));
+	ddr_trace_link_reset();
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+	int ready = 0;
+	ddr_trace_stage(DdrResetLink, 0);
+	if (!sdmmc_setup_ddr200_clock(host, true) ||
+	    !sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK) ||
+	    !_sdmmc_storage_check_status(storage))
+		goto out;
+
+	/* Keep DDR signaling for the switch command's status block. The card
+	   takes the new command system after the status block and eight clocks. */
+	ddr_trace_stage(DdrResetLink, 1);
+	if (!_sd_storage_switch(storage, status, SD_SWITCH_CHECK, SD_SWITCH_GRP_CMDSYS, 0) || status[16] != 0)
+		goto out;
+	ddr_trace_stage(DdrResetLink, 2);
+	if (!_sd_storage_switch(storage, status, SD_SWITCH_SET, SD_SWITCH_GRP_CMDSYS, 0) || status[16] != 0)
+		goto out;
+	ddr_trace_stage(DdrResetLink, 3);
+	if (sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR12))
+		ready = _sd_storage_enable_DDR200(storage, status);
+
+out:
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+	memcpy(pool->device_addr_buffer, saved, sizeof(saved));
+	armDCacheFlush(pool->device_addr_buffer, sizeof(saved));
+	if (!ready)
+		storage->initialized = 0;
+	return ready;
+}
+
 static int _sd_storage_read_DDR200_taps(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
 {
 	sdmmc_t *host = storage->sdmmc;
-	/* A passing tuning pattern is necessary, then the original read verifies
-	   the tap under normal DMA and clock gating. */
+	/* Confirm each candidate under real DMA and normal clock gating. */
 	for (u32 attempt = 0; ; ++attempt) {
 		if (_sdmmc_storage_readwrite_ex(storage, blocks, sector, count, buf, 0)) {
 			ddr_trace_read_recovery(host, true);
@@ -379,9 +406,7 @@ static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, 
 		timing_error = _sdmmc_read_timing_error(host);
 	}
 
-	/* If host tuning still fails, reset the card session through the
-	   runtime power owner and verify the original read. */
-	if (!timing_error || !emummc_ddr200_reopen_for_read(storage))
+	if (!timing_error || !_sd_storage_ddr200_ready_for_retry(storage) || !_sd_storage_reset_DDR200_link(storage))
 		return 0;
 	return _sd_storage_read_DDR200_taps(storage, blocks, sector, count, buf);
 }
@@ -424,7 +449,7 @@ reinit_try:
 		} while (retries);
 
 #ifdef EMUMMC_FORCE_DDR200
-		/* Read recovery is bounded to one attempt for each request. */
+		/* Recovery changes only the powered card's signaling and retries reads. */
 		if (!first_reinit || is_write || host->command_failure < DdrCommandResponse ||
 		    !_sd_storage_ddr200_ready_for_retry(storage))
 			return 0;

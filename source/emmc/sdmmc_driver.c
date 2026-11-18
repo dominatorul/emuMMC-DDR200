@@ -756,7 +756,7 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 	u32 best_size;
 	u32 best_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &best_size);
 	int pass = best_size >= SDMMC_SAMPLE_WIN_SIZE_MIN;
-	ddr_trace_tuning(tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size, sdmmc->divisor);
+	ddr_trace_tuning(sdmmc, tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size);
 
 	_sdmmc_manual_tuning_log(sdmmc, tuning, best_tap, best_size, pass);
 

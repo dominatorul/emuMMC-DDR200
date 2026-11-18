@@ -4,12 +4,13 @@
 #include "ddr_trace.h"
 #include "ddr_watchdog.h"
 #include "util.h"
+#include "../nx/svc.h"
 #include "../soc/clock.h"
 #include "../soc/gpio.h"
 #include "../soc/pinmux.h"
 #include "../soc/t210.h"
 
-enum { SnapshotWords = 24, SweepHistoryLength = 8 };
+enum { SnapshotWords = 24, SweepHistoryLength = 32, NoTemperature = 0x1FF };
 static _Atomic u32 snapshots[DdrSnapshotCount][SnapshotWords];
 static _Atomic u32 power_pins[DdrSnapshotCount][3];
 static _Atomic u32 first_maps[8], latest_maps[8];
@@ -22,8 +23,9 @@ static _Atomic u32 boot_power_recoveries;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
 static _Atomic u64 first_error_hw, latest_error_hw;
 static _Atomic u32 read_recovery_attempts, read_recovery_successes, read_recovery_tap;
-static _Atomic u32 native_read_reopens;
-static _Atomic u32 sweep_history[SweepHistoryLength];
+static _Atomic u32 link_resets;
+static _Atomic u64 sweep_history[SweepHistoryLength];
+static u64 first_sweep_us;
 /* SD commands include both the SD filesystem and emulated NAND. The outer
    FS counters select only SD filesystem I/O, including mutex wait time. */
 enum { PerfCalls, PerfBlocks, PerfElapsed, PerfDma, PerfBounce, PerfErrors, PerfFields };
@@ -77,8 +79,41 @@ void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
     atomic_store_explicit(&snapshots[slot][0], values[0], memory_order_release);
 }
 
-void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 tap, u32 width, u32 khz)
+static u32 cpu_temperature_code(void)
 {
+    enum {
+        SocThermBase = 0x700E2000, SocThermClock = 1u << 14,
+        Cpu0Config = 0xC4, Cpu0Status = 0xD0,
+    };
+    const u32 enabled = 1u << 31;
+    if (!(CLOCK(CLK_RST_CONTROLLER_CLK_OUT_ENB_U) & SocThermClock) ||
+        (CLOCK(CLK_RST_CONTROLLER_RST_DEVICES_U) & SocThermClock))
+        return NoTemperature;
+
+    u64 mapped, size;
+    Result result = emuMMC_ctx.fs_ver >= FS_VER_10_0_0
+        ? svcQueryIoMapping(&mapped, &size, SocThermBase, 0x1000)
+        : svcLegacyQueryIoMapping(&mapped, SocThermBase, 0x1000);
+    if (result)
+        return NoTemperature;
+    const volatile u32 *therm = (const volatile u32 *)(uintptr_t)mapped;
+    if (!(therm[Cpu0Config / 4] & enabled))
+        return NoTemperature;
+    u32 value = therm[Cpu0Status / 4];
+    if (!(value & enabled))
+        return NoTemperature;
+
+    /* Tegra's readback uses an 8-bit magnitude, a half-degree bit and a sign. */
+    int halves = (value >> 7) & 0x1FF;
+    if (value & 1)
+        halves = -halves;
+    return halves >= -256 && halves < 255 ? (u32)(halves + 256) : NoTemperature;
+}
+
+void ddr_trace_tuning(sdmmc_t *host, const u32 raw[4], const u32 complete[4],
+                      u32 count, u32 tap, u32 width)
+{
+    u32 khz = host->divisor;
     /* 9 bits for count (128 is valid), then 8 for tap, then width. */
     latest_window = count | (tap << 9) | (width << 17);
     latest_khz = khz;
@@ -90,10 +125,17 @@ void ddr_trace_tuning(const u32 raw[4], const u32 complete[4], u32 count, u32 ta
         atomic_store_explicit(&latest_maps[i], raw[i], memory_order_relaxed);
         atomic_store_explicit(&latest_maps[i + 4], complete[i], memory_order_relaxed);
     }
-    /* Each entry includes the reassert and failed-command counts when sampled. */
+    u64 now = get_tmr_us();
+    if (!sweeps)
+        first_sweep_us = now;
+    u64 centiseconds = (now - first_sweep_us) / 10000;
+    u32 environment = cpu_temperature_code() |
+        ((u32)(khz == SDMMC_DDR200_RECOVERY_CARD_KHZ) << 9) |
+        ((sdmmc_get_io_power(host) & 3u) << 10);
+    /* One atomic record preserves the window and its conditions together. */
     sweep_history[sweeps % SweepHistoryLength] = tap | (width << 8) |
-        ((u32)(khz == SDMMC_DDR200_RECOVERY_CARD_KHZ) << 16) |
-        (MIN(attempts, 127u) << 17) | (MIN(io_errors, 255u) << 24);
+        (MIN(attempts, 255u) << 16) | (MIN(io_errors, 255u) << 24) |
+        ((u64)environment << 32) | (MIN(centiseconds, 0xFFFFu) << 48);
     if (++sweeps == 1) {
         first_window = latest_window;
         first_khz = khz;
@@ -145,7 +187,7 @@ void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded)
     }
 }
 
-void ddr_trace_native_read_reopen(void) { ++native_read_reopens; }
+void ddr_trace_link_reset(void) { ++link_resets; }
 
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
                        u32 blocks, u64 elapsed_us, u64 dma_us)
@@ -189,7 +231,7 @@ void ddr_trace_boot_power(void)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x444452323030000Cull;
+    ctx->gprs[0] = 0x444452323030000Dull;
     ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
@@ -214,16 +256,31 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[30] = latest_error_hw;
     ctx->gprs[31] = ((u64)read_recovery_tap << 56) |
         ((u64)MIN(read_recovery_successes, 0xFFFFFFu) << 32) |
-        (MIN(native_read_reopens, 0xFFFFu) << 16) | MIN(read_recovery_attempts, 0xFFFFu);
-    u32 saved[DdrSnapshotCount][SnapshotWords];
+        (MIN(link_resets, 0xFFFFu) << 16) | MIN(read_recovery_attempts, 0xFFFFu);
+    struct {
+        u32 tuning[2][SnapshotWords];
+        u32 handoff[3][4];
+        u64 sweeps[SweepHistoryLength];
+    } saved;
     for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
-        saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
-        for (u32 i = 1; i < SnapshotWords; ++i)
-            saved[slot][i] = atomic_load_explicit(&snapshots[slot][i], memory_order_relaxed);
+        u32 flags = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
+        if (slot < DdrBeforeOpen) {
+            saved.tuning[slot][0] = flags;
+            for (u32 i = 1; i < SnapshotWords; ++i)
+                saved.tuning[slot][i] = atomic_load_explicit(&snapshots[slot][i], memory_order_relaxed);
+        } else {
+            u32 *handoff = saved.handoff[slot - DdrBeforeOpen];
+            handoff[0] = flags;
+            handoff[1] = atomic_load_explicit(&snapshots[slot][1], memory_order_relaxed);  /* CAR source */
+            handoff[2] = atomic_load_explicit(&snapshots[slot][12], memory_order_relaxed); /* host mode and divider */
+            handoff[3] = atomic_load_explicit(&snapshots[slot][14], memory_order_relaxed); /* tap and trim */
+        }
     }
+    for (u32 i = 0; i < SweepHistoryLength; ++i)
+        saved.sweeps[i] = atomic_load_explicit(&sweep_history[i], memory_order_relaxed);
     _Static_assert(sizeof(saved) <= sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump), "trace too large");
-    memcpy(ctx->stack_trace, saved, sizeof(ctx->stack_trace));
-    memcpy(ctx->stack_dump, (const u8 *)saved + sizeof(ctx->stack_trace),
+    memcpy(ctx->stack_trace, &saved, sizeof(ctx->stack_trace));
+    memcpy(ctx->stack_dump, (const u8 *)&saved + sizeof(ctx->stack_trace),
         sizeof(saved) - sizeof(ctx->stack_trace));
     /* The reserved TLS dump holds GPIO input, drive and pinmux state. */
     u32 pins[DdrSnapshotCount][3];
@@ -242,12 +299,8 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     u32 clocks[5];
     for (u32 i = 0; i < 5; ++i)
         clocks[i] = atomic_load_explicit(&perf_clock[i], memory_order_relaxed);
-    u32 history[SweepHistoryLength];
-    for (u32 i = 0; i < SweepHistoryLength; ++i)
-        history[i] = atomic_load_explicit(&sweep_history[i], memory_order_relaxed);
-    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks) + sizeof(history)
-        <= sizeof(ctx->tls), "performance and sweep trace too large");
+    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks)
+        <= sizeof(ctx->tls), "performance trace too large");
     memcpy(ctx->tls + sizeof(pins), performance, sizeof(performance));
     memcpy(ctx->tls + sizeof(pins) + sizeof(performance), clocks, sizeof(clocks));
-    memcpy(ctx->tls + sizeof(pins) + sizeof(performance) + sizeof(clocks), history, sizeof(history));
 }

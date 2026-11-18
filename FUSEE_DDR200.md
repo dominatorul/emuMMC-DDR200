@@ -83,23 +83,33 @@ After a read CRC or data end-bit error, it retunes the powered
 card once and repeats the original DMA read. If that still fails with a
 timing error, it tries the center of a second passing window, when one exists,
 and two interior taps of the largest window. It keeps the tap that passes the
-actual read. Windows still need eight passing taps.
+actual read. It stops with a report if recovery fails. Windows still need
+eight passing taps. The report saves the last eight sweeps with reassert and
+data error counts, the failure tap and Auto CMD12 status, and read recovery
+results.
 
-Report `0000000000aa0640` shows that the second reassertion found a 16-tap
-window at 199.68 MHz. A subsequent 32-block CMD18 failed at tap 36 with a
-data CRC error. The controller marked Auto CMD12 as unexecuted. Both
-recovery sweeps measured seven passing taps, including the sweep after
-host pad recalibration. The driver stopped before retrying with another tap.
+Report `0000000000aa0640` showed full-rate sweep centers of 40, 40, 36, 32
+and 32. The second reassertion still had 16 passing taps. The following
+32-block CMD18 failed at tap 36, and both recovery sweeps had seven passing taps.
+The native card-reopen build stalled at the Nintendo logo and left no report.
 
-When full-rate host recovery still fails after a read timing error, this
-build can close and reopen the card through Horizon's native SD accessor.
-It checks the existing DMA mappings and the card CID, restores DDR200 at
-199.68 MHz, and retries the original read. It allows one such reopen per
-native handoff. A failed recovery saves a report. The report includes the
-last eight sweeps, the failing tap and Auto CMD12 status, and the number of
-native reopens for failed reads.
+This build resets the card's command system in place after an unsuccessful
+full-rate read recovery. It uses a verified 166.40 MHz tap for CMD6 control
+commands to exit vendor DDR200, negotiates again from SDR12, and returns to
+199.68 MHz before issuing filesystem data transfers. Both data and control
+tuning require at least eight passing taps. If negotiation fails, the driver
+rejects further transfers on that card session and saves a report.
 
-Use **More Configs → Fusee DDR200 card reopen (1.11.2)**. The entry chainloads the
+Reports record up to 32 sweeps in order, including the center and passing
+interval, clock, elapsed time, reassertions and data-command errors at each
+sweep. They also include a read-only Tegra CPU thermal sensor sample when
+the sensor is active and valid, and the controller's configured SD signaling
+voltage. The measurement is CPU temperature. The controller voltage field
+reports its setting. Measuring voltage at the card requires an external probe.
+Reports keep full initial and latest sweep registers plus clock, divider,
+tap and GPIO state around handoffs.
+
+Use **More Configs → Fusee DDR200 sweep history (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
