@@ -12,7 +12,12 @@
 
 enum {
     HistoryCount = 48,
-#ifdef EMUMMC_DDR200_MATRIX
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    WakeCount = 22,
+#else
+    WakeCount = 0,
+#endif
+#if defined(EMUMMC_DDR200_MATRIX) && !defined(EMUMMC_DDR200_DLL_DIAG)
     MatrixCount = 40,
 #else
     MatrixCount = 0,
@@ -22,7 +27,7 @@ enum {
 #else
     DmaCount = 0,
 #endif
-    RuntimeCount = HistoryCount - MatrixCount - DmaCount
+    RuntimeCount = HistoryCount - MatrixCount - DmaCount - WakeCount
 };
 typedef struct {
     _Atomic u64 timing;
@@ -30,6 +35,58 @@ typedef struct {
 } sweep_event_t;
 
 static sweep_event_t history[HistoryCount];
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static _Atomic u32 wake_events;
+static _Atomic u32 first_wake_failure;
+void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
+{
+    if (step == WakeSuspend)
+        first_wake_failure = 0;
+    if (step == WakeFirstFailure && first_wake_failure)
+        return;
+    sweep_event_t *entry = &history[RuntimeCount + wake_events % WakeCount];
+    entry->timing = (get_tmr_us() & 0x00ffffffffffffffull) | ((u64)step << 56);
+    entry->settings = ((u64)detail << 32) | result;
+    ++wake_events;
+    if (step == WakeFirstFailure)
+        first_wake_failure = wake_events;
+}
+
+void ddr_trace_wake_host(const sdmmc_t *host)
+{
+    bool live = host->regs && clock_sdmmc_is_not_reset_and_enabled(SDMMC_1);
+    ddr_trace_wake(WakeHost, live ? ((u32)host->regs->hostctl << 16) | host->regs->hostctl2 : 0,
+        (live ? ((u32)host->regs->clkcon << 16) | 1 : 0) |
+        (gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4) << 1));
+    ddr_trace_wake(WakePower, CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1),
+        PINMUX_AUX(PINMUX_AUX_DMIC3_CLK));
+}
+#endif
+#ifdef EMUMMC_DDR200_DLL_DIAG
+enum { DllRows = 26, OtherRows = 6 };
+static _Atomic u32 dll_rows, other_rows, dll_state;
+static _Atomic u32 dll_history[DllRows + OtherRows][6];
+void ddr_trace_dll_result(unsigned status)
+{
+    if (status == 1)
+        dll_rows = 0;
+    dll_state = status;
+}
+void ddr_trace_dll_sweep(const sdmmc_t *host, ddr_eye_t eye, u8 kind)
+{
+    bool experiment = kind >= 32 && kind <= 35;
+    unsigned row = experiment ? dll_rows % DllRows : DllRows + other_rows % OtherRows;
+    dll_history[row][0] = host->regs->venclkctl;
+    dll_history[row][1] = host->regs->vencapover;
+    dll_history[row][2] = host->regs->veniotrimctl;
+    dll_history[row][3] = host->regs->vendllcalcfg;
+    dll_history[row][4] = host->regs->vendllcalcfgsts;
+    dll_history[row][5] = eye.left | ((u32)eye.right << 8) | ((u32)kind << 16) |
+        ((u32)(host->regs->hostctl2 & 7) << 24);
+    if (experiment) ++dll_rows;
+    else ++other_rows;
+}
+#endif
 static u64 trace_started;
 static _Atomic u32 runtime_events, matrix_events;
 static _Atomic u32 reads, writes, reasserts, io_errors, ready_khz;
@@ -100,6 +157,9 @@ static void record_event(u8 kind, u32 khz, ddr_eye_t eye, unsigned tap, u8 drive
 void ddr_trace_policy_sweep(const sdmmc_t *host, ddr_eye_t eye, unsigned tap, u8 kind, u8 drive, u64 started)
 {
     record_event(kind, host->divisor, eye, tap, drive, started);
+#ifdef EMUMMC_DDR200_DLL_DIAG
+    ddr_trace_dll_sweep(host, eye, kind);
+#endif
     bus_registers = ((u64)host->divisor << 32) | ((u32)host->regs->hostctl2 << 16) | host->regs->clkcon;
     clock_registers = ((u64)CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1) << 32) | host->regs->venclkctl;
 }
@@ -390,8 +450,10 @@ void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-#if defined(EMUMMC_DDR200_ADMA_PROBE)
-    ctx->gprs[0] = 0x4444523230300019ull;
+#if defined(EMUMMC_DDR200_DLL_DIAG)
+    ctx->gprs[0] = ctx->error_desc == 0xdd200066u ? 0x444452323030001aull : 0x444452323030001bull;
+#elif defined(EMUMMC_DDR200_ADMA_PROBE)
+    ctx->gprs[0] = 0x444452323030001aull;
 #elif defined(EMUMMC_DDR200_COUNTED_READS)
     ctx->gprs[0] = 0x4444523230300015ull;
 #elif defined(EMUMMC_DDR200_READ_AHEAD)
@@ -457,6 +519,23 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     }
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     data[HistoryCount - DmaCount + DdrDmaStats][1] = io_errors;
+#endif
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    ctx->gprs[3] |= (u64)MIN(wake_events, 0xffffu) << 48;
+    ctx->gprs[13] |= (u64)MIN(first_wake_failure, 0xffffu) << 48;
+#endif
+#ifdef EMUMMC_DDR200_DLL_DIAG
+    if (ctx->error_desc != 0xdd200066u) {
+        ctx->gprs[4] = ((u64)other_rows << 32) | dll_rows;
+        ctx->gprs[31] = dll_state;
+        u32 rows[DllRows + OtherRows][6];
+        for (unsigned i = 0; i < DllRows + OtherRows; ++i)
+            for (unsigned j = 0; j < 6; ++j)
+                rows[i][j] = dll_history[i][j];
+        memcpy(data, rows, sizeof(rows));
+        ctx->stack_trace_size = 0;
+        ctx->stack_dump_size = 0;
+    }
 #endif
     _Static_assert(sizeof(data) == sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump) + sizeof(ctx->tls),
         "sweep trace capacity");

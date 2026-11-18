@@ -276,7 +276,9 @@ typedef struct _sdmmc_t
 	u32 dma_resumes;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	bool prefetch;
-	bool handoff_sdma;
+	bool handoff_sdma, wake_sdma;
+	u8 wake_commands;
+	bool wake_pending, wake_monitor;
 	sdmmc_dma_progress_t dma_progress;
 #endif
 	u32 rsp[4];
@@ -323,6 +325,9 @@ void sdmmc_set_bus_width(sdmmc_t *sdmmc, u32 bus_width);
 void sdmmc_save_tap_value(sdmmc_t *sdmmc);
 int  sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type);
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+#ifdef EMUMMC_DDR200_DLL_DIAG
+int sdmmc_ddr200_dll_probe(sdmmc_t *host);
+#endif
 int  sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced);
 void sdmmc_set_ddr200_tap(sdmmc_t *sdmmc, u32 tap);
 u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 complete[4]);

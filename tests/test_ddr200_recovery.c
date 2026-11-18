@@ -4,6 +4,12 @@
 #include "../source/emmc/sdmmc.c"
 #include "../source/emmc/sdmmc_ddr200.c"
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
+{ (void)step; (void)detail; (void)result; }
+void ddr_trace_wake_host(const sdmmc_t *host) { (void)host; }
+#endif
+
 static t210_sdmmc_t regs;
 static sdmmc_t host = {.regs = &regs, .id = SDMMC_1};
 static sdmmc_storage_t card;
@@ -17,7 +23,10 @@ static bool reject_type_c;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 enum { RelaxedProbes = 3 };
 static unsigned full_probe_failures, full_data_taps[8], full_data_calls, drop_probes;
-static unsigned handoff_data;
+static unsigned handoff_data, wake_remaps, wake_attempts;
+static bool wake_modes[4];
+bool sdmmc_adma_remap(void) { ++wake_remaps; return true; }
+void fatal_abort(enum FatalReason reason) { (void)reason; __builtin_trap(); }
 static bool reject_handback;
 static enum DdrDropReason drop_reason;
 void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
@@ -146,6 +155,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     if (host.handoff_sdma)
         ++handoff_data;
+    if (wake_remaps || host.wake_commands)
+        if (wake_attempts < 4) wake_modes[wake_attempts++] = host.wake_sdma;
     if (reject_handback && cmd->cmd == SD_SWITCH && cmd->arg == 0x80ffff03) {
         assert(host.handoff_sdma);
         return 0;
@@ -346,7 +357,7 @@ static void reset(void)
     card.ddr.last_sweep_us = now;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     full_probe_failures = full_data_calls = drop_probes = 0;
-    handoff_data = 0;
+    handoff_data = wake_remaps = wake_attempts = 0;
     reject_handback = false;
     drop_reason = DdrDropUnknown;
 #endif
@@ -410,6 +421,16 @@ int main(void)
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+    reset();
+    host.wake_commands = 8;
+    regs.capareg = SDHCI_CAN_ADMA2;
+    regs.hcver = 3;
+    regs.hostctl2 |= SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN;
+    fail_reads = 2;
+    u32 retried = 0;
+    assert(sdmmc_storage_transfer(&card, &retried, 0, 16, buf, false));
+    assert(retried == 16 && wake_remaps == 1 && wake_attempts == 3 && host.wake_commands == 7);
+    assert(!wake_modes[0] && !wake_modes[1] && wake_modes[2] && !host.wake_sdma);
     reset();
     host.prefetch = true;
     fail_reads = no_ready = 1;

@@ -267,6 +267,36 @@ out:;
 	return result;
 }
 
+#ifdef EMUMMC_DDR200_DLL_DIAG
+int sdmmc_ddr200_dll_probe(sdmmc_t *host)
+{
+    t210_sdmmc_t *regs = host->regs;
+    if ((regs->hostctl2 & 7) != UHS_DDR50_BUS_SPEED)
+        return 0;
+    const u16 clock = regs->clkcon;
+    const u32 config = regs->vendllcalcfg;
+    regs->clkcon |= SDHCI_CLOCK_CARD_EN;
+    regs->vendllcalcfg = config | TEGRA_MMC_DLLCAL_CFG_EN_CALIBRATE;
+    _sdmmc_commit_changes(host);
+    u64 deadline = get_tmr_us() + 10000;
+    bool active = false;
+    int result = -1;
+    do {
+        u32 status = regs->vendllcalcfgsts;
+        active |= (status & TEGRA_MMC_DLLCAL_CFG_STATUS_DLL_ACTIVE) != 0;
+        if (!(regs->vendllcalcfg & TEGRA_MMC_DLLCAL_CFG_EN_CALIBRATE) &&
+            !(status & TEGRA_MMC_DLLCAL_CFG_STATUS_DLL_ACTIVE)) {
+            result = active ? 1 : 0;
+            break;
+        }
+    } while (get_tmr_us() < deadline);
+    regs->vendllcalcfg = config;
+    regs->clkcon = clock;
+    _sdmmc_commit_changes(host);
+    return result;
+}
+#endif
+
 static u64 _sdmmc_limit_ms(const sdmmc_t *sdmmc, u64 timeout)
 {
 	return sdmmc->deadline_us ? MIN(timeout, (sdmmc->deadline_us + 999) / 1000) : timeout;
@@ -1150,7 +1180,12 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	if (blkcnt >= 0xFFFF)
 		blkcnt = 0xFFFF;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	bool adma = sdmmc->id == SDMMC_1 && !sdmmc->handoff_sdma && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
+	bool adma = sdmmc->id == SDMMC_1 && !sdmmc->handoff_sdma && !sdmmc->wake_sdma &&
+		(sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
+#ifdef EMUMMC_DDR200_ADMA_READAHEAD_ONLY
+	adma &= !req->is_write && req->blksize == 512 &&
+		sdmmc_read_ahead_dma(req->buf, blkcnt) != 0;
+#endif
 	if (adma) {
 		sdmmc->dma_progress.mode = SdmmcDmaAdma2;
 		blkcnt = MIN(blkcnt, SdmmcAdmaBytes / req->blksize);

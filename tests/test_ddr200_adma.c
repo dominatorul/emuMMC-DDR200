@@ -7,6 +7,12 @@
 #undef sdmmc_get_sd_inserted
 #include "../source/emmc/sdmmc_read_ahead.c"
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
+{ (void)step; (void)detail; (void)result; }
+void ddr_trace_wake_host(const sdmmc_t *host) { (void)host; }
+#endif
+
 static t210_sdmmc_t regs;
 static sdmmc_t host = {.regs = &regs, .id = SDMMC_1, .divisor = 199680};
 static sdmmc_storage_t card = {.sdmmc = &host, .has_sector_access = true, .sec_cnt = 32768};
@@ -47,7 +53,8 @@ void ddr_trace_batch_refused(enum DdrBatchRefusal reason) { ++refusals[reason]; 
 void ddr_trace_sdma_restart(bool handoff) { (void)handoff; ++restarts; }
 void ddr_trace_descriptor_mapping(bool unmap, u32 handle, Result result)
 {
-    assert(handle == das && (!result || (!unmap && !mapping_ok)));
+    assert((unmap ? handle == descriptor_mapping.das : handle == das) &&
+        (!result || (!unmap && !mapping_ok)));
 }
 void ddr_trace_batch_seq(u32 blocks, bool hit)
 {
@@ -262,6 +269,9 @@ static void test_dma(void)
     mapping_ok = true;
     assert(_sdmmc_config_dma(&host, &blocks, &request));
     assert(host.dma_progress.mode == SdmmcDmaAdma2 && maps == 1);
+    ++das;
+    assert(sdmmc_adma_remap() && descriptor_mapping.das == das);
+    assert(maps == 2 && unmaps == 1);
 }
 
 int main(void)

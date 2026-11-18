@@ -1,16 +1,24 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <assert.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include "../source/emuMMC/emummc.h"
 #define armGetTls() ((void *)0)
 #include "../source/emuMMC/emummc.c"
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
+{ (void)step; (void)detail; (void)result; }
+void ddr_trace_wake_host(const sdmmc_t *host) { (void)host; }
+#endif
 
 static bool powered;
 static t210_sdmmc_t registers;
 static sdmmc_accessor_t sd_accessor, nand_accessor;
 static unsigned locks, closed, opened, reasserted, handbacks;
 static unsigned unmapped, wake_started;
-static bool private_mapping;
+static bool private_mapping, fail_handback, expect_snapshot;
+static jmp_buf snapshot;
 static char sd_lock, nand_lock;
 volatile emuMMC_ctx_t emuMMC_ctx = {.EMMC_Type = emuMMC_SD_Raw};
 sdmmc_accessor_t *_current_accessor;
@@ -30,13 +38,17 @@ void ddr_trace_stage(enum DdrStage stage, u32 detail) { (void)stage; (void)detai
 void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host) { (void)slot; (void)host; }
 void ddr_trace_power(enum DdrPowerEvent event, bool ok)
 {
-    assert(ok);
+    assert(ok || (event == DdrPowerHandback && fail_handback));
     if (event == DdrPowerReasserting)
         ++wake_started;
 }
 void ddr_trace_wait_native(void) {}
 void ddr_watchdog_phase(uintptr_t thread, enum DdrOpPhase phase) { (void)thread; (void)phase; }
-void fatal_abort(enum FatalReason reason) { (void)reason; __builtin_trap(); }
+void fatal_abort(enum FatalReason reason)
+{
+    assert(expect_snapshot && reason == Fatal_DdrWake);
+    longjmp(snapshot, 1);
+}
 void sdmmc_read_ahead_reset(void)
 {
     if (private_mapping) {
@@ -106,7 +118,7 @@ bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *card)
     card->ddr.rate = DdrRateSdr104;
     registers.hostctl2 = UHS_SDR104_BUS_SPEED;
     ++handbacks;
-    return true;
+    return !fail_handback;
 }
 
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *card)
@@ -150,5 +162,11 @@ int main(void)
 
     registers.hostctl2 = UHS_SDR104_BUS_SPEED;
     assert(_ddr200_reassert(FS_SDMMC_EMMC) && reasserted == 4 && opened == 3);
+    private_mapping = fail_handback = expect_snapshot = true;
+    if (!setjmp(snapshot)) {
+        controller_close(FS_SDMMC_EMMC);
+        assert(false);
+    }
+    assert(!private_mapping && closed == 3 && unmapped == 4);
     puts("Three paired suspend/wake cycles and a host-only wake passed in the lifecycle model");
 }

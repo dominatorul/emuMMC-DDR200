@@ -758,7 +758,7 @@ void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed)
     storage->ddr.last_io = get_tmr_us();
 }
 
-#ifdef EMUMMC_DDR200_MATRIX
+#if defined(EMUMMC_DDR200_MATRIX) && !defined(EMUMMC_DDR200_DLL_DIAG)
 enum MatrixPhase {
     MatrixNoise, MatrixGated, MatrixFree, MatrixLoad, MatrixIdle, MatrixDrive, MatrixSpeed, MatrixSettle
 };
@@ -1087,5 +1087,103 @@ void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage)
 {
     storage->ddr.matrix_active = false;
     ddr_trace_matrix(DdrMatrixSkipped, matrix.phase | (matrix.reduced ? 0x80 : 0), matrix.details);
+}
+#endif
+
+
+#ifdef EMUMMC_DDR200_DLL_DIAG
+/* The baseline runs first. Calibration may update internal delay state;
+   the writable control registers are restored by the calibration helper. */
+static struct {
+    unsigned samples, blocks;
+    bool started, dll;
+} dll_matrix;
+
+void sdmmc_ddr200_matrix_restart(void)
+{
+    memset(&dll_matrix, 0, sizeof(dll_matrix));
+}
+
+static bool dll_matrix_finish(sdmmc_storage_t *storage, unsigned status)
+{
+    storage->ddr.matrix_active = false;
+    ddr_trace_dll_result(status);
+    return false;
+}
+
+static void dll_matrix_sweep(sdmmc_storage_t *storage, u8 kind)
+{
+    sdmmc_t *host = storage->sdmmc;
+    u32 raw[4] = {0}, passing[4] = {0}, samples;
+    bool saved = host->powersave_enabled;
+    u32 tune0 = host->regs->ventunctl0, tune1 = host->regs->ventunctl1;
+    u32 clock = host->regs->venclkctl;
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+    u64 started = get_tmr_us();
+    u64 previous = begin_budget(host, 10000);
+    ddr_eye_t eye = scan_eye(storage, &storage->ddr.history[0], true, raw, passing, &samples);
+    host->deadline_us = previous;
+    host->regs->ventunctl0 = tune0;
+    host->regs->ventunctl1 = tune1;
+    host->regs->venclkctl = clock;
+    (void)host->regs->venclkctl;
+    sdmmc_card_clock_powersave(host, saved);
+    ddr_trace_policy_sweep(host, eye, tap_readback(host), kind, storage->ddr.drive, started);
+}
+
+bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
+{
+    enum { LoadBlocks = 64 * 1024 * 1024 / 512, SweepBlocks = 8 * 1024 * 1024 / 512 };
+    sdmmc_t *host = storage->sdmmc;
+    if (storage->ddr.rate != DdrRateFull || !storage->ddr.ready ||
+        (host->regs->hostctl2 & 7) != UHS_DDR50_BUS_SPEED ||
+        !storage->has_sector_access || storage->sec_cnt < LoadBlocks)
+        return dll_matrix_finish(storage, 6);
+    if (!dll_matrix.started) {
+        dll_matrix.started = true;
+        storage->ddr.matrix_active = true;
+        ddr_trace_dll_result(1);
+    }
+    if (dll_matrix.samples < 5) {
+        dll_matrix_sweep(storage, dll_matrix.dll ? 34 : 32);
+        ++dll_matrix.samples;
+        return true;
+    }
+    char *dma = borrow_dma(DdrVerifyBlocks, verify_backup);
+    if (!dma)
+        return dll_matrix_finish(storage, 6);
+    bool ok = true;
+    for (unsigned i = 0; i < 8; ++i) {
+        u32 done = 0;
+        u64 previous = begin_budget(host, 10000);
+        ok = sdmmc_storage_transfer(storage, &done, dll_matrix.blocks, DdrVerifyBlocks, dma, false) &&
+            done == DdrVerifyBlocks;
+        host->deadline_us = previous;
+        if (!ok) break;
+        dll_matrix.blocks += done;
+    }
+    restore_dma(dma, verify_backup, sizeof(verify_backup));
+    if (!ok)
+        return dll_matrix_finish(storage, 6);
+    if (dll_matrix.blocks % SweepBlocks == 0)
+        dll_matrix_sweep(storage, dll_matrix.dll ? 35 : 33);
+    if (dll_matrix.blocks != LoadBlocks)
+        return true;
+    if (dll_matrix.dll)
+        return dll_matrix_finish(storage, 5);
+
+    int calibrated = sdmmc_ddr200_dll_probe(host);
+    ddr_trace_dll_sweep(host, (ddr_eye_t){DdrTapCount, 0}, 36);
+    if (calibrated <= 0)
+        return dll_matrix_finish(storage, calibrated ? 4 : 3);
+    dll_matrix.dll = true;
+    dll_matrix.samples = dll_matrix.blocks = 0;
+    ddr_trace_dll_result(2);
+    return true;
+}
+
+void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage)
+{
+    dll_matrix_finish(storage, 7);
 }
 #endif

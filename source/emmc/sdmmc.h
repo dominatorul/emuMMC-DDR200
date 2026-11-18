@@ -151,3 +151,10 @@ void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage);
 #endif
 
 #endif
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_adma_remap(void);
+#endif
+#ifdef EMUMMC_DDR200_DLL_DIAG
+void sdmmc_ddr200_matrix_restart(void);
+#endif

@@ -67,8 +67,10 @@ static bool map_window(dma_window_t *mapping, Handle das, void *buffer, size_t b
             dma, permission);
         ddr_trace_read_ahead_map(rc);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-        if (mapping == &descriptor_mapping)
+        if (mapping == &descriptor_mapping) {
             ddr_trace_descriptor_mapping(false, das, rc);
+            ddr_trace_wake(WakeMap, das, rc);
+        }
 #endif
         if (!rc) {
             mapping->das = das;
@@ -90,6 +92,9 @@ static void unmap_window(dma_window_t *mapping, void *buffer, size_t bytes)
     if (mapping == &descriptor_mapping)
         ddr_trace_descriptor_mapping(true, mapping->das, rc);
 #endif
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    ddr_trace_wake(WakeRetire, mapping == &read_ahead.mapping ? 0 : 1, rc);
+#endif
     mapping->dma = 0;
     mapping->failed = rc != 0;
     if (!rc)
@@ -106,11 +111,26 @@ u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks)
 }
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_adma_remap(void)
+{
+    unmap_window(&descriptor_mapping, &descriptor_table, sizeof(descriptor_table));
+    if (!sdmmc_das_handle || !*sdmmc_das_handle)
+        return false;
+    /* A new live DAS gets its own validated mapping. A failed unmap on
+       the same handle leaves the old mapping quarantined. */
+    if (descriptor_mapping.das == 0 || descriptor_mapping.das != *sdmmc_das_handle)
+        descriptor_mapping.failed = false;
+    return map_window(&descriptor_mapping, *sdmmc_das_handle,
+        &descriptor_table, sizeof(descriptor_table), Perm_R);
+}
+
 u64 sdmmc_adma_table(u64 dma, u32 bytes)
 {
     if (!dma || !bytes || (dma & 7) || bytes > SdmmcAdmaBytes || dma + bytes < dma ||
-        !sdmmc_das_handle || !map_window(&descriptor_mapping, *sdmmc_das_handle,
-            &descriptor_table, sizeof(descriptor_table), Perm_R))
+        !sdmmc_das_handle ||
+        (descriptor_mapping.failed && descriptor_mapping.das != *sdmmc_das_handle ?
+            !sdmmc_adma_remap() : !map_window(&descriptor_mapping, *sdmmc_das_handle,
+            &descriptor_table, sizeof(descriptor_table), Perm_R)))
         return 0;
 
     unsigned count = 0;

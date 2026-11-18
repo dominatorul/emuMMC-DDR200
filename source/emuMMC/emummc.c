@@ -61,6 +61,9 @@ volatile Handle *sdmmc_das_handle;
 file_based_ctxt f_emu;
 static bool fat_mounted = false;
 static bool native_sd_opened;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static bool native_ddr_verified;
+#endif
 static unsigned native_sd_transitions;
 
 enum { BootPowerRecoveryLimit = 2, BootPowerWindowUs = 10000000 };
@@ -148,15 +151,39 @@ static bool _ddr200_reassert(int mmc_id)
 #endif
     clock_sdmmc_invalidate_clock_source(SDMMC_1);
     bool resuming = sd_storage.ddr.resume_rate != DdrRateUnknown;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    bool wake = resuming || sd_sdmmc.wake_pending || native_ddr_verified;
+    if (wake && !sd_sdmmc.wake_pending)
+        ddr_trace_wake_host(&sd_sdmmc);
+#endif
     if (resuming)
         ddr_trace_power(DdrPowerReasserting, true);
     bool ready = sdmmc_ddr200_handoff(&sd_storage);
     wait_for_native = !ready;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    native_ddr_verified |= ready;
+    if (wake) {
+        ddr_trace_wake(WakeReassert, sd_storage.ddr.rate, !ready);
+        if (!ready)
+            fatal_abort(Fatal_DdrWake);
+        sd_sdmmc.wake_pending = false;
+        sd_sdmmc.wake_commands = 8;
+        sd_sdmmc.wake_monitor = true;
+    }
+#endif
     if (resuming)
         ddr_trace_power(DdrPowerReasserted, ready);
 #ifdef EMUMMC_DDR200_MATRIX
+#ifdef EMUMMC_DDR200_DLL_DIAG
+    if (ready && sd_storage.ddr.rate == DdrRateFull) {
+        sdmmc_ddr200_matrix_restart();
+        matrix_finished = false;
+        matrix_next_step = get_tmr_us();
+    }
+#else
     if (ready && sd_storage.ddr.rate >= DdrRateReduced && !matrix_next_step)
         matrix_next_step = get_tmr_us() + 20000000;
+#endif
 #endif
     return ready;
 }
@@ -551,6 +578,14 @@ static uint64_t controller_open(int mmc_id)
         mutex_lock_handler(FS_SDMMC_EMMC);
         --native_sd_transitions;
         native_sd_opened = !result;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        if (sd_sdmmc.wake_pending) {
+            ddr_trace_wake(WakeOpen, 0, result);
+            ddr_trace_wake_host(&sd_sdmmc);
+            if (result)
+                fatal_abort(Fatal_DdrWake);
+        }
+#endif
         if (sd_storage.initialized) {
             bool retained_ddr = sd_storage.ddr.ready && _ddr200_power_ready() &&
                 (sd_sdmmc.regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED;
@@ -595,6 +630,12 @@ static uint64_t controller_close(int mmc_id)
                 _current_accessor = sd;
                 ddr_trace_stage(DdrNativeClose, 0);
                 ddr_trace_power(DdrPowerClosing, true);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+                sd_sdmmc.wake_commands = 0;
+                sd_sdmmc.wake_monitor = false;
+                sd_sdmmc.wake_pending = true;
+                ddr_trace_wake(WakeSuspend, 0, 0);
+#endif
                 bool standard = !sd_storage.ddr.capable ||
                     (_ddr200_power_ready() && sdmmc_ddr200_prepare_suspend(&sd_storage));
                 ddr_trace_power(DdrPowerHandback, standard);
@@ -602,6 +643,12 @@ static uint64_t controller_close(int mmc_id)
                 /* Retire both private mappings after the final FS-owned
                    command, before Horizon can close the address space. */
                 sdmmc_read_ahead_reset();
+#endif
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+                if (!standard) {
+                    ddr_trace_wake(WakeFailed, WakeSuspend, 1);
+                    fatal_abort(Fatal_DdrWake);
+                }
 #endif
             }
             _current_accessor = previous;
@@ -616,6 +663,11 @@ static uint64_t controller_close(int mmc_id)
                 native_sd_opened = result != 0;
                 ddr_trace_stage(DdrNativeClose, result);
                 ddr_trace_power(DdrPowerClosed, !result);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+                ddr_trace_wake(WakeClose, 0, result);
+                if (result)
+                    fatal_abort(Fatal_DdrWake);
+#endif
                 mutex_unlock_handler(FS_SDMMC_EMMC);
             }
         }
@@ -650,8 +702,16 @@ static bool _sdmmc_prepare_io(int mmc_id, sdmmc_accessor_t *accessor)
         }
         bool pending = native_sd_transitions ||
             (wait_for_native && (!native_sd_opened || !_ddr200_power_ready()));
-        if (!pending || get_tmr_us() >= deadline)
+        if (!pending || get_tmr_us() >= deadline) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+            if (sd_sdmmc.wake_pending) {
+                ddr_trace_wake_host(&sd_sdmmc);
+                ddr_trace_wake(WakeFailed, WakeReassert, pending ? 2 : 1);
+                fatal_abort(Fatal_DdrWake);
+            }
+#endif
             return false;
+        }
         mutex_unlock_handler(mmc_id);
         svcSleepThread(10000000);
     }

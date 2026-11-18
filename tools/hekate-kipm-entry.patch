@@ -1,0 +1,80 @@
+--- a/Versions.inc
++++ b/Versions.inc
+@@ -2,7 +2,7 @@
+ BLVERSION_MAJOR := 6
+ BLVERSION_MINOR := 5
+ BLVERSION_HOTFX := 5
+-BLVERSION_REL   := 0
++BLVERSION_REL   := 50
+ 
+ # Nyx Version.
+ NYXVERSION_MAJOR := 1
+--- a/bdk/ianos/ianos.h
++++ b/bdk/ianos/ianos.h
+@@ -19,6 +19,7 @@
+ #define IANOS_H
+ 
+ #include <utils/types.h>
++#include <stdint.h>
+ #include <module.h>
+ 
+ typedef enum
+--- a/bdk/utils/types.h
++++ b/bdk/utils/types.h
+@@ -19,6 +19,7 @@
+ #define _TYPES_H_
+ 
+ #include <assert.h>
++#include <stdint.h>
+ 
+ /* Types */
+ typedef signed char s8;
+--- a/bootloader/hos/pkg2.c
++++ b/bootloader/hos/pkg2.c
+@@ -430,7 +430,7 @@
+ 	return 0;
+ }
+ 
+-const char *pkg2_patch_kips(link_t *info, char *patch_names)
++const char *pkg2_patch_kips(link_t *info, char *patch_names, const char *emummc_kipm)
+ {
+ 	bool emummc_patch_selected = false;
+ 
+@@ -656,7 +656,7 @@
+ 
+ 				// Inject emuMMC code.
+ 				gfx_printf("Injecting emuMMC. FS ID: %d\n", emu_cfg.fs_ver);
+-				if (_kipm_inject("bootloader/sys/emummc.kipm", "FS", ki))
++				if (_kipm_inject(emummc_kipm, "FS", ki))
+ 					return "emummc";
+ 
+ 				// Skip checking again.
+--- a/bootloader/hos/pkg2.h
++++ b/bootloader/hos/pkg2.h
+@@ -214,7 +214,7 @@
+ void pkg2_add_kip(link_t *info, pkg2_kip1_t *kip1);
+ void pkg2_merge_kip(link_t *info, pkg2_kip1_t *kip1);
+ void pkg2_get_ids(kip1_id_t **ids, u32 *entries);
+-const char *pkg2_patch_kips(link_t *info, char *patch_names);
++const char *pkg2_patch_kips(link_t *info, char *patch_names, const char *emummc_kipm);
+ 
+ const pkg2_kernel_id_t *pkg2_identify(const u8 *hash);
+ pkg2_hdr_t *pkg2_decrypt(void *data, u8 mkey, bool is_exo);
+--- a/bootloader/hos/hos.c
++++ b/bootloader/hos/hos.c
+@@ -1007,7 +1007,14 @@
+ 	}
+ 
+ 	// Patch kip1s in memory if needed.
+-	const char *failed_patch = pkg2_patch_kips(&kip1_info, ctxt.kip1_patches);
++	const char *emummc_kipm = "bootloader/sys/emummc.kipm";
++	if (cfg) {
++		LIST_FOREACH_ENTRY(ini_kv_t, kv, &cfg->kvs, link) {
++			if (!strcmp(kv->key, "ddr200_kipm"))
++				emummc_kipm = kv->val;
++		}
++	}
++	const char *failed_patch = pkg2_patch_kips(&kip1_info, ctxt.kip1_patches, emummc_kipm);
+ 	if (failed_patch != NULL)
+ 	{
+ 		EHPRINTFARGS("Failed to apply '%s'!", failed_patch);

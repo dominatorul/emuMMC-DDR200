@@ -205,9 +205,77 @@ def print_lifecycle(data, offset):
           f'outside handoff {max(0, all_restarts - handoff_restarts)}')
 
 
+WAKE_STEPS = ('suspend begin', 'handoff CMD6', 'mapping retired', 'native close',
+              'native open', 'wake host registers', 'wake power registers', 'wake reassertion',
+              'descriptor map', 'ordinary command', 'DMA retry', 'wake failure', 'first failure')
+DLL_REGISTERS = ('venclkctl', 'vencapover', 'veniotrimctl', 'vendllcalcfg', 'vendllcalcfgsts')
+
+
+def print_wake(data, gprs, offset):
+    count = gprs[3] >> 48
+    if not count:
+        return
+    first = gprs[13] >> 48
+    print(f'Lifecycle breadcrumbs, first failure record {first or "unavailable"}')
+    for i in range(max(0, count - 22), count):
+        timing, result, detail = struct.unpack_from('<QII', data, offset + (i % 22) * 16)
+        step = timing >> 56
+        label = WAKE_STEPS[step] if step < len(WAKE_STEPS) else str(step)
+        if step == 5:
+            fields = f'hostctl {detail >> 16:#04x}, hostctl2 {detail & 0xFFFF:#06x}, clkcon {result >> 16:#06x}, live {bool(result & 1)}, GPIO {(result >> 1) & 0x7fff:#06x}'
+        elif step == 6:
+            fields = f'CAR {detail:#010x}, pinmux {result:#010x}'
+        elif step == 1:
+            fields = f'{DMA_MODES[result >> 30]}, argument {detail:#010x}, result {result & 0x3fffffff:#010x}'
+        elif step in (9, 10):
+            mode = detail & 3
+            fields = f'{DMA_MODES[mode]}, detail {detail:#x}, result {result:#010x}'
+        else:
+            fields = f'detail {detail:#x}, result {result:#010x}'
+        print(f'  {timing & 0x00FFFFFFFFFFFFFF} us {label}, {fields}')
+
+
+def print_dll(data, gprs):
+    status = ('pending', 'baseline running', 'DLL running', 'DLL inactive', 'calibration timed out',
+              'complete', 'link or I/O unavailable', 'cancelled')
+    state = gprs[31]
+    print(f'DLL matrix {status[state] if state < len(status) else state}')
+    matrix_count, other_count = gprs[4] & 0xFFFFFFFF, gprs[4] >> 32
+    baseline, calibrated = [], []
+    for base, count, capacity in ((0, matrix_count, 26), (26, other_count, 6)):
+        previous = None
+        for i in range(max(0, count - capacity), count):
+            *regs, packed = struct.unpack_from('<6I', data, 0x150 + (base + i % capacity) * 24)
+            left, right, kind, mode = packed & 255, (packed >> 8) & 255, (packed >> 16) & 255, packed >> 24
+            width = max(0, right - left + 1)
+            arm = {32:'baseline idle', 33:'baseline stream', 34:'DLL idle', 35:'DLL stream', 36:'post-calibration registers'}.get(kind, f'sweep {kind}')
+            if kind in (32, 33): baseline.append((left, right, width))
+            if kind in (34, 35): calibrated.append((left, right, width))
+            changed = ''
+            if previous and previous[0] > width:
+                moved = [name for name, a, b in zip(DLL_REGISTERS, previous[1], regs) if a != b]
+                changed = ', narrowed, registers changed ' + (', '.join(moved) or 'none')
+            warning = ' (expected 4)' if mode != 4 else ''
+            print(f'  {arm}, eye {left}–{right} ({width}), UHS mode {mode}{warning}, ' +
+                  ', '.join(f'{name}={value:08X}' for name, value in zip(DLL_REGISTERS, regs)) +
+                  f', DLL active {bool(regs[4] & 0x80000000)}' + changed)
+            previous = width, regs
+    for label, arm in (('baseline', baseline), ('DLL', calibrated)):
+        if arm:
+            widths = [row[2] for row in arm]
+            print(f'  {label} widths {min(widths)}–{max(widths)}, {len(arm)} sweeps')
+
+
 def print_policy_trace(data, gprs):
     if len(data) < 0x450:
         raise ValueError('report is too short for the DDR200 policy trace')
+    version = gprs[0] & 0xFF
+    if version >= 26:
+        mode = (gprs[28] >> 16) & 7
+        print(f'Last sampled UHS mode {mode}' + (' (expected 4)' if mode != 4 else ''))
+    if version == 27:
+        print_dll(data, gprs)
+        return
     matrix_capacity = gprs[4] & 0xFFFFFFFF
     if matrix_capacity not in (0, 40):
         raise ValueError('invalid DDR200 trace capacity')
@@ -295,6 +363,9 @@ def print_policy_trace(data, gprs):
     if perf_version >= 25:
         print_lifecycle(data, 0x150 + (48 - dma_capacity) * 16)
     runtime_capacity = 48 - matrix_capacity - dma_capacity
+    if perf_version == 26:
+        runtime_capacity -= 22
+        print_wake(data, gprs, 0x150 + runtime_capacity * 16)
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
         ('Matrix', gprs[4] >> 32, matrix_capacity, runtime_capacity),
@@ -341,7 +412,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 25:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 27:
         raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
@@ -352,6 +423,8 @@ def decode(path):
     has_rates = trace_version >= 7
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
+    if reason == 0xDD200066 and trace_version >= 26:
+        print('Automatic sleep/wake failure snapshot')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
     if trace_version >= 15:
         if stage == STAGES.index('DMA polling') and ((gprs[1] >> 16) & 0xFFFF) == 6:
