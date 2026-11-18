@@ -140,6 +140,10 @@ static bool _ddr200_reassert(int mmc_id)
     wait_for_native = !ready;
     if (resuming)
         ddr_trace_power(DdrPowerReasserted, ready);
+#ifdef EMUMMC_DDR200_MATRIX
+    if (ready && sd_storage.ddr.rate >= DdrRateReduced)
+        ddr_watchdog_arm_matrix();
+#endif
     return ready;
 }
 
@@ -416,11 +420,7 @@ static void _ddr200_matrix_worker(void *unused)
 
 void emummc_start_ddr200_matrix(void)
 {
-    static bool started;
     static _Alignas(16) u8 stack[0x4000];
-    if (started)
-        return;
-    started = true;
     Handle thread;
     Result result = svcCreateThread(&thread, _ddr200_matrix_worker, NULL, stack + sizeof(stack), 54, 3);
     if (!result) {

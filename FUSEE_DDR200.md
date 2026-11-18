@@ -40,9 +40,9 @@ to restore the previous DDR200 rate. Both wake paths preserve DMA scratch.
 
 ## Matrix
 
-The diagnostic boots with the release runtime policy. After reaching HOME,
-hold Volume Up by itself for one second to start the matrix. Hold Volume
-Down by itself to end it. It compares five repeated scans per clock, gating
+The diagnostic boots with the release runtime policy and starts the matrix
+20 seconds after the first successful native DDR200 handoff. Hold Volume
+Down by itself to skip or end it. It compares five repeated scans per clock, gating
 between tap samples versus leaving the clock on, and the 0, 10 and 100 ms
 settling targets after a confirmed DDR200 switch. The report measures each
 settling scan's start relative to the switch. Later scans may start after
@@ -68,8 +68,8 @@ attribute a reversible change to heat or rail droop.
 
 ## Console test
 
-1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs. At
-   HOME hold **Volume +** by itself for one second, then wait about two minutes.
+1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs and
+   leave it at HOME for about two minutes.
 2. Hold **Volume + and Volume −** together for three seconds, then reconnect
    in SD UMS. Collect the new file from `atmosphere/fatal_errors`.
 3. Boot **Fusee DDR200 (release policy)** and record the read and write
