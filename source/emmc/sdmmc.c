@@ -266,6 +266,27 @@ static int _sdmmc_storage_check_status(sdmmc_storage_t *storage)
 	return _sdmmc_storage_get_status(storage, &tmp, 0);
 }
 
+#ifdef EMUMMC_FORCE_DDR200
+int sdmmc_storage_verify_sd_cid(sdmmc_storage_t *storage)
+{
+	sdmmc_t *host = storage->sdmmc;
+	sdmmc_cmd_t cmd;
+	u32 cid[4];
+
+	/* CMD10 is addressed and expects the card in standby. Confirm that the
+	   native open selected the same card before using the mounted volume. */
+	sdmmc_init_cmd(&cmd, MMC_SELECT_CARD, 0, SDMMC_RSP_TYPE_0, 0);
+	if (!sdmmc_execute_cmd(host, &cmd, NULL, NULL))
+		return 0;
+	sdmmc_init_cmd(&cmd, MMC_SEND_CID, storage->rca << 16, SDMMC_RSP_TYPE_2, 0);
+	if (!sdmmc_execute_cmd(host, &cmd, NULL, NULL) ||
+	    !sdmmc_get_rsp(host, cid, sizeof(cid), SDMMC_RSP_TYPE_2) ||
+	    memcmp(cid, storage->raw_cid, sizeof(cid)))
+		return 0;
+	return _sdmmc_storage_select_card(storage) && _sdmmc_storage_check_status(storage);
+}
+#endif
+
 static int _sdmmc_storage_readwrite_ex(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors, void *buf, u32 is_write)
 {
 	u32 tmp = 0;
@@ -327,16 +348,9 @@ static bool _sdmmc_read_timing_error(const sdmmc_t *host)
 		((host->command_irq >> 16) & (SDHCI_ERR_INT_DATA_CRC | SDHCI_ERR_INT_DATA_END_BIT));
 }
 
-static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
+static int _sd_storage_read_DDR200_taps(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
 {
 	sdmmc_t *host = storage->sdmmc;
-	ddr_trace_read_recovery(host, false);
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-	int tuned = _sd_storage_train_DDR200(storage);
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
-	if (!tuned)
-		return 0;
-
 	/* A passing tuning pattern is necessary, then the original read verifies
 	   the tap under normal DMA and clock gating. */
 	for (u32 attempt = 0; ; ++attempt) {
@@ -349,6 +363,27 @@ static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, 
 			return 0;
 		sdmmc_set_ddr200_tap(host, host->ddr200_retry_taps[attempt]);
 	}
+}
+
+static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
+{
+	sdmmc_t *host = storage->sdmmc;
+	bool timing_error = _sdmmc_read_timing_error(host);
+	ddr_trace_read_recovery(host, false);
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+	int tuned = _sd_storage_train_DDR200(storage);
+	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+	if (tuned) {
+		if (_sd_storage_read_DDR200_taps(storage, blocks, sector, count, buf))
+			return 1;
+		timing_error = _sdmmc_read_timing_error(host);
+	}
+
+	/* If host tuning still fails, reset the card session through the
+	   runtime power owner and verify the original read. */
+	if (!timing_error || !emummc_ddr200_reopen_for_read(storage))
+		return 0;
+	return _sd_storage_read_DDR200_taps(storage, blocks, sector, count, buf);
 }
 #endif
 
@@ -389,8 +424,7 @@ reinit_try:
 		} while (retries);
 
 #ifdef EMUMMC_FORCE_DDR200
-		/* PCV owns card power after startup. Keep recovery to a single
-		   retune of the powered card and retry only read transfers. */
+		/* Read recovery is bounded to one attempt for each request. */
 		if (!first_reinit || is_write || host->command_failure < DdrCommandResponse ||
 		    !_sd_storage_ddr200_ready_for_retry(storage))
 			return 0;

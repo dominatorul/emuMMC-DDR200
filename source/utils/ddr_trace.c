@@ -22,6 +22,7 @@ static _Atomic u32 boot_power_recoveries;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
 static _Atomic u64 first_error_hw, latest_error_hw;
 static _Atomic u32 read_recovery_attempts, read_recovery_successes, read_recovery_tap;
+static _Atomic u32 native_read_reopens;
 static _Atomic u32 sweep_history[SweepHistoryLength];
 /* SD commands include both the SD filesystem and emulated NAND. The outer
    FS counters select only SD filesystem I/O, including mutex wait time. */
@@ -144,6 +145,8 @@ void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded)
     }
 }
 
+void ddr_trace_native_read_reopen(void) { ++native_read_reopens; }
+
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
                        u32 blocks, u64 elapsed_us, u64 dma_us)
 {
@@ -186,7 +189,7 @@ void ddr_trace_boot_power(void)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x444452323030000Bull;
+    ctx->gprs[0] = 0x444452323030000Cull;
     ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
@@ -210,7 +213,8 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[29] = first_error_hw;
     ctx->gprs[30] = latest_error_hw;
     ctx->gprs[31] = ((u64)read_recovery_tap << 56) |
-        ((u64)MIN(read_recovery_successes, 0xFFFFFFu) << 32) | read_recovery_attempts;
+        ((u64)MIN(read_recovery_successes, 0xFFFFFFu) << 32) |
+        (MIN(native_read_reopens, 0xFFFFu) << 16) | MIN(read_recovery_attempts, 0xFFFFu);
     u32 saved[DdrSnapshotCount][SnapshotWords];
     for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
         saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);

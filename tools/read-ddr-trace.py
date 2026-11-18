@@ -10,7 +10,8 @@ STAGES = (
     'boot', 'card initialization', 'ready', 'native SD open', 'host state check',
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
-    'DMA polling', 'native SD power recovery', 'early SD power recovery',
+    'DMA polling', 'native SD power recovery', 'early SD power recovery', 'verify SD card identity',
+    'verify DMA buffers after native open',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
@@ -61,7 +62,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9, 10, 11):
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 12:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
@@ -114,9 +115,11 @@ def decode(path):
                           f'Auto CMD12 status {hw & 0xFFFF:04X}')
 
     if trace_version >= 11:
-        attempts = gprs[31] & 0xFFFFFFFF
+        attempts = gprs[31] & (0xFFFF if trace_version >= 12 else 0xFFFFFFFF)
         recovered = (gprs[31] >> 32) & 0xFFFFFF
         print(f'Full-rate read recoveries {recovered}/{attempts} successful')
+        if trace_version >= 12:
+            print(f'Native SD reopens for failed reads {(gprs[31] >> 16) & 0xFFFF}')
         if recovered:
             print(f'Last recovered read passed at tap {gprs[31] >> 56}')
         history = SWEEP_HISTORY.unpack_from(data, SWEEP_OFFSET)
