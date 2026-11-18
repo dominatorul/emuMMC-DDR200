@@ -256,6 +256,8 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     u32 raw[4] = {0}, passing[4] = {0}, samples;
     u64 started = get_tmr_us();
     ddr_eye_t eye = scan_eye(storage, history, local, raw, passing, &samples);
+    if (kind == DdrSweepInitial)
+        eye = ddr_widest_eye(passing, samples);
     ddr_eye_t previous = history->eyes[0];
     bool had_eye = history->count != 0;
     if (ddr_eye_width(eye))

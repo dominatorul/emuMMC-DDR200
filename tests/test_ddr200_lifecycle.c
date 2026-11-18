@@ -134,6 +134,13 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *card)
 
 int main(void)
 {
+    assert(clock_pllc4_ddr200_compatible(0x58006804));
+    assert(clock_pllc4_ddr200_compatible(0x58003402));
+    assert(!clock_pllc4_ddr200_compatible(0x58003502));
+    assert(!clock_pllc4_ddr200_compatible(0x58083402));
+    assert(!clock_pllc4_ddr200_compatible(0x50003402));
+    assert(!clock_pllc4_ddr200_compatible(0x58000000));
+
     static sdmmc_accessor_vt_t vtable = {
         .sdmmc_accessor_controller_open = native_open, .sdmmc_accessor_controller_close = native_close,
     };

@@ -395,6 +395,16 @@ static void reset(void)
 
 static void test_eye_model(void)
 {
+    u32 initial_map[4] = {0};
+    for (unsigned tap = 2; tap <= 9; ++tap)
+        initial_map[0] |= 1u << tap;
+    for (unsigned tap = 117; tap < DdrTapCount; ++tap)
+        initial_map[tap / 32] |= 1u << (tap % 32);
+    ddr_eye_t widest = ddr_widest_eye(initial_map, DdrTapCount);
+    assert(widest.left == 117 && widest.right == 127);
+    widest = ddr_widest_eye(initial_map, 124);
+    assert(widest.left == 2 && widest.right == 9);
+
     ddr_history_t history = {0};
     const ddr_eye_t eyes[] = {{32, 48}, {29, 44}, {29, 35}, {29, 44}};
     u32 excluded[4] = {0};

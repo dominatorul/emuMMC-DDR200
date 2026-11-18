@@ -95,6 +95,20 @@ static inline ddr_eye_t ddr_first_eye(const u32 map[4], unsigned first, unsigned
     return (ddr_eye_t){DdrTapCount, 0};
 }
 
+static inline ddr_eye_t ddr_widest_eye(const u32 map[4], unsigned end)
+{
+    ddr_eye_t best = {DdrTapCount, 0};
+    for (unsigned first = 0; first < end;) {
+        ddr_eye_t eye = ddr_first_eye(map, first, end, 1);
+        if (!ddr_eye_width(eye))
+            break;
+        if (ddr_eye_width(eye) > ddr_eye_width(best))
+            best = eye;
+        first = eye.right + 1u;
+    }
+    return best;
+}
+
 static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)
 {
     history->eyes[2] = history->eyes[1];

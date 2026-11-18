@@ -68,8 +68,8 @@ static bool _clock_enable_pllc4(void)
 {
 	u32 old_base = CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
 	u32 old_misc = CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC);
-	if ((old_base & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | 0xFFFFFF))
-		== (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | (104 << 8) | 4))
+	// Horizon can restore 52/2 instead of 104/4. Both produce 998.4 MHz.
+	if (clock_pllc4_ddr200_compatible(old_base))
 		return true;
 	if (old_base & PLLCX_BASE_ENABLE)
 		return false;

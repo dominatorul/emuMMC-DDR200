@@ -146,6 +146,17 @@
 #define PLLC4_OUT3_CLKEN     (1 << 1)
 #define PLLC4_OUT3_RSTN_CLR  (1 << 0)
 
+static inline bool clock_pllc4_ddr200_compatible(u32 base)
+{
+	u32 divm = base & 0xff;
+	u32 divn = (base >> 8) & 0xff;
+	u32 divp = (base >> 19) & 0x1f;
+	const u32 required = PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK;
+	const u32 rejected = PLLCX_BASE_REF_DIS | PLLC4_BASE_IDDQ;
+	return (base & (required | rejected)) == required &&
+		!divp && divm && divn == 26 * divm;
+}
+
 /*! Generic clock descriptor. */
 typedef struct _sclock_t
 {
