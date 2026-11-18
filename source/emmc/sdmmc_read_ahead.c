@@ -11,7 +11,7 @@ enum {
     ReadAheadBlocks = ReadAheadBytes / 512,
     ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadRunIn = 512 * 1024 / 512,
-    ReadAheadShort = 1024 * 1024 / 512,
+    ReadAheadMinEye = 9,
     DeviceAlignment = 4 * 1024 * 1024,
 };
 
@@ -27,7 +27,7 @@ static struct {
     u32 first;
     u32 blocks;
     bool mapping_failed;
-    bool short_reads;
+    bool fill_failed;
 } read_ahead;
 
 static bool map_read_buffer(Handle das)
@@ -84,6 +84,13 @@ void sdmmc_read_ahead_reset(void)
     read_ahead.mapping_failed |= rc != 0;
 }
 
+static bool read_ahead_eye_ready(const ddr_policy_t *policy)
+{
+    const ddr_history_t *history = &policy->history[0];
+    return policy->rate == DdrRateFull && history->count &&
+        ddr_eye_width(history->eyes[0]) >= ReadAheadMinEye;
+}
+
 bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out)
 {
     sdmmc_t *host = storage->sdmmc;
@@ -108,23 +115,22 @@ bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bloc
     bool covered = read_ahead.blocks && read_ahead.das == das &&
         sector >= read_ahead.first && end <= (u64)read_ahead.first + read_ahead.blocks;
     if (!covered) {
-        if (preceding < ReadAheadRunIn ||
-            !sdmmc_ddr200_before_io(storage, sector, false) || storage->ddr.rate != DdrRateFull)
-            return false;
-
-        u32 fill = read_ahead.short_reads || storage->ddr.narrow ? ReadAheadShort : ReadAheadBlocks;
-        if (fill <= blocks || (u64)sector + fill > storage->sec_cnt || !map_read_buffer(das))
+        if (read_ahead.fill_failed || preceding < ReadAheadRunIn ||
+            (u64)sector + ReadAheadBlocks > storage->sec_cnt ||
+            !read_ahead_eye_ready(&storage->ddr) ||
+            !sdmmc_ddr200_before_io(storage, sector, false) ||
+            !read_ahead_eye_ready(&storage->ddr) || !map_read_buffer(das))
             return false;
         read_ahead.blocks = 0;
         u32 done = 0;
         u64 start = get_tmr_us();
         u64 previous_deadline = host->deadline_us;
         host->deadline_us = previous_deadline ? MIN(previous_deadline, start + 200000) : start + 200000;
-        bool ok = sdmmc_storage_transfer(storage, &done, sector, fill, read_buffer, false);
+        bool ok = sdmmc_storage_transfer(storage, &done, sector, ReadAheadBlocks, read_buffer, false);
         host->deadline_us = previous_deadline;
-        ddr_trace_read_ahead_fill(ok && done == fill);
-        if (!ok || done != fill) {
-            read_ahead.short_reads = true;
+        ddr_trace_read_ahead_fill(ok && done == ReadAheadBlocks);
+        if (!ok || done != ReadAheadBlocks) {
+            read_ahead.fill_failed = true;
             read_ahead.sequential_blocks = 0;
             if (!ok)
                 sdmmc_ddr200_recover(storage, sector, false);

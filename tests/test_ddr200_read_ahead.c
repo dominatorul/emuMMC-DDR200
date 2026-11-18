@@ -11,7 +11,7 @@ static sdmmc_storage_t card = {
 };
 static bool map_ok = true, transfer_ok = true, inserted = true;
 static unsigned maps, unmaps, transfers, recoveries, served, mapped_sectors;
-static unsigned expected_fill = ReadAheadBlocks, fills[2];
+static unsigned fills[2];
 static u64 time_us = 1234;
 
 Result svcMapDeviceAddressSpaceAligned(Handle das, Handle process, u64 address, u64 size,
@@ -48,7 +48,7 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector,
     u32 blocks, void *buf, u32 write)
 {
-    assert(storage == &card && buf == read_buffer && blocks == expected_fill && !write);
+    assert(storage == &card && buf == read_buffer && blocks == ReadAheadBlocks && !write);
     assert(sdmmc_read_ahead_dma(buf, blocks) != 0 && host.deadline_us > time_us);
     ++transfers;
     if (!transfer_ok)
@@ -61,7 +61,7 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector,
 
 void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed)
 {
-    assert(storage == &card && blocks == expected_fill && elapsed != 0);
+    assert(storage == &card && blocks == ReadAheadBlocks && elapsed != 0);
     mapped_sectors += blocks;
 }
 
@@ -79,6 +79,7 @@ static bool read_sectors(Handle handle, u32 sector)
 
 int main(void)
 {
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 43});
     assert(!read_sectors(1, 0));
     assert(!sdmmc_read_ahead(&card, 1, 3000, 1, output));
     assert(read_sectors(1, 1024) && transfers == 1 && maps == 1);
@@ -88,28 +89,34 @@ int main(void)
     assert(transfers == 1 && served == 2048 && mapped_sectors == ReadAheadBlocks);
 
     sdmmc_read_ahead_invalidate(4097, 1);
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 36});
     assert(!read_sectors(1, 4096));
-    transfer_ok = false;
-    assert(!read_sectors(1, 5120) && recoveries == 1 && transfers == 2 && !host.deadline_us);
-    assert(!read_sectors(1, 6144) && fills[0] == 1 && fills[1] == 1);
+    assert(!read_sectors(1, 5120) && transfers == 1);
 
     sdmmc_read_ahead_reset();
     assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_buffer, ReadAheadBlocks));
-    transfer_ok = true;
-    expected_fill = ReadAheadShort;
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 43});
     assert(!read_sectors(2, 0));
-    assert(read_sectors(2, 1024) && maps == 2 && transfers == 3);
-    assert(read_sectors(2, 2048) && transfers == 3);
+    assert(read_sectors(2, 1024) && maps == 2 && transfers == 2);
     inserted = false;
-    assert(!read_sectors(2, 3072));
+    assert(!read_sectors(2, 2048) && unmaps == 2);
     inserted = true;
 
     sdmmc_read_ahead_reset();
     assert(!read_sectors(3, 14336) && !read_sectors(3, 15360) && maps == 2);
-    map_ok = false;
+    transfer_ok = false;
     assert(!read_sectors(3, 0));
-    assert(!read_sectors(3, 1024) && maps == 5);
-    assert(!read_sectors(3, 2048) && maps == 5 && transfers == 3);
-    assert(!read_sectors(3, 3072) && maps == 5);
+    assert(!read_sectors(3, 1024) && recoveries == 1 && transfers == 3 && !host.deadline_us);
+    assert(fills[0] == 1 && fills[1] == 2);
+    transfer_ok = true;
+    assert(!read_sectors(3, 2048) && !read_sectors(3, 3072) && transfers == 3);
+
+    sdmmc_read_ahead_reset();
+    assert(!read_sectors(4, 0) && !read_sectors(4, 1024) && maps == 3);
+    read_ahead.fill_failed = false; // Start a new boot for the mapping failure case.
+    map_ok = false;
+    assert(!read_sectors(4, 0));
+    assert(!read_sectors(4, 1024) && maps == 6);
+    assert(!read_sectors(4, 2048) && maps == 6 && transfers == 3);
     puts("DDR200 read-ahead preserves sector data, invalidates writes and wake, and falls back on mapping or transfer errors");
 }
