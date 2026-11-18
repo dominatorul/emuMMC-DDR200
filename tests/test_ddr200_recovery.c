@@ -17,6 +17,8 @@ static bool reject_type_c;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 enum { RelaxedProbes = 3 };
 static unsigned full_probe_failures, full_data_taps[8], full_data_calls, drop_probes;
+static unsigned handoff_data;
+static bool reject_handback;
 static enum DdrDropReason drop_reason;
 void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
     u8 probes, ddr_eye_t eye)
@@ -141,6 +143,14 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
         }
         return 1;
     }
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (host.handoff_sdma)
+        ++handoff_data;
+    if (reject_handback && cmd->cmd == SD_SWITCH && cmd->arg == 0x80ffff03) {
+        assert(host.handoff_sdma);
+        return 0;
+    }
+#endif
     if (cmd->cmd == SD_SWITCH) {
         assert(!req->is_write && req->blksize == 64);
         if (card_retained_ddr) {
@@ -336,6 +346,8 @@ static void reset(void)
     card.ddr.last_sweep_us = now;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     full_probe_failures = full_data_calls = drop_probes = 0;
+    handoff_data = 0;
+    reject_handback = false;
     drop_reason = DdrDropUnknown;
 #endif
     card.csd.busspeed = 200;
@@ -462,8 +474,16 @@ int main(void)
     assert(sdmmc_ddr200_prepare_suspend(&card));
     assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && card.ddr.resume_rate == DdrRateFull);
     assert(switched_to_stock == 1 && card.csd.busspeed == 104 && !verifies && !stops);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(handoff_data == 1 && !host.handoff_sdma);
+#endif
     assert(sdmmc_ddr200_handoff(&card));
     assert(card.ddr.ready && card.ddr.rate == DdrRateFull && card.ddr.resume_rate == DdrRateUnknown);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(handoff_data >= 4 && !host.handoff_sdma);
+    unsigned before_runtime = handoff_data;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0) && handoff_data == before_runtime);
+#endif
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
 
@@ -473,9 +493,20 @@ int main(void)
     card_retained_ddr = true;
     assert(sdmmc_ddr200_handoff(&card));
     assert(rejected_sdr_checks == 2 && retained_restorations == 1 && !switched_to_stock);
-    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 2 + RelaxedProbes);
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 4);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    reset();
+    reject_handback = true;
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){31, 36});
+    assert(!sdmmc_ddr200_prepare_suspend(&card));
+    assert(handoff_data == 1 && !host.handoff_sdma && !host.deadline_us);
+    assert(!card.ddr.ready && card.ddr.resume_rate == DdrRateFull);
+    for (size_t i = 0; i < sizeof(window); ++i)
+        assert(window[i] == 0x6f);
+#endif
 
     reset();
     fail_reads = 1;

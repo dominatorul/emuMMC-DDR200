@@ -66,6 +66,10 @@ static bool map_window(dma_window_t *mapping, Handle das, void *buffer, size_t b
         Result rc = svcMapDeviceAddressSpaceAligned(das, current_process, address, bytes,
             dma, permission);
         ddr_trace_read_ahead_map(rc);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        if (mapping == &descriptor_mapping)
+            ddr_trace_descriptor_mapping(false, das, rc);
+#endif
         if (!rc) {
             mapping->das = das;
             mapping->dma = dma;
@@ -82,6 +86,10 @@ static void unmap_window(dma_window_t *mapping, void *buffer, size_t bytes)
         return;
     Result rc = svcUnmapDeviceAddressSpace(mapping->das, current_process, (uintptr_t)buffer,
         bytes, mapping->dma);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (mapping == &descriptor_mapping)
+        ddr_trace_descriptor_mapping(true, mapping->das, rc);
+#endif
     mapping->dma = 0;
     mapping->failed = rc != 0;
     if (!rc)

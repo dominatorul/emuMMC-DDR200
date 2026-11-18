@@ -1150,7 +1150,7 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	if (blkcnt >= 0xFFFF)
 		blkcnt = 0xFFFF;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	bool adma = sdmmc->id == SDMMC_1 && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
+	bool adma = sdmmc->id == SDMMC_1 && !sdmmc->handoff_sdma && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
 	if (adma) {
 		sdmmc->dma_progress.mode = SdmmcDmaAdma2;
 		blkcnt = MIN(blkcnt, SdmmcAdmaBytes / req->blksize);
@@ -1220,6 +1220,8 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 		/* Version 4 selects ADMA2 with bit 4. Host Control 2
 		   already enables the 64-bit address and 16-byte descriptor. */
 		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | SDHCI_CTRL_ADMA32;
+	} else if (sdmmc->id == SDMMC_1) {
+		sdmmc->regs->hostctl &= ~SDHCI_CTRL_DMA_MASK;
 	}
 #endif
 	sdmmc->regs->admaaddr = (u32)address_register;
@@ -1280,7 +1282,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 			++sdmmc->dma_resumes;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 			if (sdmmc->id == SDMMC_1)
-				ddr_trace_sdma_restart();
+				ddr_trace_sdma_restart(sdmmc->handoff_sdma);
 #endif
 			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
@@ -1795,15 +1797,16 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	}
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	bool may_use_adma = sd_data && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
-	u8 dma_select = may_use_adma ? sdmmc->regs->hostctl & SDHCI_CTRL_DMA_MASK : 0;
-	u16 adma_irq = may_use_adma ? sdmmc->regs->errintstsen & SDHCI_ERR_INT_ADMA_ERROR : 0;
+	u8 dma_select = sd_data ? sdmmc->regs->hostctl & SDHCI_CTRL_DMA_MASK : 0;
+	u16 adma_irq = sd_data ? sdmmc->regs->errintstsen & SDHCI_ERR_INT_ADMA_ERROR : 0;
 #endif
 	int result = _sdmmc_execute_cmd_inner(sdmmc, cmd, req, blkcnt_out, sample ? &dma_us : NULL);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	if (sdmmc->dma_progress.mode == SdmmcDmaAdma2) {
+	if (sd_data) {
 		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | dma_select;
 		sdmmc->regs->errintstsen = (sdmmc->regs->errintstsen & ~SDHCI_ERR_INT_ADMA_ERROR) | adma_irq;
+		if (sdmmc->handoff_sdma && sdmmc->dma_progress.mode == SdmmcDmaSdma512)
+			ddr_trace_handoff_sdma();
 	}
 	if (!result && sd_data)
 		ddr_trace_io_error(sdmmc, cmd->cmd, req->num_sectors);

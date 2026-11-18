@@ -276,6 +276,7 @@ typedef struct _sdmmc_t
 	u32 dma_resumes;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	bool prefetch;
+	bool handoff_sdma;
 	sdmmc_dma_progress_t dma_progress;
 #endif
 	u32 rsp[4];

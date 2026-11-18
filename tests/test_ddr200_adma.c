@@ -44,7 +44,11 @@ void ddr_trace_read_ahead(unsigned blocks) { assert(blocks && blocks <= sizeof(o
 void ddr_trace_read_ahead_map(Result result) { assert((result == 0) == mapping_ok); }
 void ddr_trace_read_ahead_fill(bool succeeded) { (void)succeeded; }
 void ddr_trace_batch_refused(enum DdrBatchRefusal reason) { ++refusals[reason]; }
-void ddr_trace_sdma_restart(void) { ++restarts; }
+void ddr_trace_sdma_restart(bool handoff) { (void)handoff; ++restarts; }
+void ddr_trace_descriptor_mapping(bool unmap, u32 handle, Result result)
+{
+    assert(handle == das && (!result || (!unmap && !mapping_ok)));
+}
 void ddr_trace_batch_seq(u32 blocks, bool hit)
 {
     sequential += blocks;
@@ -243,6 +247,21 @@ static void test_dma(void)
     mapping_ok = false;
     assert(!_sdmmc_config_dma(&host, &blocks, &request));
     assert(host.dma_progress.mode == SdmmcDmaAdma2);
+
+    reset((ddr_eye_t){29, 36}, 32);
+    host.handoff_sdma = true;
+    regs.hostctl |= SDHCI_CTRL_ADMA32;
+    mapping_ok = false;
+    request.num_sectors = 1;
+    request.blksize = 64;
+    request.buf = direct + 32; /* IOVA starts on the next SDMA boundary. */
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(host.dma_progress.mode == SdmmcDmaSdma512 && !maps && !host.dma_boundaries_left);
+    assert((regs.hostctl & SDHCI_CTRL_DMA_MASK) == SDHCI_CTRL_SDMA);
+    host.handoff_sdma = false;
+    mapping_ok = true;
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(host.dma_progress.mode == SdmmcDmaAdma2 && maps == 1);
 }
 
 int main(void)

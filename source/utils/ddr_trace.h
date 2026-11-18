@@ -43,9 +43,9 @@ enum DdrDropReason { DdrDropUnknown, DdrDropNoEye, DdrDropMargin, DdrDropScratch
     DdrDropDiagnostic, DdrDropWakeCheck, DdrDropSuspend, DdrDropLinkLost, DdrDropRetryLimit };
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-/* Slots 2 and 3 held bulk SDMA controls in report version 22. */
-enum DdrDmaSample { DdrDmaBaseline = 1, DdrDmaWriteTotals, DdrDmaAlternate = 4,
-    DdrDmaTotals = 6, DdrDmaHost, DdrDmaRefusals, DdrDmaSequential = 12,
+enum DdrDmaSample { DdrDmaPower, DdrDmaBaseline, DdrDmaWriteTotals,
+    DdrDmaMappings, DdrDmaAlternate, DdrDmaHandoff, DdrDmaTotals, DdrDmaHost,
+    DdrDmaRefusals, DdrDmaSequential = 12,
     DdrDmaStats, DdrDmaLastDrop, DdrDmaFailures, DdrDmaFailureCount = 8,
     DdrDmaSamples = DdrDmaFailures + DdrDmaFailureCount };
 enum DdrDmaResult { DdrDmaOk = 1, DdrDmaFailed, DdrDmaMismatch };
@@ -53,7 +53,9 @@ enum DdrDmaResult { DdrDmaOk = 1, DdrDmaFailed, DdrDmaMismatch };
 void ddr_trace_dma_begin(void);
 void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye_t eye,
     u64 elapsed, u32 blocks, u32 resumes, enum DdrDmaResult result);
-void ddr_trace_sdma_restart(void);
+void ddr_trace_sdma_restart(bool handoff);
+void ddr_trace_handoff_sdma(void);
+void ddr_trace_descriptor_mapping(bool unmap, u32 das, Result result);
 void ddr_trace_batch_refused(enum DdrBatchRefusal reason);
 void ddr_trace_batch_seq(u32 blocks, bool served);
 void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
@@ -72,7 +74,7 @@ enum DdrMatrixStage {
 };
 enum DdrPowerEvent {
     DdrPowerClosing, DdrPowerHandback, DdrPowerClosed, DdrPowerOpened, DdrPowerReasserted,
-    DdrPowerRetained,
+    DdrPowerRetained, DdrPowerReasserting, DdrPowerWaiting,
 };
 
 void ddr_trace_policy_sweep(const sdmmc_t *host, ddr_eye_t eye, unsigned tap, u8 kind, u8 drive, u64 started);

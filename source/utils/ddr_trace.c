@@ -178,9 +178,26 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye
         ((u64)eye.left << 40) | ((u64)eye.right << 48) | ((u64)progress->adma_error << 56);
 }
 
-void ddr_trace_sdma_restart(void)
+void ddr_trace_sdma_restart(bool handoff)
 {
     ++history[HistoryCount - DmaCount + DdrDmaStats].timing;
+    if (handoff)
+        ++history[HistoryCount - DmaCount + DdrDmaHandoff].settings;
+}
+
+void ddr_trace_handoff_sdma(void)
+{
+    ++history[HistoryCount - DmaCount + DdrDmaHandoff].timing;
+}
+
+void ddr_trace_descriptor_mapping(bool unmap, u32 das, Result result)
+{
+    sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaMappings];
+    u64 sample = ((u64)das << 32) | result;
+    if (unmap)
+        slot->settings = sample;
+    else
+        slot->timing = sample;
 }
 
 void ddr_trace_batch_refused(enum DdrBatchRefusal reason)
@@ -345,6 +362,17 @@ void ddr_trace_wait_native(void) { ++waiting_native; }
 
 void ddr_trace_power(enum DdrPowerEvent event, bool ok)
 {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    _Static_assert(DdrPowerWaiting < 8, "power count layout");
+    sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaPower];
+    unsigned shift = event * 8;
+    u64 count = slot->timing;
+    if (((count >> shift) & 0xff) != 0xff)
+        slot->timing = count + (1ull << shift);
+    count = slot->settings;
+    if (ok && ((count >> shift) & 0xff) != 0xff)
+        slot->settings = count + (1ull << shift);
+#endif
     record_event(DdrSweepPower, ready_khz, (ddr_eye_t){event, ok}, 255, 0, get_tmr_us());
 }
 
@@ -363,7 +391,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_ADMA_PROBE)
-    ctx->gprs[0] = 0x4444523230300018ull;
+    ctx->gprs[0] = 0x4444523230300019ull;
 #elif defined(EMUMMC_DDR200_COUNTED_READS)
     ctx->gprs[0] = 0x4444523230300015ull;
 #elif defined(EMUMMC_DDR200_READ_AHEAD)

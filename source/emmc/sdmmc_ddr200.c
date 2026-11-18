@@ -291,7 +291,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
             exclude_tap(tried, failed_tap);
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-        if (runtime_full) {
+        if (runtime_full && !host->handoff_sdma) {
             policy->narrow_pair = false;
             applied = verify_full_rate(storage, history, eye, sector, guard, tried);
         } else
@@ -519,6 +519,13 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     char *dma = borrow_dma(1, backup);
     if (!dma)
         return false;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    /* Horizon owns the SD address space during the handoff. Use its
+       existing DMA buffers until the card and host agree on the mode. */
+    bool previous_sdma = host->handoff_sdma;
+    host->handoff_sdma = true;
+    policy->narrow_pair = false;
+#endif
     u64 old = begin_budget(host, 1500000);
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     enum DdrRate requested = policy->resume_rate;
@@ -561,6 +568,9 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     restore_dma(dma, backup, sizeof(backup));
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
     host->deadline_us = old;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    host->handoff_sdma = previous_sdma;
+#endif
     policy->ready = ok;
     if (ok) {
         storage->csd.busspeed = policy->rate >= DdrRateReduced ? 200 : 104;
@@ -588,12 +598,19 @@ bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *storage)
     sdmmc_t *host = storage->sdmmc;
     u64 old = begin_budget(host, 350000);
     bool powersave = host->powersave_enabled;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    bool previous_sdma = host->handoff_sdma;
+    host->handoff_sdma = true;
+#endif
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     bool ok = sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000) &&
         set_sdr104(storage, status);
     restore_dma(dma, backup, sizeof(backup));
     sdmmc_card_clock_powersave(host, powersave);
     host->deadline_us = old;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    host->handoff_sdma = previous_sdma;
+#endif
     policy->ready = ok;
     if (ok) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE

@@ -38,7 +38,8 @@ MATRIX_FLAGS = ('DMA window or sector range unavailable', 'full-rate transfer fa
                 'drive strength test failed', 'requested rate or power unavailable',
                 '64 MiB stream ended early', 'CMD6 settling comparison unavailable')
 POWER_EVENTS = ('paired native close started', 'SDR104 before native close', 'native SD closed',
-                'native SD opened', 'DDR200 reassertion after native close', 'retained DDR200 verified')
+                'native SD opened', 'DDR200 reassertion after native close', 'retained DDR200 verified',
+                'wake reassertion started', 'waiting for Horizon SD power')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 DMA_SAMPLES = ('SDMA reference slices', 'ADMA2 primary', 'SDMA 512 KiB boundary',
@@ -187,6 +188,23 @@ def print_batch_trace(data, offset):
               f'DMA offset {flags & 0x7FFFF:#07x}, {report}, IRQ {irq:#010x}')
 
 
+def print_lifecycle(data, offset):
+    attempts, passed = struct.unpack_from('<QQ', data, offset)
+    print('SD power lifecycle since boot')
+    for event, label in enumerate(POWER_EVENTS):
+        count = (attempts >> (8 * event)) & 0xFF
+        if count:
+            print(f'  {label}: {(passed >> (8 * event)) & 0xFF}/{count} successful')
+    mapped, unmapped = struct.unpack_from('<QQ', data, offset + 3 * 16)
+    for action, entry in (('map', mapped), ('unmap', unmapped)):
+        if entry:
+            print(f'  Last descriptor {action} DAS {entry >> 32:#010x}, result {entry & 0xFFFFFFFF:#010x}')
+    commands, handoff_restarts = struct.unpack_from('<QQ', data, offset + 5 * 16)
+    all_restarts, = struct.unpack_from('<Q', data, offset + 13 * 16)
+    print(f'  Handoff SDMA commands {commands}, handoff restarts {handoff_restarts}, '
+          f'outside handoff {max(0, all_restarts - handoff_restarts)}')
+
+
 def print_policy_trace(data, gprs):
     if len(data) < 0x450:
         raise ValueError('report is too short for the DDR200 policy trace')
@@ -274,6 +292,8 @@ def print_policy_trace(data, gprs):
         print_dma_comparison(data, 0x150 + (48 - dma_capacity) * 16, perf_version)
     if perf_version >= 24:
         print_batch_trace(data, 0x150 + (48 - dma_capacity) * 16)
+    if perf_version >= 25:
+        print_lifecycle(data, 0x150 + (48 - dma_capacity) * 16)
     runtime_capacity = 48 - matrix_capacity - dma_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -321,7 +341,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 24:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 25:
         raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

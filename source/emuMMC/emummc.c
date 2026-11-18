@@ -124,6 +124,7 @@ static bool _ddr200_reassert(int mmc_id)
         if (!wait_for_native) {
             ddr_trace_host(DdrReassert, &sd_sdmmc);
             ddr_trace_wait_native();
+            ddr_trace_power(DdrPowerWaiting, true);
         }
         wait_for_native = true;
         ddr_trace_stage(DdrWaitForNative, mmc_id);
@@ -147,6 +148,8 @@ static bool _ddr200_reassert(int mmc_id)
 #endif
     clock_sdmmc_invalidate_clock_source(SDMMC_1);
     bool resuming = sd_storage.ddr.resume_rate != DdrRateUnknown;
+    if (resuming)
+        ddr_trace_power(DdrPowerReasserting, true);
     bool ready = sdmmc_ddr200_handoff(&sd_storage);
     wait_for_native = !ready;
     if (resuming)
@@ -587,9 +590,6 @@ static uint64_t controller_close(int mmc_id)
             _file_based_emmc_finalize();
             bool close_sd = sd && native_sd_opened && !native_sd_transitions;
             if (close_sd) {
-#ifdef EMUMMC_DDR200_READ_AHEAD
-                sdmmc_read_ahead_reset();
-#endif
                 ++native_sd_transitions;
                 wait_for_native = true;
                 _current_accessor = sd;
@@ -598,6 +598,11 @@ static uint64_t controller_close(int mmc_id)
                 bool standard = !sd_storage.ddr.capable ||
                     (_ddr200_power_ready() && sdmmc_ddr200_prepare_suspend(&sd_storage));
                 ddr_trace_power(DdrPowerHandback, standard);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+                /* Retire both private mappings after the final FS-owned
+                   command, before Horizon can close the address space. */
+                sdmmc_read_ahead_reset();
+#endif
             }
             _current_accessor = previous;
             mutex_unlock_handler(FS_SDMMC_EMMC);
