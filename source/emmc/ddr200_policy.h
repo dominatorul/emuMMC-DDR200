@@ -95,18 +95,35 @@ static inline ddr_eye_t ddr_first_eye(const u32 map[4], unsigned first, unsigned
     return (ddr_eye_t){DdrTapCount, 0};
 }
 
-static inline ddr_eye_t ddr_widest_eye(const u32 map[4], unsigned end)
+/* With history, keep the same phase of the tap delay line when possible. */
+static inline ddr_eye_t ddr_select_eye(const u32 map[4], unsigned first, unsigned end,
+                                      unsigned minimum, ddr_eye_t previous)
 {
     ddr_eye_t best = {DdrTapCount, 0};
-    for (unsigned first = 0; first < end;) {
-        ddr_eye_t eye = ddr_first_eye(map, first, end, 1);
+    unsigned best_distance = 2 * DdrTapCount;
+    while (first < end) {
+        ddr_eye_t eye = ddr_first_eye(map, first, end, minimum);
         if (!ddr_eye_width(eye))
             break;
-        if (ddr_eye_width(eye) > ddr_eye_width(best))
+        unsigned distance = 0;
+        if (ddr_eye_width(previous)) {
+            unsigned center = eye.left + eye.right;
+            unsigned old_center = previous.left + previous.right;
+            distance = MAX(center, old_center) - MIN(center, old_center);
+        }
+        if (distance < best_distance ||
+            (distance == best_distance && ddr_eye_width(eye) > ddr_eye_width(best))) {
             best = eye;
+            best_distance = distance;
+        }
         first = eye.right + 1u;
     }
     return best;
+}
+
+static inline ddr_eye_t ddr_widest_eye(const u32 map[4], unsigned end)
+{
+    return ddr_select_eye(map, 0, end, 1, (ddr_eye_t){DdrTapCount, 0});
 }
 
 static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)

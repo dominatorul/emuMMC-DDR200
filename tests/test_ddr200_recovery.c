@@ -409,6 +409,16 @@ static void test_eye_model(void)
     widest = ddr_widest_eye(initial_map, 124);
     assert(widest.left == 2 && widest.right == 9);
 
+    reset();
+    full_eye = (ddr_eye_t){19, 40};
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){78, 85});
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    regs.venclkctl = 81 << 16;
+    assert(train(&card, DdrRateFull, DdrSweepRecovery, true, 1024, 81));
+    /* The local scan starts inside this eye, forcing a full scan. */
+    assert(hint_scans == 1 && card.ddr.history[0].eyes[0].left == 65);
+    assert(card.ddr.history[0].eyes[0].right == 86 && tap_readback(&host) == 82);
+
     ddr_history_t history = {0};
     const ddr_eye_t eyes[] = {{32, 48}, {29, 44}, {29, 35}, {29, 44}};
     u32 excluded[4] = {0};

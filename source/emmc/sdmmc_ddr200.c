@@ -208,21 +208,21 @@ static ddr_eye_t scan_eye(sdmmc_storage_t *storage, const ddr_history_t *history
 {
     sdmmc_t *host = storage->sdmmc;
     unsigned first = 0, end = DdrTapCount;
-    if (local && history->count) {
-        ddr_eye_t old = history->eyes[0];
+    ddr_eye_t old = history->count ? history->eyes[0] : (ddr_eye_t){DdrTapCount, 0};
+    if (local && ddr_eye_width(old)) {
         int center = (old.left + old.right) / 2;
         first = MAX(0, center - 16);
         end = MIN(DdrTapCount, center + 17);
     }
     *samples = sdmmc_scan_ddr200(host, first, end, raw, passing);
-    ddr_eye_t eye = ddr_first_eye(passing, first, first + *samples, DdrRuntimeWidth);
+    ddr_eye_t eye = ddr_select_eye(passing, first, first + *samples, DdrRuntimeWidth, old);
     if (first || end < DdrTapCount) {
         if (ddr_eye_width(eye) && eye.left != first && eye.right + 1u < end && *samples == end - first)
             return eye;
         memset(raw, 0, sizeof(u32) * 4);
         memset(passing, 0, sizeof(u32) * 4);
         *samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
-        return ddr_first_eye(passing, 0, *samples, DdrRuntimeWidth);
+        return ddr_select_eye(passing, 0, *samples, DdrRuntimeWidth, old);
     }
     return eye;
 }
@@ -255,9 +255,14 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     }
     u32 raw[4] = {0}, passing[4] = {0}, samples;
     u64 started = get_tmr_us();
-    ddr_eye_t eye = scan_eye(storage, history, local, raw, passing, &samples);
-    if (kind == DdrSweepInitial)
+    ddr_eye_t eye;
+    if (kind == DdrSweepInitial) {
+        *history = (ddr_history_t){0};
+        samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
         eye = ddr_widest_eye(passing, samples);
+    } else {
+        eye = scan_eye(storage, history, local, raw, passing, &samples);
+    }
     ddr_eye_t previous = history->eyes[0];
     bool had_eye = history->count != 0;
     if (ddr_eye_width(eye))
