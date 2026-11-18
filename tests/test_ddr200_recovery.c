@@ -314,6 +314,15 @@ static void test_eye_model(void)
     assert(ddr_failure_next(DdrRateSdr104) == DdrRateUnknown);
     assert(ddr_retry_delay(0) == 5000000 && ddr_retry_delay(2) == 20000000);
     assert(ddr_retry_delay(6) == 300000000);
+
+    history = (ddr_history_t){0};
+    ddr_remember_eye(&history, (ddr_eye_t){29, 35});
+    ddr_remember_eye(&history, (ddr_eye_t){29, 36});
+    assert(ddr_pick_tap(&history, excluded, DdrTapMargin, true) == 32);
+    exclude_tap(excluded, 32);
+    assert(ddr_pick_tap(&history, excluded, DdrTapMargin, true) == 33);
+    exclude_tap(excluded, 33);
+    assert(ddr_pick_tap(&history, excluded, DdrTapMargin, true) == -1);
 }
 
 int main(void)
@@ -367,6 +376,15 @@ int main(void)
     assert(verify_taps[0] == 32 && verify_taps[1] != 32 && verify_taps[1] != 36);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
+
+    reset();
+    fail_reads = 1;
+    regs.venclkctl = 32 << 16;
+    full_eye = (ddr_eye_t){29, 36};
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 35});
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+    assert(card.ddr.rate == DdrRateFull && tap_readback(&host) == 33);
+    assert(stops == 1 && resets == 1 && verifies == 2 && verify_taps[1] != 32);
 
     for (unsigned edge = 33; edge <= 34; ++edge) {
         reset();

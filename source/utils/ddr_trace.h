@@ -25,6 +25,7 @@ void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed_us);
 #ifdef EMUMMC_DDR200_READ_AHEAD
 void ddr_trace_read_ahead_map(Result result);
 void ddr_trace_read_ahead(u32 blocks);
+void ddr_trace_read_ahead_fill(bool succeeded);
 #endif
 void ddr_trace_reassert(void);
 void ddr_trace_boot_power(void);

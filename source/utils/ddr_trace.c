@@ -42,6 +42,7 @@ static _Atomic u32 large_read_commands, large_read_restarts, largest_read, write
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
 static _Atomic u32 largest_fs_read, read_ahead_blocks, map_attempts, map_result;
+static _Atomic u32 read_ahead_fills[2];
 #endif
 static _Atomic u64 matrix_status;
 static _Atomic u64 bus_registers, clock_registers;
@@ -228,6 +229,11 @@ void ddr_trace_read_ahead(u32 blocks)
 {
     atomic_fetch_add_explicit(&read_ahead_blocks, blocks, memory_order_relaxed);
 }
+
+void ddr_trace_read_ahead_fill(bool succeeded)
+{
+    ++read_ahead_fills[succeeded];
+}
 #endif
 
 void ddr_trace_reassert(void)
@@ -259,7 +265,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_READ_AHEAD)
-    ctx->gprs[0] = 0x4444523230300013ull;
+    ctx->gprs[0] = 0x4444523230300014ull;
 #elif defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     ctx->gprs[0] = 0x4444523230300012ull;
 #else
@@ -300,6 +306,8 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[31] = largest_read;
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
+    ctx->gprs[4] = ((u64)MIN(read_ahead_fills[0], 0xffffu) << 48) |
+                  ((u64)MIN(read_ahead_fills[1], 0xffffu) << 32);
     ctx->gprs[31] |= (u64)largest_fs_read << 32;
     ctx->pstate = map_attempts;
     ctx->far = ((u64)map_result << 32) | read_ahead_blocks;

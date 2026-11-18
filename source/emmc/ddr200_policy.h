@@ -79,6 +79,19 @@ static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)
         ++history->count;
 }
 
+static inline int ddr_pick_tap_in_range(int left, int right, const u32 tried[4], bool prefer_left)
+{
+    int selected = -1, best_margin = -1;
+    for (int tap = left; tap <= right; ++tap) {
+        int score = prefer_left ? right - tap : MIN(tap - left, right - tap);
+        if (score > best_margin && !ddr_tap_passes(tried, tap)) {
+            best_margin = score;
+            selected = tap;
+        }
+    }
+    return selected;
+}
+
 static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4],
                                unsigned guard, bool prefer_left)
 {
@@ -105,15 +118,13 @@ static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4],
             right = MIN(right, MAX(left, newest.right - 2 * right_loss));
     }
 
-    int selected = -1, best_margin = -1;
-    for (int tap = left; tap <= right; ++tap) {
-        int score = prefer_left ? right - tap : MIN(tap - left, right - tap);
-        if (score > best_margin && !ddr_tap_passes(tried, tap)) {
-            best_margin = score;
-            selected = tap;
-        }
-    }
-    return selected;
+    int selected = ddr_pick_tap_in_range(left, right, tried, prefer_left);
+    if (selected >= 0)
+        return selected;
+
+    /* The intersection can contain only the failed tap. A fresh candidate
+       still needs the same edge margin and the caller's data verification. */
+    return ddr_pick_tap_in_range(newest.left + guard, newest.right - guard, tried, prefer_left);
 }
 
 static inline enum DdrRate ddr_failure_next(enum DdrRate rate)
