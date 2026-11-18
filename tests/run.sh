@@ -12,3 +12,9 @@ for variant in release matrix; do
         -Wl,--gc-sections -o "$out/test_ddr200_recovery"
     ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_recovery"
 done
+
+"${CC:-clang}" -std=gnu2x -O1 -g -ffunction-sections -fdata-sections \
+    -fsanitize=address,undefined -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT \
+    -DINNER_HEAP_SIZE=0x8000 tests/test_ddr200_lifecycle.c \
+    -Wl,--gc-sections -o "$out/test_ddr200_lifecycle"
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_lifecycle"

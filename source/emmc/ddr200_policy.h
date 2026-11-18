@@ -26,6 +26,7 @@ typedef struct {
 typedef struct {
     ddr_history_t history[2];
     enum DdrRate rate;
+    enum DdrRate resume_rate;
     bool capable;
     bool ready;
     bool unstable;

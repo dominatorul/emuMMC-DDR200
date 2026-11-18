@@ -29,21 +29,24 @@ link recovery. At a degraded rate the driver schedules up to six full-rate
 retries with a 5–300 second backoff after idle or enough traffic. The trace
 marks the boot as unstable if it needed to leave full rate.
 
-After the boot power window closes, Horizon owns SD power. On a cold
-access the emuMMC wrapper checks the power GPIO and pinmux, yields the locks
-while waiting for Horizon, and reasserts on its initialized SDR104 state.
-The native SD open callback is reached through the OS lifecycle. Reassertion,
-retry and diagnostic code use the already powered controller. Training
-restores the DDR200 pad configuration and preserves the affected DMA scratch.
+After the boot power window closes, Horizon owns SD power. At the native
+eMMC close, the driver verifies SDR104 before handing back the SD link and
+runs the paired SD close with the emuMMC locks released. On a cold access
+it checks the power GPIO and pinmux and yields the locks while Horizon
+restores power. Wake can restore the host's SDR104 setup while the card
+retains DDR200. The driver checks for an SDR104 CMD6 reply. If it cannot
+confirm SDR104 it verifies the retained link at 166.40 MHz before attempting
+to restore the previous DDR200 rate. Both wake paths preserve DMA scratch.
 
 ## Matrix
 
-The diagnostic starts at the first eligible native DDR200 handoff. Hold
-Volume Down by itself to skip or end it. It compares five repeated scans
-per clock, gating between tap samples versus leaving the clock on between
-samples, and the 0, 10 and 100 ms settling targets after the first confirmed
-DDR200 switch. The report measures each settling scan's start relative to
-the switch. Later samples can start after their target as earlier scans finish.
+The diagnostic boots with the release runtime policy. After reaching HOME,
+hold Volume Up by itself for one second to start the matrix. Hold Volume
+Down by itself to end it. It compares five repeated scans per clock, gating
+between tap samples versus leaving the clock on, and the 0, 10 and 100 ms
+settling targets after a confirmed DDR200 switch. The report measures each
+settling scan's start relative to the switch. Later scans may start after
+their target as earlier scans finish.
 
 The worker reads 64 MiB in 8 MiB slices at each clock, samples during the
 load and after idle, and times up to 256 MiB of sequential reading at each
@@ -65,8 +68,8 @@ attribute a reversible change to heat or rail droop.
 
 ## Console test
 
-1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs. Leave
-   the console at HOME for about two minutes.
+1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs. At
+   HOME hold **Volume +** by itself for one second, then wait about two minutes.
 2. Hold **Volume + and Volume −** together for three seconds, then reconnect
    in SD UMS. Collect the new file from `atmosphere/fatal_errors`.
 3. Boot **Fusee DDR200 (release policy)** and record the read and write
@@ -79,6 +82,6 @@ The manual report opens the Atmosphère fatal screen. The **Fusee DDR200
 
 Use `python3 tools/read-ddr-trace.py report_*.bin` to decode the reports.
 Use `sh tests/run.sh` for the release and matrix host checks with ASan and
-UBSan. Host checks simulate the measured eye drift, compare the two-tap
-reads, exercise command cleanup and fallback, and run the matrix schedule.
-They cannot verify sleep, link stability, or the physical cause on the console.
+UBSan. Host checks simulate eye drift, two-tap reads, command cleanup and the
+matrix schedule. They exercise three native suspend/wake pairs and a wake
+where Horizon resets only the host. Console verification is pending.

@@ -12,6 +12,7 @@ STAGES = (
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
     'DMA polling', 'native SD power recovery', 'early SD power recovery', 'verify SD card identity',
     'verify DMA buffers after native open', 'reset DDR200 command system', 'wait for Horizon SD power',
+    'native SD close',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
@@ -35,7 +36,9 @@ MATRIX_STATES = ('pending', 'running', 'complete', 'skipped', 'interrupted')
 MATRIX_FLAGS = ('DMA window or sector range unavailable', 'full-rate transfer failed',
                 'reduced-rate transfer failed', '30-second idle not reached',
                 'drive strength test failed', 'requested rate or power unavailable',
-                '64 MiB stream ended early')
+                '64 MiB stream ended early', 'CMD6 settling comparison unavailable')
+POWER_EVENTS = ('paired native close started', 'SDR104 before native close', 'native SD closed',
+                'native SD opened', 'DDR200 reassertion after native close', 'retained DDR200 verified')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
@@ -168,6 +171,11 @@ def print_policy_trace(data, gprs):
             if kind == 5:
                 print(f'  +{usec} us policy {RATES[left & 3]}, ready {bool(right)}, '
                       f'unstable {bool(drive & 128)}, upgrade attempts {drive & 127}')
+                continue
+            if kind == 6:
+                event = POWER_EVENTS[left] if left < len(POWER_EVENTS) else str(left)
+                status = 'OK' if right else 'failed'
+                print(f'  +{usec} us {event}, {status}')
                 continue
             if kind == 25:
                 switched_at = usec

@@ -122,6 +122,7 @@ intptr_t sdmmc_calculate_dma_addr(sdmmc_accessor_t *_this, void *buf, unsigned i
 int sdmmc_calculate_dma_index(sdmmc_accessor_t *_this, void *buf, unsigned int num_sectors);
 int sdmmc_calculate_fitting_dma_index(sdmmc_accessor_t *_this, unsigned int num_sectors);
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage);
+bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *storage);
 bool sdmmc_ddr200_profile_ready(const sdmmc_storage_t *storage);
 bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions);
 bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector);
@@ -134,7 +135,6 @@ void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 
 
 #ifdef EMUMMC_DDR200_MATRIX
 bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage);
-void sdmmc_ddr200_matrix_settle(sdmmc_storage_t *storage, u64 switched_at);
 #endif
 
 #endif

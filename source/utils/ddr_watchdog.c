@@ -3,11 +3,17 @@
 #include <stddef.h>
 #include "ddr_watchdog.h"
 #include "fatal.h"
+#ifdef EMUMMC_DDR200_MATRIX
+#include "../emuMMC/emummc.h"
+#endif
 
 #define OP_TIMEOUT_US 15000000u
 #define BUTTON_HOLD_US 3000000u
 #define SUSPEND_GAP_US 2000000u
 #define POLL_NS 100000000
+#define VOLUME_UP_PIN (1u << 6)
+#define VOLUME_DOWN_PIN (1u << 7)
+#define VOLUME_PINS (VOLUME_UP_PIN | VOLUME_DOWN_PIN)
 
 enum { SlotCount = 32, NoSlot = SlotCount };
 typedef struct {
@@ -27,7 +33,7 @@ static _Atomic(volatile const u32 *) button_input;
 bool ddr_watchdog_volume_down(void)
 {
     const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
-    return input && ((*input & ((1u << 6) | (1u << 7))) == (1u << 6));
+    return input && ((*input & VOLUME_PINS) == VOLUME_UP_PIN);
 }
 
 static u32 find_slot(uintptr_t thread)
@@ -119,6 +125,9 @@ static void watchdog_entry(void *unused)
 {
     (void)unused;
     u64 last_poll = get_tmr_us(), pressed_at = 0;
+#ifdef EMUMMC_DDR200_MATRIX
+    u64 matrix_pressed_at = 0;
+#endif
     bool released = false;
     const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
     for (;;) {
@@ -127,6 +136,9 @@ static void watchdog_entry(void *unused)
         if (now - last_poll >= SUSPEND_GAP_US) {
             ignore_suspend_gap(last_poll, now);
             pressed_at = 0;
+#ifdef EMUMMC_DDR200_MATRIX
+            matrix_pressed_at = 0;
+#endif
         }
         last_poll = now;
 
@@ -136,9 +148,21 @@ static void watchdog_entry(void *unused)
 #endif
 
         /* Volume buttons X6/X7 are active low. Arm after both are released. */
-        u32 volume = *input & ((1u << 6) | (1u << 7));
+        u32 volume = *input & VOLUME_PINS;
+#ifdef EMUMMC_DDR200_MATRIX
+        if (volume == VOLUME_DOWN_PIN && released) {
+            if (!matrix_pressed_at)
+                matrix_pressed_at = now;
+            if (now - matrix_pressed_at >= 1000000u) {
+                emummc_start_ddr200_matrix();
+                released = false;
+            }
+        } else {
+            matrix_pressed_at = 0;
+        }
+#endif
         if (volume) {
-            if (volume == ((1u << 6) | (1u << 7)))
+            if (volume == VOLUME_PINS)
                 released = true;
             pressed_at = 0;
         } else if (released) {

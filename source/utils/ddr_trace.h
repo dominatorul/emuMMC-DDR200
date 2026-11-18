@@ -7,7 +7,7 @@ enum DdrSnapshot { DdrInitialTune, DdrLatestTune, DdrBeforeOpen, DdrAfterOpen, D
 enum DdrStage { DdrBoot, DdrInit, DdrReady, DdrNativeOpen, DdrCheckState,
     DdrReadFunctions, DdrCheckFunction, DdrSetFunction, DdrSetClock, DdrSweep,
     DdrCheckStatus, DdrRead, DdrWrite, DdrSetSdr12, DdrDma, DdrNativePower,
-    DdrBootPower, DdrCheckCardIdentity, DdrCheckDmaBuffers, DdrResetLink, DdrWaitForNative };
+    DdrBootPower, DdrCheckCardIdentity, DdrCheckDmaBuffers, DdrResetLink, DdrWaitForNative, DdrNativeClose };
 enum DdrCommandFailure { DdrCommandClock = 1, DdrCommandInhibit, DdrCommandDmaSetup,
     DdrCommandResponse, DdrCommandTransfer, DdrCommandBusy };
 
@@ -30,12 +30,17 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);
 
 enum DdrSweepKind {
     DdrSweepInitial, DdrSweepHandoff, DdrSweepTrack, DdrSweepRecovery, DdrSweepUpgrade, DdrSweepLadder,
+    DdrSweepPower,
     DdrSweepNoise = 16, DdrSweepGated, DdrSweepFree,
     DdrSweepSettle0, DdrSweepSettle10, DdrSweepSettle100,
     DdrSweepLoad, DdrSweepIdle, DdrSweepDrive, DdrSweepSettleStart,
 };
 enum DdrMatrixStage {
     DdrMatrixPending, DdrMatrixRunning, DdrMatrixComplete, DdrMatrixSkipped, DdrMatrixInterrupted,
+};
+enum DdrPowerEvent {
+    DdrPowerClosing, DdrPowerHandback, DdrPowerClosed, DdrPowerOpened, DdrPowerReasserted,
+    DdrPowerRetained,
 };
 
 void ddr_trace_policy_sweep(const sdmmc_t *host, ddr_eye_t eye, unsigned tap, u8 kind, u8 drive, u64 started);
@@ -44,5 +49,6 @@ void ddr_trace_verify(unsigned tap, unsigned second, bool passed);
 void ddr_trace_hygiene(bool stopped, bool ready, bool reset);
 void ddr_trace_functions(u16 drive, u16 power, u8 selected_drive, u8 selected_power);
 void ddr_trace_wait_native(void);
+void ddr_trace_power(enum DdrPowerEvent event, bool ok);
 void ddr_trace_matrix(enum DdrMatrixStage state, unsigned phase, u32 detail);
 void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed);

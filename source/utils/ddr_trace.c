@@ -193,6 +193,11 @@ void ddr_trace_reassert(void)
 void ddr_trace_boot_power(void) { ddr_trace_stage(DdrBootPower, ++boot_power_recoveries); }
 void ddr_trace_wait_native(void) { ++waiting_native; }
 
+void ddr_trace_power(enum DdrPowerEvent event, bool ok)
+{
+    record_event(DdrSweepPower, ready_khz, (ddr_eye_t){event, ok}, 255, 0, get_tmr_us());
+}
+
 void ddr_trace_matrix(enum DdrMatrixStage state, unsigned phase, u32 detail)
 {
     matrix_status = ((u64)detail << 32) | ((u64)phase << 8) | state;

@@ -15,6 +15,8 @@ static u64 now;
 static unsigned fail_reads, commands, verifies, failed_verifies, stops, resets;
 static unsigned no_ready, hint_scans, switched_to_stock, log_events;
 static bool stop_ok, inconsistent, verify_rejected;
+static bool card_retained_ddr;
+static unsigned rejected_sdr_checks, retained_restorations;
 static char flow[256];
 static unsigned cursor;
 static u32 status_word;
@@ -116,9 +118,17 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     }
     if (cmd->cmd == SD_SWITCH) {
         assert(!req->is_write && req->blksize == 64);
+        if (card_retained_ddr) {
+            assert(cmd->arg == 0x00ffffff && (regs.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
+            ++rejected_sdr_checks;
+            return 0;
+        }
         memset(req->buf, 0, 64);
         u8 *reply = req->buf;
+        reply[9] = 3;
         reply[16] = cmd->arg & 0xff;
+        if (cmd->arg == 0x00ffffff)
+            reply[16] = UHS_SDR104_BUS_SPEED;
         if (reply[16] == 0xf0)
             reply[16] = 0;
         if (reply[16] == 0xef)
@@ -191,6 +201,11 @@ void ddr_trace_hygiene(bool stopped, bool ready, bool reset) { assert(reset == r
 void ddr_trace_read_recovery(const sdmmc_t *target, bool ok) { assert(target == &host); (void)ok; }
 void ddr_trace_stage(enum DdrStage stage, u32 data) { (void)stage; (void)data; }
 void ddr_trace_reassert(void) {}
+void ddr_trace_power(enum DdrPowerEvent event, bool ok)
+{
+    assert(event == DdrPowerRetained && ok && card_retained_ddr);
+    ++retained_restorations;
+}
 void ddr_trace_card(const u8 *data, bool selected) { (void)data; (void)selected; }
 void ddr_trace_functions(u16 drive, u16 power, u8 chosen_drive, u8 chosen_power)
 {
@@ -265,7 +280,8 @@ static void reset(void)
     stops = resets = no_ready = verifies = failed_verifies = commands = fail_reads = 0;
     hint_scans = switched_to_stock = log_events = cursor = 0;
     stop_ok = true;
-    inconsistent = verify_rejected = false;
+    inconsistent = verify_rejected = card_retained_ddr = false;
+    rejected_sdr_checks = retained_restorations = 0;
     flow[0] = 0;
 #ifdef EMUMMC_DDR200_MATRIX
     memset(&matrix, 0, sizeof(matrix));
@@ -314,6 +330,26 @@ int main(void)
     full_eye = (ddr_eye_t){29, 44};
     assert(sdmmc_ddr200_handoff(&card) && tap_readback(&host) == 35 && verifies == 2);
     assert(strchr(flow, 'H'));
+
+    reset();
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 35});
+    assert(sdmmc_ddr200_prepare_suspend(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && card.ddr.resume_rate == DdrRateFull);
+    assert(switched_to_stock == 1 && card.csd.busspeed == 104 && !verifies && !stops);
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && card.ddr.resume_rate == DdrRateUnknown);
+    for (size_t i = 0; i < sizeof(window); ++i)
+        assert(window[i] == 0x6f);
+
+    reset();
+    /* Native wake restored the host to SDR104 while the card kept DDR200. */
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    card_retained_ddr = true;
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(rejected_sdr_checks == 2 && retained_restorations == 1 && !switched_to_stock);
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 4);
+    for (size_t i = 0; i < sizeof(window); ++i)
+        assert(window[i] == 0x6f);
 
     reset();
     fail_reads = 1;
@@ -366,9 +402,6 @@ int main(void)
     reset();
     full_eye = (ddr_eye_t){29, 44};
     card.ddr.drive_support = 3;
-    sdmmc_card_clock_powersave(&host, SDMMC_POWER_SAVE_DISABLE);
-    sdmmc_ddr200_matrix_settle(&card, now);
-    sdmmc_card_clock_powersave(&host, SDMMC_POWER_SAVE_ENABLE);
     for (unsigned step = 0; sdmmc_ddr200_matrix_step(&card); ++step) {
         assert(step < 160 && host.deadline_us == 0 && card.ddr.ready);
         now += matrix.phase == MatrixIdle ? MatrixIdleUs : 100000;

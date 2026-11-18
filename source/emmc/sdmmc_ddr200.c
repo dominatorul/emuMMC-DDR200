@@ -5,7 +5,6 @@
 #include "sd.h"
 #include "../nx/cache.h"
 #include "../utils/ddr_trace.h"
-#include "../utils/ddr_watchdog.h"
 #include "../utils/util.h"
 
 enum { DdrVerifyBytes = DdrVerifyBlocks * 512 };
@@ -307,6 +306,45 @@ bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions)
     return true;
 }
 
+static bool probe_native_sdr104(sdmmc_storage_t *storage, u8 status[64])
+{
+    sdmmc_t *host = storage->sdmmc;
+    u64 old = begin_budget(host, 120000);
+    bool read = sdmmc_sd_switch(storage, status, 0x00ffffff);
+    host->deadline_us = old;
+    if (read)
+        return (status[16] >> 4) == 0;
+
+    /* Native wake can program the SDR104 mode with the tap it sampled
+       while the physical link was DDR200. Recheck at a tuned SDR104 tap. */
+    old = begin_budget(host, 200000);
+    read = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
+        sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
+        sdmmc_sd_switch(storage, status, 0x00ffffff);
+    host->deadline_us = old;
+    return read && (status[16] >> 4) == 0;
+}
+
+static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested, u8 status[64])
+{
+    ddr_policy_t *policy = &storage->ddr;
+    sdmmc_t *host = storage->sdmmc;
+    /* Horizon may have restored only the controller. Try the measured
+       reduced DDR clock without changing the card's command system. */
+    policy->rate = DdrRateReduced;
+    if (!sdmmc_setup_ddr200_clock(host, true) ||
+        !sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000) ||
+        !train(storage, DdrRateReduced, DdrSweepHandoff, true, 0, -1)) {
+        policy->rate = DdrRateUnknown;
+        ddr_trace_power(DdrPowerRetained, false);
+        return false;
+    }
+    ddr_trace_power(DdrPowerRetained, true);
+    if (requested == DdrRateFull && !train(storage, requested, DdrSweepHandoff, true, 0, -1))
+        return fallback(storage, requested, 0, status);
+    return true;
+}
+
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
 {
     ddr_policy_t *policy = &storage->ddr;
@@ -317,47 +355,81 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
         return false;
     u64 old = begin_budget(host, 1500000);
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-    enum DdrRate requested = policy->rate;
-    if (!policy->unstable || requested == DdrRateUnknown)
+    enum DdrRate requested = policy->resume_rate;
+    if (requested == DdrRateUnknown && policy->unstable)
+        requested = policy->rate;
+    if (requested == DdrRateUnknown)
         requested = DdrRateFull;
     policy->rate = DdrRateSdr104;
     policy->ready = false;
     policy->blocks = policy->busy_us = 0;
     ddr_trace_reassert();
 
-    bool ok = false;
-    if (policy->capable && requested != DdrRateSdr104) {
+    bool want_ddr = policy->capable && requested >= DdrRateReduced;
+    if (want_ddr)
         sdmmc_ddr200_restore_host_cfg(host);
-        bool functions = sdmmc_sd_switch(storage, status, 0x00ffffff);
-        if (functions) {
-            remember_functions(storage, status);
-            sdmmc_sd_set_current_limit(storage, policy->power_support, status);
-        }
-        if (functions && enter_from_sdr104(storage, status)) {
-#ifdef EMUMMC_DDR200_MATRIX
-            if (requested == DdrRateFull)
-                sdmmc_ddr200_matrix_settle(storage, get_tmr_us());
-#endif
+    bool standard = probe_native_sdr104(storage, status);
+    bool ok = false;
+    if (standard && want_ddr) {
+        remember_functions(storage, status);
+        sdmmc_sd_set_current_limit(storage, policy->power_support, status);
+        if (enter_from_sdr104(storage, status)) {
             ok = train(storage, requested, DdrSweepHandoff, true, 0, -1) ||
                 fallback(storage, requested, 0, status);
-            if (ok && policy->rate != DdrRateSdr104)
-                storage->csd.busspeed = 200;
         }
-    } else {
+    } else if (standard) {
         /* Horizon has already completed its native SDR104 init. Reuse the
            standard timing while keeping our serialized emuMMC transport. */
         ok = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
              sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
              sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
         storage->csd.busspeed = 104;
+    } else if (want_ddr) {
+        ok = restore_retained_ddr(storage, requested, status);
     }
-    if (!ok && policy->rate == DdrRateSdr104)
+    if (!ok && standard && policy->rate == DdrRateSdr104)
         ok = set_sdr104(storage, status);
     restore_dma(dma, backup, sizeof(backup));
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
     host->deadline_us = old;
     policy->ready = ok;
+    if (ok) {
+        storage->csd.busspeed = policy->rate >= DdrRateReduced ? 200 : 104;
+        policy->resume_rate = DdrRateUnknown;
+    }
     ddr_trace_ladder(policy->rate, ok, policy->unstable, policy->upgrades);
+    return ok;
+}
+
+bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *storage)
+{
+    ddr_policy_t *policy = &storage->ddr;
+    if (!policy->ready)
+        return false;
+    policy->resume_rate = policy->rate;
+    if (policy->rate == DdrRateSdr104)
+        return true;
+    if (policy->rate < DdrRateReduced)
+        return false;
+
+    u8 backup[512], status[64];
+    char *dma = borrow_dma(1, backup);
+    if (!dma)
+        return false;
+    sdmmc_t *host = storage->sdmmc;
+    u64 old = begin_budget(host, 350000);
+    bool powersave = host->powersave_enabled;
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+    bool ok = sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000) &&
+        set_sdr104(storage, status);
+    restore_dma(dma, backup, sizeof(backup));
+    sdmmc_card_clock_powersave(host, powersave);
+    host->deadline_us = old;
+    policy->ready = ok;
+    if (ok) {
+        storage->csd.busspeed = 104;
+        ddr_trace_stage(DdrReady, host->divisor);
+    }
     return ok;
 }
 
@@ -463,6 +535,7 @@ enum {
     MatrixDriveError = 1u << 4,
     MatrixUnavailable = 1u << 5,
     MatrixUnfinishedLoad = 1u << 6,
+    MatrixSettleUnavailable = 1u << 7,
 };
 
 static struct {
@@ -492,11 +565,8 @@ static bool matrix_sweep(sdmmc_storage_t *storage, u8 kind, bool gated)
     return ddr_eye_width(eye) >= DdrRuntimeWidth && tap >= eye.left && tap <= eye.right;
 }
 
-void sdmmc_ddr200_matrix_settle(sdmmc_storage_t *storage, u64 switched_at)
+static void matrix_settle(sdmmc_storage_t *storage, u64 switched_at)
 {
-    if (matrix.settled || ddr_watchdog_volume_down())
-        return;
-    matrix.settled = true;
     ddr_trace_policy_sweep(storage->sdmmc, (ddr_eye_t){DdrTapCount, 0},
                            tap_readback(storage->sdmmc), DdrSweepSettleStart,
                            storage->ddr.drive, switched_at);
@@ -507,6 +577,38 @@ void sdmmc_ddr200_matrix_settle(sdmmc_storage_t *storage, u64 switched_at)
             usleep(waits[trial] - (now - switched_at));
         matrix_sweep(storage, DdrSweepSettle0 + trial, false);
     }
+}
+
+static bool matrix_probe_cmd6(sdmmc_storage_t *storage)
+{
+    ddr_policy_t *policy = &storage->ddr;
+    sdmmc_t *host = storage->sdmmc;
+    u8 backup[512], status[64];
+    char *dma = borrow_dma(1, backup);
+    if (!dma) {
+        matrix.details |= MatrixSettleUnavailable;
+        return policy->ready;
+    }
+
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+    if (sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000)) {
+        if (set_sdr104(storage, status) && enter_from_sdr104(storage, status))
+            matrix_settle(storage, get_tmr_us());
+        else
+            matrix.details |= MatrixSettleUnavailable;
+
+        if (policy->rate == DdrRateFull)
+            train(storage, DdrRateFull, DdrSweepRecovery, true, 0, -1);
+        else
+            policy->ready = policy->rate == DdrRateSdr104 && set_sdr104(storage, status);
+        if (!policy->ready && policy->rate >= DdrRateReduced)
+            fallback(storage, policy->rate, 0, status);
+    } else {
+        matrix.details |= MatrixSettleUnavailable;
+    }
+    restore_dma(dma, backup, sizeof(backup));
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+    return policy->ready;
 }
 
 static bool matrix_set_rate(sdmmc_storage_t *storage)
@@ -668,6 +770,12 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
     bool more = true;
     switch (matrix.phase) {
         case MatrixNoise:
+            if (!matrix.reduced && !matrix.settled) {
+                matrix.settled = true;
+                if (!matrix_probe_cmd6(storage))
+                    more = finish_matrix(storage, DdrMatrixInterrupted);
+                break;
+            }
             matrix_sweep(storage, DdrSweepNoise, false);
             if (++matrix.noise_count == 5)
                 matrix.phase = MatrixGated;
