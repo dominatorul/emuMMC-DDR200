@@ -170,7 +170,13 @@ def print_policy_trace(data, gprs):
         if perf_version >= 17 and gprs[2] >> 32:
             commands, restarts = gprs[2] >> 32, gprs[2] & 0xFFFFFFFF
             print(f'{commands} large CMD18 reads, average {blocks / (2 * commands):.1f} KiB, '
-                  f'maximum {gprs[31] / 2:.1f} KiB, {restarts} SDMA boundary restarts')
+                  f'maximum {(gprs[31] & 0xFFFFFFFF) / 2:.1f} KiB, {restarts} SDMA boundary restarts')
+        if perf_version >= 19:
+            maps, = struct.unpack_from('<I', data, 0x120)
+            served, result = struct.unpack_from('<II', data, 0x130)
+            print(f'Largest Horizon read at the SD hook {(gprs[31] >> 32) / 2:.1f} KiB')
+            print(f'Read-ahead served {served / 2048:.2f} MiB, DMA map attempts {maps}, '
+                  f'last result {result:#010x}')
     runtime_capacity = 48 - matrix_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -214,7 +220,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 18:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 19:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

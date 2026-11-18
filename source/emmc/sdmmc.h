@@ -114,6 +114,12 @@ extern bool sdmmc_memcpy_buf;
 int sdmmc_storage_end(sdmmc_storage_t *storage);
 int sdmmc_storage_read(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf);
 int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out);
+u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks);
+void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks);
+void sdmmc_read_ahead_reset(void);
+#endif
 int sdmmc_storage_init_mmc(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type);
 int sdmmc_storage_set_mmc_partition(sdmmc_storage_t *storage, u32 partition);
 int sdmmc_storage_init_sd(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type);

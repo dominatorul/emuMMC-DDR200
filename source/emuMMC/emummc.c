@@ -115,6 +115,9 @@ static bool _ddr200_reassert(int mmc_id)
     if (!sd_storage.ddr.capable)
         return sdmmc_ddr200_profile_ready(&sd_storage) && !wait_for_native;
     if (!_ddr200_power_ready()) {
+#ifdef EMUMMC_DDR200_READ_AHEAD
+        sdmmc_read_ahead_reset();
+#endif
         if (!boot_power_window_closed && !sdmmc_get_sd_power_enabled())
             return _ddr200_recover_boot_power();
 
@@ -139,6 +142,9 @@ static bool _ddr200_reassert(int mmc_id)
         return true;
 
     ddr_trace_host(DdrReassert, &sd_sdmmc);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    sdmmc_read_ahead_reset();
+#endif
     clock_sdmmc_invalidate_clock_source(SDMMC_1);
     bool resuming = sd_storage.ddr.resume_rate != DdrRateUnknown;
     bool ready = sdmmc_ddr200_handoff(&sd_storage);
@@ -525,6 +531,9 @@ static uint64_t controller_open(int mmc_id)
 
         mutex_lock_handler(FS_SDMMC_EMMC);
         ++native_sd_transitions;
+#ifdef EMUMMC_DDR200_READ_AHEAD
+        sdmmc_read_ahead_reset();
+#endif
         _ddr200_close_boot_power_window();
         bool trace_open = sd_storage.initialized;
         if (trace_open) {
@@ -578,6 +587,9 @@ static uint64_t controller_close(int mmc_id)
             _file_based_emmc_finalize();
             bool close_sd = sd && native_sd_opened && !native_sd_transitions;
             if (close_sd) {
+#ifdef EMUMMC_DDR200_READ_AHEAD
+                sdmmc_read_ahead_reset();
+#endif
                 ++native_sd_transitions;
                 wait_for_native = true;
                 _current_accessor = sd;
@@ -681,8 +693,13 @@ static uint64_t controller_read(void *buf, uint64_t bufSize, int mmc_id, unsigne
 
         if (mmc_id == FS_SDMMC_SD)
         {
-            // Call hekate's driver.
-            if (sdmmc_storage_read(&sd_storage, sector, num_sectors, buf))
+            bool read_ahead = false;
+#ifdef EMUMMC_DDR200_READ_AHEAD
+            read_ahead = native_sd_opened && boot_power_window_closed &&
+                bufSize >= (u64)num_sectors * 512 &&
+                sdmmc_read_ahead(&sd_storage, *sdmmc_das_handle, sector, num_sectors, buf);
+#endif
+            if (read_ahead || sdmmc_storage_read(&sd_storage, sector, num_sectors, buf))
             {
                 ddr_trace_io(false);
                 mutex_unlock_handler(mmc_id);

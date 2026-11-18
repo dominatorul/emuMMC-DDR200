@@ -78,7 +78,8 @@ startup:
 
     MOV W0, #0xFFFF8001
     ADR X1, __data_start
-    ADR X2, __argdata__
+    ADRP X2, __argdata__
+    ADD X2, X2, #:lo12:__argdata__
     SUB X2, X2, X1
     MOV X3, #3
     SVC 0x73

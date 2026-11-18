@@ -40,6 +40,9 @@ static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
 static _Atomic u64 large_read_blocks, large_read_us, large_read_dma_us, large_read_copied;
 static _Atomic u32 large_read_commands, large_read_restarts, largest_read, write_errors;
 #endif
+#ifdef EMUMMC_DDR200_READ_AHEAD
+static _Atomic u32 largest_fs_read, read_ahead_blocks, map_attempts, map_result;
+#endif
 static _Atomic u64 matrix_status;
 static _Atomic u64 bus_registers, clock_registers;
 static _Atomic u64 native_before, native_after;
@@ -205,7 +208,27 @@ void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed)
 {
     atomic_fetch_add_explicit(&fs_stats[write][0], blocks, memory_order_relaxed);
     atomic_fetch_add_explicit(&fs_stats[write][1], elapsed, memory_order_relaxed);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    u32 previous = atomic_load_explicit(&largest_fs_read, memory_order_relaxed);
+    while (!write && blocks > previous &&
+        !atomic_compare_exchange_weak_explicit(&largest_fs_read, &previous, blocks,
+            memory_order_relaxed, memory_order_relaxed)) {
+    }
+#endif
 }
+
+#ifdef EMUMMC_DDR200_READ_AHEAD
+void ddr_trace_read_ahead_map(Result result)
+{
+    map_result = result;
+    ++map_attempts;
+}
+
+void ddr_trace_read_ahead(u32 blocks)
+{
+    atomic_fetch_add_explicit(&read_ahead_blocks, blocks, memory_order_relaxed);
+}
+#endif
 
 void ddr_trace_reassert(void)
 {
@@ -235,7 +258,9 @@ void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+#if defined(EMUMMC_DDR200_READ_AHEAD)
+    ctx->gprs[0] = 0x4444523230300013ull;
+#elif defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     ctx->gprs[0] = 0x4444523230300012ull;
 #else
     ctx->gprs[0] = 0x444452323030000full;
@@ -273,6 +298,11 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[2] = ((u64)large_read_commands << 32) | large_read_restarts;
     ctx->gprs[30] |= (u64)MIN(write_errors, 0xffffu) << 48;
     ctx->gprs[31] = largest_read;
+#endif
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    ctx->gprs[31] |= (u64)largest_fs_read << 32;
+    ctx->pstate = map_attempts;
+    ctx->far = ((u64)map_result << 32) | read_ahead_blocks;
 #endif
     ctx->afsr0 = native_before >> 16;
     ctx->afsr1 = native_after >> 16;

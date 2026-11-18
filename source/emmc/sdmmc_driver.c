@@ -1125,7 +1125,15 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	if (blkcnt >= 0xFFFF)
 		blkcnt = 0xFFFF;
 
-	u64 admaaddr = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
+	u64 admaaddr = 0;
+#ifdef EMUMMC_DDR200_READ_AHEAD
+	if (sdmmc->id == SDMMC_1 && !req->is_write && req->blksize == 512)
+		admaaddr = sdmmc_read_ahead_dma(req->buf, blkcnt);
+#endif
+	if (admaaddr)
+		sdmmc_memcpy_buf = false;
+	else
+		admaaddr = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
 	if (!admaaddr)
 	{
 		/* The caller's buffer is outside the mapped windows. Keep DMA

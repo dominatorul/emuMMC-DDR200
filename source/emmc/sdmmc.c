@@ -397,6 +397,10 @@ int sdmmc_storage_read(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, vo
 
 int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf)
 {
+#ifdef EMUMMC_DDR200_READ_AHEAD
+	if (storage->sdmmc->id == SDMMC_1)
+		sdmmc_read_ahead_invalidate(sector, num_sectors);
+#endif
 	if (!custom_driver)
 	{
 		sdmmc_accessor_t *accessor_sd = sdmmc_accessor_sd();

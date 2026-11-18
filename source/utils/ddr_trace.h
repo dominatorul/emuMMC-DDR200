@@ -22,6 +22,10 @@ void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded);
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
                        u32 blocks, u64 elapsed_us, u64 dma_us);
 void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed_us);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+void ddr_trace_read_ahead_map(Result result);
+void ddr_trace_read_ahead(u32 blocks);
+#endif
 void ddr_trace_reassert(void);
 void ddr_trace_boot_power(void);
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);

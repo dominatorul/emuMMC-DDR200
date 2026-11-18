@@ -38,6 +38,16 @@ SVC_BEGIN svcAttachDeviceAddressSpace
 	RET
 SVC_END
 
+SVC_BEGIN svcMapDeviceAddressSpaceAligned
+	SVC 0x5A
+	RET
+SVC_END
+
+SVC_BEGIN svcUnmapDeviceAddressSpace
+	SVC 0x5C
+	RET
+SVC_END
+
 SVC_BEGIN svcQueryMemory
 	STR X1, [SP, #-16]!
 	SVC 0x6

@@ -19,3 +19,7 @@ done
     -DINNER_HEAP_SIZE=0x8000 tests/test_ddr200_lifecycle.c \
     -Wl,--gc-sections -o "$out/test_ddr200_lifecycle"
 ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_lifecycle"
+
+"${CC:-clang}" -std=gnu2x -O1 -g -fsanitize=address,undefined \
+    -DEMUMMC_DDR200_READ_AHEAD tests/test_ddr200_read_ahead.c -o "$out/test_ddr200_read_ahead"
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_read_ahead"

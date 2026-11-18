@@ -71,6 +71,11 @@ Result svcLegacyQueryIoMapping(u64* virtaddr, u64 physaddr, u64 size);
  */
 Result svcAttachDeviceAddressSpace(u64 device, Handle handle);
 
+Result svcMapDeviceAddressSpaceAligned(Handle das, Handle process, u64 address, u64 size,
+    u64 device_address, u32 permission);
+Result svcUnmapDeviceAddressSpace(Handle das, Handle process, u64 address, u64 size,
+    u64 device_address);
+
 /**
  * @brief Query information about an address. Will always fetch the lowest page-aligned mapping that contains the provided address.
  * @param[out] meminfo_ptr \ref MemoryInfo structure which will be filled in.
