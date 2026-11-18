@@ -82,8 +82,7 @@ static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsi
         ++neighbor;
     if (neighbor > eye.right)
         return false;
-    /* Prefer an interior neighbor. The final production tap has its own
-       three-tap margin even when the second probe has a narrower margin. */
+    /* Prefer a nearby interior tap for the second data read. */
     if (tap > eye.left && !ddr_tap_passes(used, tap - 1))
         neighbor = tap - 1;
     else if (tap < eye.right && !ddr_tap_passes(used, tap + 1))
@@ -162,18 +161,22 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
 
     u32 prior_tap = tap_readback(host);
     bool tracking = kind == DdrSweepTrack && !clock_changed;
+    bool runtime_full = rate == DdrRateFull && kind != DdrSweepInitial;
+    unsigned width = ddr_eye_width(eye);
+    bool narrow = runtime_full && width >= 2 * DdrNarrowMargin + 1 && width < 2 * DdrTapMargin + 1;
+    unsigned guard = narrow ? DdrNarrowMargin : DdrTapMargin;
     unsigned applied = SDMMC_INVALID_TAP;
-    if (tracking && ddr_eye_width(eye) >= 2 * DdrTapMargin + 1 &&
+    if (tracking && !narrow && width >= 2 * DdrTapMargin + 1 &&
         prior_tap >= eye.left + DdrTapMargin && prior_tap <= eye.right - DdrTapMargin &&
         (!had_eye || previous.right < eye.right + 3u)) {
         applied = prior_tap;
-    } else if (ddr_eye_width(eye) >= (kind == DdrSweepInitial ? SDMMC_SAMPLE_WIN_SIZE_MIN : DdrRuntimeWidth)) {
+    } else if (width >= (kind == DdrSweepInitial ? SDMMC_SAMPLE_WIN_SIZE_MIN : DdrRuntimeWidth)) {
         u32 tried[4] = {0};
         if (failed_tap >= 0)
             exclude_tap(tried, failed_tap);
 
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
-            int tap = ddr_pick_tap(history, tried);
+            int tap = ddr_pick_tap(history, tried, guard, runtime_full);
             if (tap < 0 || policy->rate == DdrRateUnknown)
                 break;
             if (kind == DdrSweepInitial) {
@@ -192,6 +195,7 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
     }
     ddr_trace_policy_sweep(host, eye, applied, kind, policy->drive, started);
     policy->ready = applied != SDMMC_INVALID_TAP;
+    policy->narrow = policy->ready && narrow;
     if (policy->ready)
         ddr_trace_stage(DdrReady, host->divisor);
     return policy->ready;
@@ -472,8 +476,10 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector)
     if (!policy->capable || !policy->ready)
         return policy->ready;
 
+    unsigned track_blocks = policy->narrow ? DdrNarrowTrackBlocks : DdrTrackBlocks;
+    unsigned track_time = policy->narrow ? DdrNarrowTrackBusyUs : DdrTrackBusyUs;
     bool track = policy->rate == DdrRateFull &&
-        (policy->blocks >= DdrTrackBlocks || policy->busy_us >= DdrTrackBusyUs);
+        (policy->blocks >= track_blocks || policy->busy_us >= track_time);
     bool upgrade = !policy->matrix_active && ddr_should_upgrade(policy, get_tmr_us());
     if (!track && !upgrade)
         return true;

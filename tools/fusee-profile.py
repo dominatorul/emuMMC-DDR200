@@ -13,7 +13,7 @@ STUB_LOAD = 0x40010000
 LZ4_LITERAL_PAIR = 0xB4
 PROGRAM_SIZE = 0x3C000
 SLOT = b'sdmc:/atmosphere/emummc.kip\0'
-PROFILES = {'matrix': b'matrix', 'known-good': b'goodfs'}
+PROFILES = {'matrix': b'matrix', 'known-good': b'goodfs', 'clock-trial': b'clocks'}
 
 
 def loader_unpack(packed):

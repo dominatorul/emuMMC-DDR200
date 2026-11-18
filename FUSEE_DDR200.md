@@ -9,15 +9,21 @@ and emuMMC configuration.
 ## Runtime policy
 
 Initial DDR200 qualification requires an eight-tap window. After it qualifies,
-local sweeps cover the previous eye within 16 taps of its center. The driver
-checks after a native handoff, approximately 256 MiB, or two seconds of
-transfer time. The intersection of up to three measured windows supplies
-candidate taps. A receding right edge tightens the eligible interval. The
-picked tap keeps at least three taps of margin from each measured edge and
-from the current eye. A newly applied runtime tap requires matching 256 KiB
-DMA reads at two distinct passing taps. The four-tap measurement floor
-allows a narrow eye into the trace. The final three-tap margin needs at least
-seven passing taps.
+the driver sweeps within 16 taps of the previous eye's center after native
+handoff, 64 MiB of I/O, or 500 ms of busy time. The intersection of up to
+three measured windows supplies candidate taps. Full-rate runtime tuning
+prefers the low side to leave room for a collapsing right edge.
+
+A five- or six-tap full-rate eye can continue with two taps of margin if two
+256 KiB reads at distinct passing taps agree. The driver rechecks these
+narrow windows every 32 MiB or 250 ms of busy time. Wider eyes and reduced
+DDR200 use a three-tap guard. Failed verification triggers normal fallback.
+
+The release clock uses PLLC4_OUT0 at 998.4 MHz, the SDMMC1 source divider
+of 2.5, and the SDHCI divider of 2, giving 199.68 MHz. The experimental
+**Fusee DDR200 (204 MHz PLLP trial)** entry uses an existing locked 408 MHz
+PLLP clock and SDHCI divide by 2. This changes the controller's mux and
+divider and lets a console test compare the two sources.
 
 The driver first repairs a failed data command with explicit CMD12, waits
 for CMD13 transfer state and READY_FOR_DATA, and resets CMD/DAT. Read recovery

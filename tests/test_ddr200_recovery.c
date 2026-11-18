@@ -226,8 +226,11 @@ void ddr_trace_ladder(enum DdrRate rate, bool ready, bool unstable, unsigned upg
 void ddr_trace_policy_sweep(const sdmmc_t *target, ddr_eye_t eye, unsigned tap, u8 kind, u8 drive, u64 started)
 {
     assert(target == &host && started <= now);
-    if (tap < DdrTapCount && kind < DdrSweepNoise)
-        assert(tap >= eye.left + DdrTapMargin && tap + DdrTapMargin <= eye.right);
+    if (tap < DdrTapCount && kind < DdrSweepNoise) {
+        unsigned guard = target->divisor == 199680 && kind != DdrSweepInitial &&
+                         ddr_eye_width(eye) < 2 * DdrTapMargin + 1 ? DdrNarrowMargin : DdrTapMargin;
+        assert(tap >= eye.left + guard && tap + guard <= eye.right);
+    }
 #ifdef EMUMMC_DDR200_MATRIX
     if (kind >= DdrSweepNoise && kind != DdrSweepSettleStart)
         ++matrix_sweeps;
@@ -301,7 +304,7 @@ static void test_eye_model(void)
         ddr_eye_t measured = ddr_first_eye(map, 15, 64, DdrRuntimeWidth);
         assert(measured.left == eyes[i].left && measured.right == eyes[i].right);
         ddr_remember_eye(&history, measured);
-        int tap = ddr_pick_tap(&history, excluded);
+        int tap = ddr_pick_tap(&history, excluded, DdrTapMargin, false);
         assert(tap >= measured.left + DdrTapMargin && tap + DdrTapMargin <= measured.right);
         unsigned next = MIN(i + 1, 3u);
         assert(tap >= eyes[next].left && tap <= eyes[next].right);
@@ -362,9 +365,20 @@ int main(void)
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
 
+    for (unsigned edge = 33; edge <= 34; ++edge) {
+        reset();
+        fail_reads = 1;
+        full_eye = (ddr_eye_t){29, edge};
+        assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+        assert(card.ddr.rate == DdrRateFull && card.ddr.narrow && verifies == 2);
+        assert(tap_readback(&host) == 31 && verify_taps[0] != verify_taps[1]);
+        card.ddr.busy_us = DdrNarrowTrackBusyUs;
+        assert(sdmmc_ddr200_before_io(&card, 1024) && verifies == 4 && card.ddr.ready);
+    }
+
     reset();
     fail_reads = 1;
-    full_eye = (ddr_eye_t){29, 34};
+    full_eye = (ddr_eye_t){29, 32};
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
     assert(card.ddr.rate == DdrRateReduced && card.ddr.unstable && verifies == 2 && log_events >= 2);
     assert(!ddr_should_upgrade(&card.ddr, now));
@@ -375,6 +389,7 @@ int main(void)
 
     reset();
     inconsistent = true;
+    full_eye = (ddr_eye_t){29, 33};
     fail_reads = 1;
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
     assert(card.ddr.rate == DdrRateSdr104 && switched_to_stock == 1 && verifies >= 4);

@@ -29,7 +29,7 @@ POLICY_SWEEPS = {
     19: 'CMD6 settle target 0 ms', 20: 'CMD6 settle target 10 ms', 21: 'CMD6 settle target 100 ms',
     22: 'stream', 23: 'after idle', 24: 'drive strength', 25: 'CMD6 switch complete',
 }
-RATES = ('unavailable', 'SDR104', '166.40 MHz DDR200', '199.68 MHz DDR200')
+RATES = ('unavailable', 'SDR104', '166.40 MHz DDR200', 'full-rate DDR200')
 MATRIX_PHASES = ('noise floor', 'clock gating', 'free-running clock', 'stream',
                  'idle', 'driver strength', 'throughput', 'CMD6 settling')
 MATRIX_STATES = ('pending', 'running', 'complete', 'skipped', 'interrupted')
@@ -108,7 +108,9 @@ def print_policy_trace(data, gprs):
     if matrix_capacity not in (0, 40):
         raise ValueError('invalid DDR200 trace capacity')
     state = gprs[30]
-    print(f'Policy {RATES[state & 3]}, ready {bool(state & 0x100)}, '
+    ready_khz = gprs[6] & 0xFFFFFFFF
+    rate = f'{ready_khz / 1000:.2f} MHz DDR200' if (state & 0x103) == 0x103 else RATES[state & 3]
+    print(f'Policy {rate}, ready {bool(state & 0x100)}, '
           f'full rate unstable {bool(state & 0x200)}, upgrade attempts {(state >> 16) & 0xFF}')
     print(f'Last verified SD clock {(gprs[6] & 0xFFFFFFFF) / 1000:.2f} MHz, '
           f'last sampled data/scan clock {(gprs[28] >> 32) / 1000:.2f} MHz, '

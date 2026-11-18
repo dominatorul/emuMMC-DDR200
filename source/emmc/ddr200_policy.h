@@ -8,9 +8,12 @@ enum {
     DdrTapCount = 128,
     DdrRuntimeWidth = 4,
     DdrTapMargin = 3,
+    DdrNarrowMargin = 2,
     DdrVerifyBlocks = 512,
-    DdrTrackBlocks = 512 * 1024,
-    DdrTrackBusyUs = 2000000,
+    DdrTrackBlocks = 128 * 1024,
+    DdrTrackBusyUs = 500000,
+    DdrNarrowTrackBlocks = 64 * 1024,
+    DdrNarrowTrackBusyUs = 250000,
     DdrCoolIdleUs = 5000000,
     DdrCoolBlocks = 256 * 1024,
     DdrMaxUpgrades = 6,
@@ -29,6 +32,7 @@ typedef struct {
     enum DdrRate resume_rate;
     bool capable;
     bool ready;
+    bool narrow;
     bool unstable;
     bool matrix_active;
     u8 upgrades;
@@ -74,21 +78,22 @@ static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)
         ++history->count;
 }
 
-static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4])
+static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4],
+                               unsigned guard, bool prefer_left)
 {
     ddr_eye_t newest = history->eyes[0];
-    if (ddr_eye_width(newest) < 2 * DdrTapMargin + 1)
+    if (ddr_eye_width(newest) < 2 * guard + 1)
         return -1;
 
-    int left = newest.left + DdrTapMargin;
-    int right = newest.right - DdrTapMargin;
+    int left = newest.left + guard;
+    int right = newest.right - guard;
     for (unsigned i = 1; i < history->count; ++i) {
-        left = MAX(left, history->eyes[i].left + DdrTapMargin);
-        right = MIN(right, history->eyes[i].right - DdrTapMargin);
+        left = MAX(left, history->eyes[i].left + (int)guard);
+        right = MIN(right, history->eyes[i].right - (int)guard);
     }
     if (left > right) {
-        left = newest.left + DdrTapMargin;
-        right = newest.right - DdrTapMargin;
+        left = newest.left + guard;
+        right = newest.right - guard;
     }
 
     /* A receding right edge is a measured trend. Leave an extra guard on
@@ -101,9 +106,9 @@ static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4])
 
     int selected = -1, best_margin = -1;
     for (int tap = left; tap <= right; ++tap) {
-        int margin = MIN(tap - left, right - tap);
-        if (margin > best_margin && !ddr_tap_passes(tried, tap)) {
-            best_margin = margin;
+        int score = prefer_left ? right - tap : MIN(tap - left, right - tap);
+        if (score > best_margin && !ddr_tap_passes(tried, tap)) {
+            best_margin = score;
             selected = tap;
         }
     }

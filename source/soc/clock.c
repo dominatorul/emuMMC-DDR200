@@ -327,6 +327,19 @@ static int _clock_sdmmc_config_clock_host(u32 *pclock, u32 id, u32 val)
 		if (!_clock_enable_pllc4())
 			return 0;
 		break;
+#ifdef EMUMMC_DDR200_PLLP_TRIAL
+	case SDMMC_DDR200_PLLP_SRC_KHZ:
+		/* Use the existing 408 MHz PLLP clock. SDHCI divides it by two
+		   for DDR, so no fractional CAR divider or PLL retune is needed. */
+		if (id != SDMMC_1 ||
+		    (CLOCK(CLK_RST_CONTROLLER_PLLP_BASE) & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK)) !=
+		        (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK))
+			return 0;
+		source = SDMMC_CLOCK_SRC_PLLP_OUT0;
+		*pclock = SDMMC_DDR200_PLLP_SRC_KHZ;
+		divisor = 0; // 1 div.
+		break;
+#endif
 	case SDMMC_DDR200_RECOVERY_SRC_KHZ:
 		source = SDMMC_CLOCK_SRC_PLLC4_OUT0;
 		*pclock = 2 * SDMMC_DDR200_RECOVERY_CARD_KHZ;
