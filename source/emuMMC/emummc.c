@@ -79,10 +79,33 @@ static bool _ddr200_power_ready(void)
 }
 
 #ifdef EMUMMC_FORCE_DDR200
+static bool boot_power_window_closed;
+
+static void _ddr200_close_boot_power_window(void)
+{
+    boot_power_window_closed = true;
+    i2c_release_boot_bus();
+}
+
+/* The boot process can drop the card's GPIO before native FS is ready to
+   reopen SD. Complete the original fork's early recovery once at that point. */
+static int _ddr200_recover_boot_power(void)
+{
+    boot_power_window_closed = true;
+    ddr_trace_boot_power();
+    sdmmc_end(&sd_sdmmc);
+    sd_storage.initialized = 0;
+    clock_sdmmc_invalidate_clock_source(SDMMC_1);
+    int ok = nx_sd_initialize(false);
+    _ddr200_close_boot_power_window();
+    return ok;
+}
+
 /* Storage mutexes are held. Open uses the native FS regulator service, so
    its power changes are serialized with Horizon's other I2C transactions. */
 static int _ddr200_native_reopen(void)
 {
+    _ddr200_close_boot_power_window();
     sdmmc_accessor_t *accessor = sdmmc_accessor_get(FS_SDMMC_SD);
     if (!accessor)
         return 0;
@@ -141,7 +164,12 @@ static void _ddr200_reassert(int mmc_id)
 
     reasserting = true;
 #ifdef EMUMMC_FORCE_DDR200
-    int ok = !cold || _ddr200_native_reopen();
+    int ok;
+    if (cold && !boot_power_window_closed && !sdmmc_get_sd_power_enabled()) {
+        ok = _ddr200_recover_boot_power();
+        goto recovered;
+    }
+    ok = !cold || _ddr200_native_reopen();
     /* Native FS ordinarily reopens in SDR104. If timing is uncertain,
        avoid issuing a CMD6 data transfer using a mismatched host. */
     if (ok && cold && (sd_sdmmc.regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED) {
@@ -187,6 +215,9 @@ static void _ddr200_reassert(int mmc_id)
         sdmmc_card_clock_powersave(&sd_sdmmc, SDMMC_POWER_SAVE_ENABLE);
     }
 
+#ifdef EMUMMC_FORCE_DDR200
+recovered:
+#endif
     if (dma_scratch != NULL)
     {
         memcpy(dma_scratch, dma_save, sizeof(dma_save));
@@ -229,9 +260,6 @@ static void _sdmmc_ensure_initialized(void)
     if (!sdmmc_first_init)
     {
         sdmmc_initialize();
-#ifdef EMUMMC_FORCE_DDR200
-        i2c_release_boot_bus();
-#endif
         sdmmc_first_init = true;
     }
 #ifndef EMUMMC_FORCE_DDR200
@@ -591,6 +619,10 @@ static uint64_t controller_open(int mmc_id)
             ddr_trace_stage(DdrNativeOpen, mmc_id);
             ddr_trace_host(DdrBeforeOpen, &sd_sdmmc);
         }
+#ifdef EMUMMC_FORCE_DDR200
+        if (mmc_id == FS_SDMMC_SD)
+            _ddr200_close_boot_power_window();
+#endif
         result = _this->vtab->sdmmc_accessor_controller_open(_this);
         if (!result && mmc_id == FS_SDMMC_SD)
             native_sd_opened = true;

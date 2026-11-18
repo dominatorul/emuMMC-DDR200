@@ -44,14 +44,20 @@ programmed transfer length. The active DDR200 clock policy is the same.
 
 The stall-trace boot produced an Atmosphère fatal report from `pcv`, Program ID
 `010000000000001A`, with result `0x265` (`2101-0001`, I²C NoAck). The associated
-PTM and OMM crashes share that boot. The forced driver now releases its raw
-boot I²C5 interface as soon as it finishes initial SD setup. Native FS handles
-later power recovery so its regulator transactions go through Horizon's service.
-The read retry changes the SD sampling clock without cycling the PMIC. HOC clock
-and SysFanControl startup flags are saved under `ddr200-debug/previous-fusee-stall-trace`
-for this test to isolate the power and clock services.
+PTM and OMM crashes share that boot. The PCV test moved later SD power recovery
+to native FS and changed read retries to retune the powered card in place.
 
-Use **More Configs → Fusee DDR200 PCV test (1.11.2)**. The entry chainloads the
+PCV-test report `00000000001648d8` now shows the earlier boot transition.
+The driver completed 98 reads and 36 writes at 199.68 MHz with a 17-tap window.
+SD power GPIO was then low while the host still held the DDR settings. Native
+SD open returned `0x218` (NoDevice), leaving the card off. This revision allows
+the original fork's early cold initialization once if the GPIO drops before
+native FS begins SD open. Finishing that recovery or invoking native SD open
+closes direct I²C5 access for the remainder of the boot. Later power recovery
+uses native FS and read retries retune in place. HOC clock and SysFanControl
+startup flags remain backed up under `ddr200-debug/previous-fusee-stall-trace`.
+
+Use **More Configs → Fusee DDR200 boot handoff (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a

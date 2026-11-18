@@ -16,6 +16,7 @@ static _Atomic u32 reads, writes, attempts, sweeps;
 static _Atomic u32 first_window, latest_window, first_card[2], latest_card[2];
 static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
 static _Atomic u32 last_full_window, last_reduced_window;
+static _Atomic bool boot_power_recovery;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
 
 /* SD operations serialize trace writes. Atomic reads let a watchdog capture
@@ -114,6 +115,12 @@ void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
 
 void ddr_trace_reassert(void) { ++attempts; }
 
+void ddr_trace_boot_power(void)
+{
+    boot_power_recovery = true;
+    ddr_trace_stage(DdrBootPower, 0);
+}
+
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
@@ -137,6 +144,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[23] = ((u64)last_full_window << 32) | last_reduced_window;
     /* Use reserved report space while leaving actual stack lengths zero. */
     ddr_watchdog_report(&ctx->gprs[24]);
+    ctx->gprs[28] = boot_power_recovery;
     u32 saved[DdrSnapshotCount][SnapshotWords];
     for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
         saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);

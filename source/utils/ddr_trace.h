@@ -6,7 +6,8 @@
 enum DdrSnapshot { DdrInitialTune, DdrLatestTune, DdrBeforeOpen, DdrAfterOpen, DdrReassert, DdrSnapshotCount };
 enum DdrStage { DdrBoot, DdrInit, DdrReady, DdrNativeOpen, DdrCheckState,
     DdrReadFunctions, DdrCheckFunction, DdrSetFunction, DdrSetClock, DdrSweep,
-    DdrCheckStatus, DdrRead, DdrWrite, DdrSetSdr12, DdrDma, DdrNativePower };
+    DdrCheckStatus, DdrRead, DdrWrite, DdrSetSdr12, DdrDma, DdrNativePower,
+    DdrBootPower };
 enum DdrCommandFailure { DdrCommandClock = 1, DdrCommandInhibit, DdrCommandDmaSetup,
     DdrCommandResponse, DdrCommandTransfer, DdrCommandBusy };
 
@@ -17,4 +18,5 @@ void ddr_trace_card(const u8 *status, bool selected);
 void ddr_trace_io(bool write);
 void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks);
 void ddr_trace_reassert(void);
+void ddr_trace_boot_power(void);
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);

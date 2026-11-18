@@ -10,7 +10,7 @@ STAGES = (
     'boot', 'card initialization', 'ready', 'native SD open', 'host state check',
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
-    'DMA polling', 'native SD power recovery',
+    'DMA polling', 'native SD power recovery', 'early SD power recovery',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
@@ -41,6 +41,8 @@ def decode(path):
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
     if stage == STAGES.index('DMA polling'):
         print(f'  CMD{(gprs[1] >> 16) & 0xFFFF}, blocks {gprs[1] & 0xFFFF}')
+    if stage == STAGES.index('native SD power recovery') and gprs[1] & 0xFFFFFFFF == 0x218:
+        print('  Native SDMMC ResultNoDevice (0x218)')
     print(f'Completed reads {gprs[2] >> 32}, writes {gprs[2] & 0xFFFFFFFF}')
     print(f'Reassert attempts {gprs[3] >> 32}, completed sweeps {gprs[3] & 0xFFFFFFFF}')
 
@@ -73,6 +75,8 @@ def decode(path):
                       f'IRQ {rate_irq & 0xFFFF:04X}, present state {state >> 32:08X}, blocks {state & 0xFFFFFFFF}')
 
     if gprs[0] == 0x4444523230300008:
+        if gprs[28]:
+            print('One-time early SD power recovery was attempted')
         op, phase, age, depth = gprs[24:28]
         if depth:
             kind = op >> 16
