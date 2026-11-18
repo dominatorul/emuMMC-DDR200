@@ -1131,7 +1131,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 	return 0;
 }
 
-static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *blkcnt_out)
+static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *blkcnt_out, u64 *dma_us)
 {
 	sdmmc->command_failure = DdrCommandInhibit;
 	int has_req_or_check_busy = req || cmd->check_busy;
@@ -1187,7 +1187,10 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 			sdmmc->command_failure = DdrCommandTransfer;
 			if (sdmmc->id == SDMMC_1)
 				ddr_trace_stage(DdrDma, ((u32)cmd->cmd << 16) | blkcnt);
+			u64 dma_start = dma_us ? get_tmr_us() : 0;
 			result = _sdmmc_update_dma(sdmmc);
+			if (dma_us)
+				*dma_us = get_tmr_us() - dma_start;
 		}
 	}
 
@@ -1586,6 +1589,10 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	sdmmc->command_irq = 0;
 	if (!sdmmc->card_clock_enabled)
 		return 0;
+	bool sample = sdmmc->id == SDMMC_1 && req && req->blksize == 512 &&
+		(cmd->cmd == MMC_READ_MULTIPLE_BLOCK || cmd->cmd == MMC_WRITE_MULTIPLE_BLOCK);
+	u64 started = sample ? get_tmr_us() : 0;
+	u64 dma_us = 0;
 
 	// Recalibrate periodically for SDMMC1.
 	if (sdmmc->manual_cal && sdmmc->powersave_enabled)
@@ -1600,11 +1607,14 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 		usleep((8000 + sdmmc->divisor - 1) / sdmmc->divisor);
 	}
 
-	int result = _sdmmc_execute_cmd_inner(sdmmc, cmd, req, blkcnt_out);
+	int result = _sdmmc_execute_cmd_inner(sdmmc, cmd, req, blkcnt_out, sample ? &dma_us : NULL);
 	usleep((8000 + sdmmc->divisor - 1) / sdmmc->divisor);
 
 	if (should_disable_sd_clock)
 		sdmmc->regs->clkcon &= ~SDHCI_CLOCK_CARD_EN;
+	if (sample)
+		ddr_trace_sd_perf(sdmmc, req->is_write, result, sdmmc_memcpy_buf,
+			result && blkcnt_out ? *blkcnt_out : req->num_sectors, get_tmr_us() - started, dma_us);
 
 	return result;
 }

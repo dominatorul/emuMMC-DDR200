@@ -13,6 +13,9 @@ STAGES = (
     'DMA polling', 'native SD power recovery', 'early SD power recovery',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
+PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
+PERF_TOTALS = struct.Struct('<18Q')
+PERF_CLOCK = struct.Struct('<5I')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
@@ -27,6 +30,28 @@ REGISTERS = (
 )
 
 
+def print_performance(data):
+    counters = PERF_TOTALS.unpack_from(data, PERF_OFFSET)
+    khz, source, pll, host_clock, vendor = PERF_CLOCK.unpack_from(data, PERF_OFFSET + PERF_TOTALS.size)
+    print(f'Last data command clock {khz / 1000:.2f} MHz, host mode {(host_clock >> 16) & 7}, '
+          f'CAR.source {source:08X}, CAR.pllc4_base {pll:08X}, '
+          f'host.ctrl2_and_clock {host_clock:08X}, vendor.clock {vendor:08X}')
+    print('Cumulative transfer counters since boot')
+    for i, direction in enumerate(('Read', 'Write')):
+        calls, blocks, elapsed, dma, copied, errors = counters[i * 6:i * 6 + 6]
+        successful = calls - errors
+        rate = f'{blocks * 512 / elapsed:.2f} MB/s' if elapsed else 'n/a'
+        average = f'{blocks / (2 * successful):.1f} KiB' if successful > 0 else 'n/a'
+        bounce = f'{100 * copied / blocks:.1f}%' if blocks else 'n/a'
+        print(f'  {direction} SD commands at {rate} during {elapsed / 1e6:.3f}s, '
+              f'{calls} attempts, {errors} failed, {average} per successful command, '
+              f'{bounce} copied through DMA buffers, {dma / 1e6:.3f}s in DMA polling')
+        fs_calls, fs_blocks, fs_elapsed = counters[12 + i * 3:15 + i * 3]
+        fs_rate = f'{fs_blocks * 512 / fs_elapsed:.2f} MB/s' if fs_elapsed else 'n/a'
+        print(f'  {direction} SD filesystem at {fs_rate} across {fs_calls} successful requests, '
+              f'{fs_elapsed / 1e6:.3f}s including lock wait and recovery')
+
+
 def decode(path):
     data = path.read_bytes()
     if len(data) < 0x350:
@@ -34,10 +59,12 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9):
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9, 10):
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
-    if trace_version >= 9 and len(data) < 0x350 + len(SNAPSHOTS) * 12:
+    if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
+    if trace_version >= 10 and len(data) < PERF_OFFSET + PERF_TOTALS.size + PERF_CLOCK.size:
+        raise ValueError(f'{path} is too short for a performance trace')
     has_rates = trace_version >= 7
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
@@ -90,6 +117,9 @@ def decode(path):
                   f'{age / 1000000:.3f}s, nesting {depth}')
         else:
             print('No active SDMMC wrapper at the time of the report')
+
+    if trace_version >= 10:
+        print_performance(data)
 
     # AFE2 stack-trace and stack-dump regions carry the snapshots.
     states = {}

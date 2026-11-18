@@ -847,7 +847,10 @@ uint64_t sdmmc_wrapper_controller_close(int mmc_id)
 uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned int sector, unsigned int num_sectors)
 {
     u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpRead, mmc_id);
+    u64 started = mmc_id == FS_SDMMC_SD ? get_tmr_us() : 0;
     u64 result = controller_read(buf, bufSize, mmc_id, sector, num_sectors);
+    if (!result && mmc_id == FS_SDMMC_SD)
+        ddr_trace_fs_perf(false, num_sectors, get_tmr_us() - started);
     ddr_watchdog_leave(slot);
     return result;
 }
@@ -855,7 +858,10 @@ uint64_t sdmmc_wrapper_read(void *buf, uint64_t bufSize, int mmc_id, unsigned in
 uint64_t sdmmc_wrapper_write(int mmc_id, unsigned int sector, unsigned int num_sectors, void *buf, uint64_t bufSize)
 {
     u32 slot = ddr_watchdog_enter((uintptr_t)armGetTls(), DdrOpWrite, mmc_id);
+    u64 started = mmc_id == FS_SDMMC_SD ? get_tmr_us() : 0;
     u64 result = controller_write(mmc_id, sector, num_sectors, buf, bufSize);
+    if (!result && mmc_id == FS_SDMMC_SD)
+        ddr_trace_fs_perf(true, num_sectors, get_tmr_us() - started);
     ddr_watchdog_leave(slot);
     return result;
 }

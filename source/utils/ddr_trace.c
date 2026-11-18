@@ -20,6 +20,11 @@ static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
 static _Atomic u32 last_full_window, last_reduced_window;
 static _Atomic u32 boot_power_recoveries;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
+/* SD commands include both the SD filesystem and emulated NAND. The outer
+   FS counters select only SD filesystem I/O, including mutex wait time. */
+enum { PerfCalls, PerfBlocks, PerfElapsed, PerfDma, PerfBounce, PerfErrors, PerfFields };
+static _Atomic u64 sd_perf[2][PerfFields], fs_perf[2][3];
+static _Atomic u32 perf_clock[5];
 
 /* SD operations serialize trace writes. Atomic reads let a watchdog capture
    the current trace even while a worker owns both storage mutexes. */
@@ -118,6 +123,38 @@ void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
             first_io_error[i] = latest_io_error[i];
 }
 
+void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
+                       u32 blocks, u64 elapsed_us, u64 dma_us)
+{
+    _Atomic u64 *totals = sd_perf[write];
+    u64 calls = atomic_fetch_add_explicit(&totals[PerfCalls], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&totals[PerfElapsed], elapsed_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&totals[PerfDma], dma_us, memory_order_relaxed);
+    if (!succeeded) {
+        atomic_fetch_add_explicit(&totals[PerfErrors], 1, memory_order_relaxed);
+        return;
+    }
+    atomic_fetch_add_explicit(&totals[PerfBlocks], blocks, memory_order_relaxed);
+    if (copied)
+        atomic_fetch_add_explicit(&totals[PerfBounce], blocks, memory_order_relaxed);
+
+    /* Sample concrete clock registers periodically and on clock changes. */
+    if (!(calls & 255) || perf_clock[0] != host->divisor) {
+        perf_clock[0] = host->divisor;
+        perf_clock[1] = CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1);
+        perf_clock[2] = CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
+        perf_clock[3] = ((u32)host->regs->hostctl2 << 16) | host->regs->clkcon;
+        perf_clock[4] = host->regs->venclkctl;
+    }
+}
+
+void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed_us)
+{
+    atomic_fetch_add_explicit(&fs_perf[write][PerfCalls], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fs_perf[write][PerfBlocks], blocks, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fs_perf[write][PerfElapsed], elapsed_us, memory_order_relaxed);
+}
+
 void ddr_trace_reassert(void) { ++attempts; }
 
 void ddr_trace_boot_power(void)
@@ -128,7 +165,7 @@ void ddr_trace_boot_power(void)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x4444523230300009ull;
+    ctx->gprs[0] = 0x444452323030000Aull;
     ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
@@ -166,4 +203,17 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
             pins[slot][i] = atomic_load_explicit(&power_pins[slot][i], memory_order_relaxed);
     _Static_assert(sizeof(pins) <= sizeof(ctx->tls), "GPIO trace too large");
     memcpy(ctx->tls, pins, sizeof(pins));
+    u64 performance[2 * PerfFields + 2 * 3];
+    for (u32 dir = 0; dir < 2; ++dir) {
+        for (u32 i = 0; i < PerfFields; ++i)
+            performance[dir * PerfFields + i] = atomic_load_explicit(&sd_perf[dir][i], memory_order_relaxed);
+        for (u32 i = 0; i < 3; ++i)
+            performance[2 * PerfFields + dir * 3 + i] = atomic_load_explicit(&fs_perf[dir][i], memory_order_relaxed);
+    }
+    u32 clocks[5];
+    for (u32 i = 0; i < 5; ++i)
+        clocks[i] = atomic_load_explicit(&perf_clock[i], memory_order_relaxed);
+    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks) <= sizeof(ctx->tls), "performance trace too large");
+    memcpy(ctx->tls + sizeof(pins), performance, sizeof(performance));
+    memcpy(ctx->tls + sizeof(pins) + sizeof(performance), clocks, sizeof(clocks));
 }

@@ -64,14 +64,26 @@ initial setup. Native SD open permanently closes direct I²C5 access. Later
 power recovery uses native FS and read retries retune in place. HOC clock and
 SysFanControl startup flags remain under `ddr200-debug/previous-fusee-stall-trace`.
 
-Use **More Configs → Fusee DDR200 power pin (1.11.2)**. The entry chainloads the
+The power-pin build reached HOME on the Samsung PRO Plus. The SD card had no
+new fatal report or saved benchmark, so the active clock and the cause of the
+reported slowdown are still unknown. This build retains that clock and recovery
+policy. Its trace records the last sampled data command clock and controller
+registers, plus command size, elapsed time, failures and the share transferred
+through a DMA bounce buffer. SD command totals include emulated NAND I/O.
+Separate SD filesystem request totals include mutex wait and retry time.
+
+Use **More Configs → Fusee DDR200 speed trace (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
-report automatically. If the logo still hangs, release both volume buttons and
-then hold them together for three seconds to capture a report independently of
-SD I/O. If HOME loads, test sleep and wake once. Console testing is
-needed to verify DDR200 boot and resume.
+report automatically.
+
+Run the same benchmark and record its read and write speeds. Once the benchmark
+finishes, exit the app. Hold Volume + and Volume − together for three seconds
+to intentionally open the Atmosphère report screen and save the driver trace.
+Return to Hekate SD UMS to collect the report. The totals include activity since
+boot. Test sleep and wake on a separate boot so the speed report captures the
+session before suspend.
 
 Decode this build's report with `python3 tools/read-ddr-trace.py report_*.bin`
 using a report from the Fusee test. `DD200062` means DDR200 recovery failed.
