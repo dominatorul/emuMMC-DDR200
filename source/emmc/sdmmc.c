@@ -315,7 +315,7 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 		return 0;
 
 	while (num_sectors) {
-		if (sd && !sdmmc_ddr200_before_io(storage, sector))
+		if (sd && !sdmmc_ddr200_before_io(storage, sector, is_write))
 			return 0;
 		u32 count = MIN(num_sectors, 0xFFFF);
 		u32 blocks = 0;

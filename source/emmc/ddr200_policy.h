@@ -43,6 +43,7 @@ typedef struct {
     u32 blocks;
     u32 busy_us;
     u64 last_io;
+    u64 last_write;
     u64 retry_at;
 } ddr_policy_t;
 
@@ -130,5 +131,6 @@ static inline bool ddr_should_upgrade(const ddr_policy_t *policy, u64 now)
 {
     return policy->capable && policy->ready && policy->rate != DdrRateFull &&
         policy->upgrades < DdrMaxUpgrades && now >= policy->retry_at &&
+        (!policy->last_write || now - policy->last_write >= DdrCoolIdleUs) &&
         ((now - policy->last_io >= DdrCoolIdleUs) || policy->blocks >= DdrCoolBlocks);
 }

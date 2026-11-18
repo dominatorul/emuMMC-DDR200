@@ -125,7 +125,7 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage);
 bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *storage);
 bool sdmmc_ddr200_profile_ready(const sdmmc_storage_t *storage);
 bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions);
-bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector);
+bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing);
 bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade);
 void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed);
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write);

@@ -483,29 +483,41 @@ bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
     return ok;
 }
 
-bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector)
+bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 {
     ddr_policy_t *policy = &storage->ddr;
     sdmmc_t *host = storage->sdmmc;
     if (!policy->capable || !policy->ready)
         return policy->ready;
 
+    u64 now = get_tmr_us();
+    if (writing)
+        policy->last_write = now;
+    /* Narrow eyes have passed two read probes. A lower clock gives writes
+       more margin because a partially programmed CMD25 cannot be retried. */
+#ifndef EMUMMC_FORCE_DDR200
+    bool guard_write = writing;
+#else
+    bool guard_write = false;
+#endif
+    bool lower_for_write = guard_write && policy->rate == DdrRateFull && policy->narrow;
     unsigned track_blocks = policy->narrow ? DdrNarrowTrackBlocks : DdrTrackBlocks;
     unsigned track_time = policy->narrow ? DdrNarrowTrackBusyUs : DdrTrackBusyUs;
     bool track = policy->rate == DdrRateFull &&
         (policy->blocks >= track_blocks || policy->busy_us >= track_time);
-    bool upgrade = !policy->matrix_active && ddr_should_upgrade(policy, get_tmr_us());
-    if (!track && !upgrade)
+    bool upgrade = !writing && !policy->matrix_active && ddr_should_upgrade(policy, now);
+    if (!track && !upgrade && !lower_for_write)
         return true;
     u8 backup[512], status[64];
     char *dma = borrow_dma(1, backup);
     if (!dma)
-        return policy->ready;
+        return !lower_for_write;
 
     u64 old = begin_budget(host, 1500000);
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-    if (track) {
-        if (!train(storage, DdrRateFull, DdrSweepTrack, true, sector, -1))
+    if (track || lower_for_write) {
+        if (lower_for_write || !train(storage, DdrRateFull, DdrSweepTrack, true, sector, -1) ||
+            (guard_write && policy->narrow))
             fallback(storage, DdrRateFull, sector, status);
     } else {
         enum DdrRate was = policy->rate;

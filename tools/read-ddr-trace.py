@@ -120,6 +120,8 @@ def print_policy_trace(data, gprs):
           f'group 4 supported {gprs[5] & 0xFFFF:#06x}, selected {(gprs[5] >> 24) & 0xFF}')
     errors = gprs[6] >> 32
     print(f'Data command failures {errors}')
+    if (gprs[0] & 0xFF) >= 18:
+        print(f'CMD25 write command failures {state >> 48}')
     if errors:
         for label, meta, status in (('First', gprs[9], gprs[10]), ('Last', gprs[7], gprs[8])):
             print(f'{label} failed CMD{(meta >> 16) & 0xFFFF}, tap {(meta >> 40) & 0xFF}, '
@@ -212,7 +214,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 17:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 18:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

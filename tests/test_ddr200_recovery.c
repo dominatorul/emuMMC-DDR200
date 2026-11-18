@@ -376,7 +376,7 @@ int main(void)
         assert(card.ddr.rate == DdrRateFull && card.ddr.narrow && verifies == 2);
         assert(tap_readback(&host) == 31 && verify_taps[0] != verify_taps[1]);
         card.ddr.busy_us = DdrNarrowTrackBusyUs;
-        assert(sdmmc_ddr200_before_io(&card, 1024) && verifies == 4 && card.ddr.ready);
+        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == 4 && card.ddr.ready);
     }
 
     reset();
@@ -387,8 +387,35 @@ int main(void)
     assert(!ddr_should_upgrade(&card.ddr, now));
     now += DdrCoolIdleUs * 2;
     full_eye = (ddr_eye_t){29, 44};
-    assert(sdmmc_ddr200_before_io(&card, 1024) && card.ddr.rate == DdrRateFull);
+    assert(sdmmc_ddr200_before_io(&card, 1024, false) && card.ddr.rate == DdrRateFull);
     assert(card.ddr.upgrades == 1 && card.ddr.unstable);
+
+    reset();
+    card.ddr.narrow = true;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, window, 1));
+    assert(card.ddr.rate == DdrRateReduced && host.divisor == 166400 && commands == 3 && verifies == 2);
+    assert(card.ddr.last_write != 0 && !card.ddr.upgrades);
+    for (size_t i = 0; i < sizeof(window); ++i)
+        assert(window[i] == 0x6f);
+
+    now += DdrCoolIdleUs * 2;
+    card.ddr.blocks = DdrCoolBlocks;
+    assert(ddr_should_upgrade(&card.ddr, now));
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 1));
+    assert(card.ddr.rate == DdrRateReduced && !card.ddr.upgrades);
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+    assert(card.ddr.rate == DdrRateReduced && !card.ddr.upgrades);
+
+    now += DdrCoolIdleUs;
+    full_eye = (ddr_eye_t){29, 44};
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+    assert(card.ddr.rate == DdrRateFull && card.ddr.upgrades == 1);
+
+    reset();
+    card.ddr.busy_us = DdrTrackBusyUs;
+    full_eye = (ddr_eye_t){29, 34};
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 1));
+    assert(card.ddr.rate == DdrRateReduced && verifies == 4 && commands == 5);
 
     reset();
     inconsistent = true;
