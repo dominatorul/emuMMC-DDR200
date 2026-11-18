@@ -60,6 +60,7 @@ void ddr_trace_wake_host(const sdmmc_t *host)
         (gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4) << 1));
     ddr_trace_wake(WakePower, CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1),
         PINMUX_AUX(PINMUX_AUX_DMIC3_CLK));
+    ddr_trace_wake(WakePll, CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE), CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC));
 }
 #endif
 #ifdef EMUMMC_DDR200_DLL_DIAG

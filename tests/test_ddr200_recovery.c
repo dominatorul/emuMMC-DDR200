@@ -49,6 +49,8 @@ static unsigned no_ready, hint_scans, switched_to_stock, log_events;
 static bool stop_ok, inconsistent, verify_rejected, verify_guarded_only;
 static bool card_retained_ddr;
 static unsigned rejected_sdr_checks, retained_restorations;
+static bool retained_full_clock_fails, retained_reduced_clock_fails;
+static unsigned retained_clock_changes, retained_failures;
 static char flow[256];
 static unsigned cursor;
 static u32 status_word;
@@ -73,6 +75,11 @@ void Log(const char *data, ...) { (void)data; }
 int sdmmc_setup_ddr200_clock(sdmmc_t *target, bool reduced)
 {
     assert(target == &host);
+    if (card_retained_ddr) {
+        ++retained_clock_changes;
+        if (reduced ? retained_reduced_clock_fails : retained_full_clock_fails)
+            return 0;
+    }
     host.divisor = reduced ? 166400 : 199680;
     regs.hostctl2 = UHS_DDR50_BUS_SPEED;
     return 1;
@@ -285,8 +292,9 @@ void ddr_trace_stage(enum DdrStage stage, u32 data) { (void)stage; (void)data; }
 void ddr_trace_reassert(void) {}
 void ddr_trace_power(enum DdrPowerEvent event, bool ok)
 {
-    assert(event == DdrPowerRetained && ok && card_retained_ddr);
-    ++retained_restorations;
+    assert(event == DdrPowerRetained && card_retained_ddr);
+    retained_restorations += ok;
+    retained_failures += !ok;
 }
 void ddr_trace_card(const u8 *data, bool selected) { (void)data; (void)selected; }
 void ddr_trace_functions(u16 drive, u16 power, u8 chosen_drive, u8 chosen_power)
@@ -375,6 +383,8 @@ static void reset(void)
     reject_type_c = false;
     inconsistent = verify_rejected = verify_guarded_only = card_retained_ddr = false;
     rejected_sdr_checks = retained_restorations = 0;
+    retained_clock_changes = retained_failures = 0;
+    retained_full_clock_fails = retained_reduced_clock_fails = false;
     flow[0] = 0;
 #ifdef EMUMMC_DDR200_MATRIX
     memset(&matrix, 0, sizeof(matrix));
@@ -514,9 +524,24 @@ int main(void)
     card_retained_ddr = true;
     assert(sdmmc_ddr200_handoff(&card));
     assert(rejected_sdr_checks == 2 && retained_restorations == 1 && !switched_to_stock);
-    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 4);
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 2 && retained_clock_changes == 1);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
+
+    reset();
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    card_retained_ddr = retained_full_clock_fails = true;
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateReduced && verifies == 2 && retained_clock_changes == 2);
+    assert(card.ddr.unstable && card.ddr.retry_at > now && retained_restorations == 1);
+
+    reset();
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    card_retained_ddr = retained_reduced_clock_fails = true;
+    card.ddr.resume_rate = DdrRateReduced;
+    assert(!sdmmc_ddr200_handoff(&card));
+    assert(!card.ddr.ready && card.ddr.rate == DdrRateUnknown && !verifies && retained_clock_changes == 1);
+    assert(retained_failures == 1 && host.powersave_enabled && !host.deadline_us);
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     reset();

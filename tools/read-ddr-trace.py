@@ -207,7 +207,8 @@ def print_lifecycle(data, offset):
 
 WAKE_STEPS = ('suspend begin', 'handoff CMD6', 'mapping retired', 'native close',
               'native open', 'wake host registers', 'wake power registers', 'wake reassertion',
-              'descriptor map', 'ordinary command', 'DMA retry', 'wake failure', 'first failure')
+              'descriptor map', 'ordinary command', 'DMA retry', 'wake failure', 'first failure',
+              'wake PLLC4 registers', 'retained DDR link check')
 DLL_REGISTERS = ('venclkctl', 'vencapover', 'veniotrimctl', 'vendllcalcfg', 'vendllcalcfgsts')
 
 
@@ -230,6 +231,11 @@ def print_wake(data, gprs, offset):
         elif step in (9, 10):
             mode = detail & 3
             fields = f'{DMA_MODES[mode]}, detail {detail:#x}, result {result:#010x}'
+        elif step == 13:
+            fields = f'base {detail:#010x}, misc {result:#010x}, locked {bool(detail & (1 << 27))}'
+        elif step == 14:
+            fields = (f'{RATES[detail & 3]}, clock configured {bool(result & 1)}, '
+                      f'CMD13 ready {bool(result & 2)}, verified eye and data {bool(result & 4)}')
         else:
             fields = f'detail {detail:#x}, result {result:#010x}'
         print(f'  {timing & 0x00FFFFFFFFFFFFFF} us {label}, {fields}')

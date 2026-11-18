@@ -487,28 +487,43 @@ static bool probe_native_sdr104(sdmmc_storage_t *storage, u8 status[64])
     return read && (status[16] >> 4) == 0;
 }
 
-static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested, u8 status[64])
+static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
+{
+    sdmmc_t *host = storage->sdmmc;
+    u64 old = begin_budget(host, 500000);
+    /* The software rate predates the host reset. Always program the clock. */
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+    bool clock = sdmmc_setup_ddr200_clock(host, rate == DdrRateReduced);
+    bool ready = clock && sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
+    storage->ddr.rate = rate;
+    bool verified = ready && train(storage, rate, DdrSweepHandoff, true, 0, -1);
+    host->deadline_us = old;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    ddr_trace_wake(WakeRetained, rate, (clock ? 1 : 0) | (ready ? 2 : 0) | (verified ? 4 : 0));
+#endif
+    return verified;
+}
+
+static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested)
 {
     ddr_policy_t *policy = &storage->ddr;
-    sdmmc_t *host = storage->sdmmc;
-    /* Horizon may have restored only the controller. Try the measured
-       reduced DDR clock without changing the card's command system. */
+    /* Horizon may have restored only the controller. Restore the running
+       card's last rate before trying the existing reduced-rate recovery. */
+    bool ok = train_retained_ddr(storage, requested);
+    if (!ok && requested == DdrRateFull) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (requested == DdrRateFull)
         ddr_trace_clock_drop(requested, DdrRateReduced, DdrDropWakeCheck, 0, (ddr_eye_t){DdrTapCount, 0});
 #endif
-    policy->rate = DdrRateReduced;
-    if (!sdmmc_setup_ddr200_clock(host, true) ||
-        !sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000) ||
-        !train(storage, DdrRateReduced, DdrSweepHandoff, true, 0, -1)) {
-        policy->rate = DdrRateUnknown;
-        ddr_trace_power(DdrPowerRetained, false);
-        return false;
+        ok = train_retained_ddr(storage, DdrRateReduced);
+        if (ok) {
+            policy->unstable = true;
+            policy->retry_at = get_tmr_us() + ddr_retry_delay(policy->upgrades);
+        }
     }
-    ddr_trace_power(DdrPowerRetained, true);
-    if (requested == DdrRateFull && !train(storage, requested, DdrSweepHandoff, true, 0, -1))
-        return fallback(storage, requested, 0, status);
-    return true;
+    if (!ok)
+        policy->rate = DdrRateUnknown;
+    ddr_trace_power(DdrPowerRetained, ok);
+    return ok;
 }
 
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
@@ -561,7 +576,7 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
              sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
         storage->csd.busspeed = 104;
     } else if (want_ddr) {
-        ok = restore_retained_ddr(storage, requested, status);
+        ok = restore_retained_ddr(storage, requested);
     }
     if (!ok && standard && policy->rate == DdrRateSdr104)
         ok = set_sdr104(storage, status);
