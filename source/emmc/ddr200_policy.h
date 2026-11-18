@@ -36,6 +36,7 @@ typedef struct {
     bool narrow;
     bool unstable;
     bool matrix_active;
+    bool counted_reads_failed;
     u8 upgrades;
     u8 drive;
     u16 drive_support;

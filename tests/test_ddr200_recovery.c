@@ -14,6 +14,11 @@ static ddr_eye_t full_eye, reduced_eye;
 static u64 now;
 static unsigned fail_reads, commands, verifies, failed_verifies, stops, resets;
 static bool reject_type_c;
+#ifdef EMUMMC_DDR200_COUNTED_READS
+static enum SdmmcAutoCommand last_auto_command;
+static unsigned counted_reads;
+static bool counted_reads_disabled;
+#endif
 static unsigned no_ready, hint_scans, switched_to_stock, log_events;
 static bool stop_ok, inconsistent, verify_rejected;
 static bool card_retained_ddr;
@@ -143,6 +148,9 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
         return 1;
     }
     assert(req->blksize == 512);
+#ifdef EMUMMC_DDR200_COUNTED_READS
+    last_auto_command = req->auto_command;
+#endif
     ++commands;
     unsigned tap = regs.venclkctl >> 16;
     if (req->num_sectors == DdrVerifyBlocks) {
@@ -202,6 +210,14 @@ void ddr_trace_io_error(const sdmmc_t *target, u32 opcode, u32 count)
 }
 void ddr_trace_hygiene(bool stopped, bool ready, bool reset) { assert(reset == ready && (!ready || stopped)); }
 void ddr_trace_read_recovery(const sdmmc_t *target, bool ok) { assert(target == &host); (void)ok; }
+#ifdef EMUMMC_DDR200_COUNTED_READS
+void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool completed)
+{
+    assert(!completed || (supported && version >= 2 && !disabled));
+    counted_reads += completed;
+    counted_reads_disabled = disabled;
+}
+#endif
 void ddr_trace_stage(enum DdrStage stage, u32 data) { (void)stage; (void)data; }
 void ddr_trace_reassert(void) {}
 void ddr_trace_power(enum DdrPowerEvent event, bool ok)
@@ -334,6 +350,24 @@ int main(void)
     test_eye_model();
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
+#ifdef EMUMMC_DDR200_COUNTED_READS
+    reset();
+    u32 transferred;
+    regs.hcver = 2;
+    regs.hostctl2 |= SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN;
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
+    assert(last_auto_command == SdmmcAutoStop);
+    card.scr.cmds = SD_SCR_CMD23_SUPPORT;
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 1));
+    assert(last_auto_command == SdmmcAutoStop);
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
+    assert(last_auto_command == SdmmcAutoBlockCount && counted_reads == 1);
+    fail_reads = 1;
+    assert(!sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
+    assert(stops == 1 && resets == 1 && counted_reads_disabled && card.ddr.counted_reads_failed);
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
+    assert(last_auto_command == SdmmcAutoStop && counted_reads == 1);
+#endif
     reset();
     host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
     assert(!sdmmc_ddr200_initial(&card, functions) && !verifies);

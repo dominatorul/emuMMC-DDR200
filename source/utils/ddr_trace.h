@@ -22,6 +22,9 @@ void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded);
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
                        u32 blocks, u64 elapsed_us, u64 dma_us);
 void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed_us);
+#ifdef EMUMMC_DDR200_COUNTED_READS
+void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool completed);
+#endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
 void ddr_trace_read_ahead_map(Result result);
 void ddr_trace_read_ahead(u32 blocks);

@@ -33,6 +33,9 @@ static _Atomic u32 verify_attempts, verify_passed, verify_pair;
 static _Atomic u32 recovery_attempts, recovery_passed;
 static _Atomic u32 hygiene_attempts, hygiene_passed, hygiene_last;
 static _Atomic u32 function_status;
+#ifdef EMUMMC_DDR200_COUNTED_READS
+static _Atomic u32 counted_reads, counted_read_flags;
+#endif
 static _Atomic u64 checkpoint, functions, ladder, bytes_since_reassert;
 static _Atomic u64 first_failure[2], last_failure[2];
 static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
@@ -218,6 +221,15 @@ void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed)
 #endif
 }
 
+#ifdef EMUMMC_DDR200_COUNTED_READS
+void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool completed)
+{
+    counted_read_flags = (version & 0x3f) | ((u32)supported << 6) | ((u32)disabled << 7);
+    if (completed)
+        ++counted_reads;
+}
+#endif
+
 #ifdef EMUMMC_DDR200_READ_AHEAD
 void ddr_trace_read_ahead_map(Result result)
 {
@@ -264,7 +276,9 @@ void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-#if defined(EMUMMC_DDR200_READ_AHEAD)
+#if defined(EMUMMC_DDR200_COUNTED_READS)
+    ctx->gprs[0] = 0x4444523230300015ull;
+#elif defined(EMUMMC_DDR200_READ_AHEAD)
     ctx->gprs[0] = 0x4444523230300014ull;
 #elif defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     ctx->gprs[0] = 0x4444523230300012ull;
@@ -300,6 +314,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[29] = clock_registers;
     ctx->gprs[30] = ladder | ((u64)function_status << 32);
     ctx->gprs[31] = matrix_status;
+#ifdef EMUMMC_DDR200_COUNTED_READS
+    ctx->gprs[5] |= (u64)MIN(counted_reads, 0xffffu) << 48;
+    ctx->gprs[30] |= (u64)counted_read_flags << 24;
+#endif
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     ctx->gprs[2] = ((u64)large_read_commands << 32) | large_read_restarts;
     ctx->gprs[30] |= (u64)MIN(write_errors, 0xffffu) << 48;

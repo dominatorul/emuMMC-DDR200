@@ -116,7 +116,7 @@ def print_policy_trace(data, gprs):
           f'last sampled data/scan clock {(gprs[28] >> 32) / 1000:.2f} MHz, '
           f'HC2/clock {gprs[28] & 0xFFFFFFFF:08X}, CAR source {gprs[29] >> 32:08X}, '
           f'vendor clock {gprs[29] & 0xFFFFFFFF:08X}')
-    print(f'CMD6 group 3 supported {gprs[5] >> 32:#06x}, selected {(gprs[5] >> 16) & 0xFF}, '
+    print(f'CMD6 group 3 supported {(gprs[5] >> 32) & 0xFFFF:#06x}, selected {(gprs[5] >> 16) & 0xFF}, '
           f'group 4 supported {gprs[5] & 0xFFFF:#06x}, selected {(gprs[5] >> 24) & 0xFF}')
     errors = gprs[6] >> 32
     print(f'Data command failures {errors}')
@@ -179,6 +179,10 @@ def print_policy_trace(data, gprs):
                   f'last result {result:#010x}')
         if perf_version >= 20:
             print(f'Read-ahead fills {(gprs[4] >> 32) & 0xFFFF} completed, {gprs[4] >> 48} failed')
+        if perf_version >= 21:
+            flags = (state >> 24) & 0xFF
+            print(f'Auto CMD23 completed {gprs[5] >> 48} reads, host version field {flags & 0x3F}, '
+                  f'card support {bool(flags & 0x40)}, disabled after failure {bool(flags & 0x80)}')
     runtime_capacity = 48 - matrix_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -222,7 +226,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 20:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 21:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

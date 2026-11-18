@@ -261,6 +261,8 @@ typedef struct _sdmmc_cmd_t
 	u32 check_busy;
 } sdmmc_cmd_t;
 
+enum SdmmcAutoCommand { SdmmcAutoNone, SdmmcAutoStop, SdmmcAutoBlockCount };
+
 /*! SDMMC request. */
 typedef struct _sdmmc_req_t
 {
@@ -269,7 +271,7 @@ typedef struct _sdmmc_req_t
 	u32 num_sectors;
 	int is_write;
 	int is_multi_block;
-	int is_auto_cmd12;
+	enum SdmmcAutoCommand auto_command;
 } sdmmc_req_t;
 
 int  sdmmc_get_io_power(sdmmc_t *sdmmc);

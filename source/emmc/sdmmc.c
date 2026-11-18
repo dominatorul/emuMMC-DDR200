@@ -278,9 +278,30 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 		sector, SDMMC_RSP_TYPE_1, 0);
 	sdmmc_req_t req = {
 		.buf = buf, .num_sectors = num_sectors, .blksize = 512,
-		.is_write = is_write, .is_multi_block = 1, .is_auto_cmd12 = 1,
+		.is_write = is_write, .is_multi_block = 1, .auto_command = SdmmcAutoStop,
 	};
-	if (sdmmc_execute_cmd(host, &cmd, &req, blkcnt_out))
+#ifdef EMUMMC_DDR200_COUNTED_READS
+	bool test_counted = host->id == SDMMC_1 && !is_write && num_sectors >= DdrVerifyBlocks &&
+		host->divisor == 199680 && storage->ddr.rate == DdrRateFull &&
+		storage->ddr.ready && !host->deadline_us;
+	u16 control = host->regs->hostctl2;
+	u16 mode = SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN;
+	u8 version = host->regs->hcver & 0xff;
+	bool supported = (storage->scr.cmds & SD_SCR_CMD23_SUPPORT) != 0;
+	if (test_counted && supported && version >= 2 && (control & mode) == mode &&
+	    !storage->ddr.counted_reads_failed)
+		req.auto_command = SdmmcAutoBlockCount;
+#endif
+	bool ok = sdmmc_execute_cmd(host, &cmd, &req, blkcnt_out);
+#ifdef EMUMMC_DDR200_COUNTED_READS
+	if (test_counted) {
+		if (req.auto_command == SdmmcAutoBlockCount && !ok)
+			storage->ddr.counted_reads_failed = true;
+		ddr_trace_counted_read(version, supported, storage->ddr.counted_reads_failed,
+			ok && req.auto_command == SdmmcAutoBlockCount);
+	}
+#endif
+	if (ok)
 		return 1;
 
 	u32 failure = host->command_failure;
@@ -600,7 +621,7 @@ static int _mmc_storage_get_ext_csd(sdmmc_storage_t *storage, void *buf)
 	reqbuf.num_sectors = 1;
 	reqbuf.is_write = 0;
 	reqbuf.is_multi_block = 0;
-	reqbuf.is_auto_cmd12 = 0;
+	reqbuf.auto_command = SdmmcAutoNone;
 
 	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, 0))
 		return 0;
@@ -990,7 +1011,7 @@ int _sd_storage_get_scr(sdmmc_storage_t *storage, u8 *buf)
 	reqbuf.num_sectors = 1;
 	reqbuf.is_write = 0;
 	reqbuf.is_multi_block = 0;
-	reqbuf.is_auto_cmd12 = 0;
+	reqbuf.auto_command = SdmmcAutoNone;
 
 	if (!_sd_storage_execute_app_cmd(storage, R1_STATE_TRAN, 0, &cmdbuf, &reqbuf, 0))
 		return 0;
@@ -1447,7 +1468,7 @@ int _gc_storage_custom_cmd(sdmmc_storage_t *storage, void *buf)
 	reqbuf.num_sectors = 1;
 	reqbuf.is_write = 1;
 	reqbuf.is_multi_block = 0;
-	reqbuf.is_auto_cmd12 = 0;
+	reqbuf.auto_command = SdmmcAutoNone;
 
 	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, 0))
 	{

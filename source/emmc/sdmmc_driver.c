@@ -620,6 +620,10 @@ static int _sdmmc_send_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, bool is_data_presen
 		cmdflags |= SDHCI_CMD_ABORTCMD;
 	if (is_data_present)
 		cmdflags |= SDHCI_CMD_DATA;
+#ifdef EMUMMC_DDR200_COUNTED_READS
+	else
+		sdmmc->regs->trnmod &= ~(SDHCI_TRNS_AUTO_CMD12 | SDHCI_TRNS_AUTO_CMD23);
+#endif
 	sdmmc->regs->argument = cmd->arg;
 	sdmmc->regs->cmdreg = (cmd->cmd << 8) | cmdflags;
 
@@ -1178,8 +1182,14 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 		trnmode = SDHCI_TRNS_MULTI | SDHCI_TRNS_BLK_CNT_EN | SDHCI_TRNS_DMA;
 	if (!req->is_write)
 		trnmode |= SDHCI_TRNS_READ;
-	if (req->is_auto_cmd12)
-		trnmode = (trnmode & ~(SDHCI_TRNS_AUTO_CMD12 | SDHCI_TRNS_AUTO_CMD23)) | SDHCI_TRNS_AUTO_CMD12;
+	if (req->auto_command == SdmmcAutoStop)
+		trnmode |= SDHCI_TRNS_AUTO_CMD12;
+	else if (req->auto_command == SdmmcAutoBlockCount) {
+		/* In v4 mode SDMA uses admaaddr. sysad is the Auto CMD23
+		   argument, which must match the size after DMA window limits. */
+		sdmmc->regs->sysad = blkcnt;
+		trnmode |= SDHCI_TRNS_AUTO_CMD23;
+	}
 
 	sdmmc->regs->trnmod = trnmode;
 
@@ -1320,7 +1330,7 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 			if (blkcnt_out)
 				*blkcnt_out = blkcnt;
 
-			if (req->is_auto_cmd12)
+			if (req->auto_command == SdmmcAutoStop)
 				sdmmc->rsp3 = sdmmc->regs->rspreg3;
 		}
 
