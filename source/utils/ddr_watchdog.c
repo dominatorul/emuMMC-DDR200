@@ -128,7 +128,7 @@ static void watchdog_entry(void *unused)
 #ifdef EMUMMC_DDR200_MATRIX
     u64 down_at = 0;
 #endif
-    bool released = false;
+    bool released = false, snapshot_pending = false;
     const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
     for (;;) {
         svcSleepThread(POLL_NS);
@@ -136,6 +136,7 @@ static void watchdog_entry(void *unused)
         if (now - last_poll >= SUSPEND_GAP_US) {
             ignore_suspend_gap(last_poll, now);
             pressed_at = 0;
+            snapshot_pending = false;
 #ifdef EMUMMC_DDR200_MATRIX
             down_at = 0;
 #endif
@@ -159,15 +160,18 @@ static void watchdog_entry(void *unused)
             down_at = 0;
         }
 #endif
-        if (volume) {
-            if (volume == VOLUME_PINS)
-                released = true;
+        if (volume == VOLUME_PINS) {
+            if (snapshot_pending)
+                fatal_abort(Fatal_DdrSnapshot);
+            released = true;
+            pressed_at = 0;
+        } else if (volume) {
             pressed_at = 0;
         } else if (released) {
             if (!pressed_at)
                 pressed_at = now;
             if (now - pressed_at >= BUTTON_HOLD_US)
-                fatal_abort(Fatal_DdrSnapshot);
+                snapshot_pending = true;
         }
     }
 }
