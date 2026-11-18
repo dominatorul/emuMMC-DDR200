@@ -10,9 +10,14 @@
 enum {
     ReadAheadBytes = 2 * 1024 * 1024,
     ReadAheadBlocks = ReadAheadBytes / 512,
-    ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadRunIn = 512 * 1024 / 512,
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    ReadAheadRequest = 64 * 1024 / 512,
+    ReferenceSlices = ReadAheadBlocks / DdrVerifyBlocks,
+#else
+    ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadMinEye = 9,
+#endif
     DeviceAlignment = 4 * 1024 * 1024,
 };
 
@@ -39,10 +44,8 @@ static struct {
     bool fill_failed;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     bool adma_verified;
-    bool compared;
-    bool compared_at_eight;
-    ddr_eye_t verified_eight;
-    u8 verified_tap;
+    u8 verified_tap[2];
+    u8 verified_upgrade;
 #endif
 } read_ahead;
 
@@ -124,7 +127,6 @@ void sdmmc_read_ahead_reset(void)
     read_ahead.sequential_blocks = 0;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     read_ahead.adma_verified = false;
-    read_ahead.verified_eight = (ddr_eye_t){0};
 #endif
     if (!read_ahead.dma)
         return;
@@ -139,6 +141,16 @@ void sdmmc_read_ahead_reset(void)
 static unsigned active_tap(const sdmmc_t *host)
 {
     return (host->regs->venclkctl >> 16) & 0xff;
+}
+
+static unsigned adma_guard(ddr_eye_t eye)
+{
+    return ddr_eye_width(eye) >= 2 * DdrTapMargin + 2 ? DdrTapMargin : DdrNarrowMargin;
+}
+
+static bool guarded_tap(ddr_eye_t eye, unsigned tap, unsigned guard)
+{
+    return tap >= eye.left + guard && tap + guard <= eye.right;
 }
 
 static bool transfer(sdmmc_storage_t *storage, enum SdmmcDmaMode mode, u32 sector,
@@ -166,112 +178,95 @@ static bool data_command_failed(const sdmmc_t *host)
         (errors ? (errors & ~SDHCI_ERR_INT_ADMA_ERROR) != 0 : !(host->command_irq & SDHCI_INT_DMA_END));
 }
 
-static bool read_reference(sdmmc_storage_t *storage, u32 sector, ddr_eye_t eye, bool compare)
+static bool read_reference(sdmmc_storage_t *storage, u32 sector, ddr_eye_t eye,
+    u64 hashes[ReferenceSlices], u8 *poison)
 {
-    enum { BoundaryBlocks = 512 * 1024 / 512 };
-    u32 done = 0, resumes = 0;
+    enum { BoundaryBytes = 512 * 1024, SliceBytes = DdrVerifyBlocks * 512 };
+    _Static_assert(SliceBytes < BoundaryBytes, "SDMA reference must end before its boundary");
+    u8 *slice = read_window.data + (-read_ahead.dma & (BoundaryBytes - 1));
+    unsigned i = 0, resumes = 0;
     u64 total_us = 0;
-    while (done < ReadAheadBlocks) {
-        /* Every reference command ends at or before its next SDMA boundary. */
-        u32 before_boundary = BoundaryBlocks - (read_ahead.dma / 512 + done) % BoundaryBlocks;
-        u32 count = MIN(ReadAheadBlocks - done, before_boundary);
+    for (; i < ReferenceSlices; ++i) {
+        /* Reuse one aligned 256 KiB slice so even the end of a reference
+           command cannot raise a 512 KiB boundary interrupt. */
         u64 elapsed;
-        bool ok = transfer(storage, SdmmcDmaSdma512, sector + done, count,
-            read_window.data + done * 512u, &elapsed);
+        bool ok = transfer(storage, SdmmcDmaSdma512, sector + i * DdrVerifyBlocks,
+            DdrVerifyBlocks, slice, &elapsed);
         total_us += elapsed;
         resumes += storage->sdmmc->dma_resumes;
-        if (!ok)
+        if (!ok || storage->sdmmc->dma_resumes)
             break;
-        done += count;
+        hashes[i] = ddr_data_checksum(slice, SliceBytes);
+        if (!i)
+            *poison = (u8)~slice[0];
     }
-    bool ok = done == ReadAheadBlocks;
-    if (compare)
-        ddr_trace_dma_sample(DdrDmaReference, storage->sdmmc, eye, total_us,
-            ReadAheadBlocks, resumes, ok ? DdrDmaOk : DdrDmaFailed);
+    bool ok = i == ReferenceSlices;
+    ddr_trace_dma_sample(DdrDmaReference, storage->sdmmc, eye, total_us,
+        ReadAheadBlocks, resumes, ok ? DdrDmaOk : DdrDmaFailed);
     return ok;
 }
 
-static enum DdrDmaResult compare_read(sdmmc_storage_t *storage, enum SdmmcDmaMode mode,
-    u32 sector, ddr_eye_t eye, u64 reference, u8 poison, bool log, enum DdrDmaSample sample)
+static enum DdrDmaResult compare_read(sdmmc_storage_t *storage, u32 sector, ddr_eye_t eye,
+    const u64 hashes[ReferenceSlices], u8 poison, enum DdrDmaSample sample)
 {
     /* A transfer that leaves the previous bytes in memory must fail validation. */
     memset(read_window.data, poison, ReadAheadBytes);
     u64 elapsed;
     enum DdrDmaResult result = DdrDmaFailed;
-    if (transfer(storage, mode, sector, ReadAheadBlocks, read_window.data, &elapsed))
-        result = ddr_data_checksum(read_window.data, ReadAheadBytes) == reference ? DdrDmaOk : DdrDmaMismatch;
-    if (log)
-        ddr_trace_dma_sample(sample, storage->sdmmc, eye, elapsed,
-            ReadAheadBlocks, storage->sdmmc->dma_resumes, result);
+    if (transfer(storage, SdmmcDmaAdma2, sector, ReadAheadBlocks, read_window.data, &elapsed)) {
+        enum { SliceBytes = DdrVerifyBlocks * 512 };
+        result = DdrDmaOk;
+        for (unsigned i = 0; i < ReferenceSlices; ++i) {
+            if (ddr_data_checksum(read_window.data + i * SliceBytes, SliceBytes) != hashes[i]) {
+                result = DdrDmaMismatch;
+                break;
+            }
+        }
+    }
+    ddr_trace_dma_sample(sample, storage->sdmmc, eye, elapsed,
+        ReadAheadBlocks, storage->sdmmc->dma_resumes, result);
     return result;
 }
 
-static bool qualify_adma(sdmmc_storage_t *storage, u32 sector, ddr_eye_t eye, unsigned tap, bool eight)
+static bool qualify_adma(sdmmc_storage_t *storage, u32 sector, ddr_eye_t eye, unsigned tap, unsigned alternate)
 {
     sdmmc_t *host = storage->sdmmc;
-    bool compare = !read_ahead.compared || (eight && !read_ahead.compared_at_eight);
-    if (compare) {
-        ddr_trace_dma_begin();
-        read_ahead.compared = true;
-        read_ahead.compared_at_eight |= eight;
-    }
-
-    if (!read_reference(storage, sector, eye, compare)) {
+    u64 hashes[ReferenceSlices];
+    u8 poison = 0;
+    ddr_trace_dma_begin();
+    if (!read_reference(storage, sector, eye, hashes, &poison)) {
         if (data_command_failed(host))
             sdmmc_ddr200_recover(storage, sector, false);
         return false;
     }
-    u64 reference = ddr_data_checksum(read_window.data, ReadAheadBytes);
-    u8 poison = (u8)~read_window.data[0];
-    enum DdrDmaResult result = compare_read(storage, SdmmcDmaAdma2, sector, eye,
-        reference, poison, compare, DdrDmaBaseline);
+    enum DdrDmaResult result = compare_read(storage, sector, eye, hashes, poison, DdrDmaBaseline);
     if (result != DdrDmaOk) {
         if (result == DdrDmaFailed && data_command_failed(host))
             sdmmc_ddr200_recover(storage, sector, false);
         return false;
     }
 
-    bool failed_tap = false;
-    if (compare) {
-        result = compare_read(storage, SdmmcDmaSdma512, sector, eye,
-            reference, poison, true, DdrDmaSdma512);
-        if (result == DdrDmaOk)
-            result = compare_read(storage, SdmmcDmaSdma256, sector, eye,
-                reference, poison, true, DdrDmaSdma256);
-        if (result == DdrDmaMismatch || !storage->ddr.ready)
-            return false;
-        failed_tap = result == DdrDmaFailed;
-    }
-
-    unsigned alternate = tap < eye.right - DdrTapMargin ? tap + 1 : tap - 1;
     sdmmc_set_ddr200_tap(host, alternate);
     if (active_tap(host) != alternate) {
         sdmmc_set_ddr200_tap(host, tap);
-        if (failed_tap)
-            sdmmc_ddr200_recover(storage, sector, false);
         return false;
     }
-    result = compare_read(storage, SdmmcDmaAdma2, sector, eye,
-        reference, poison, compare, DdrDmaAlternate);
+    result = compare_read(storage, sector, eye, hashes, poison, DdrDmaAlternate);
     if (result != DdrDmaOk) {
-        if (failed_tap || (result == DdrDmaFailed && data_command_failed(host)))
-            sdmmc_ddr200_recover(storage, sector, failed_tap);
+        if (result == DdrDmaFailed && data_command_failed(host))
+            sdmmc_ddr200_recover(storage, sector, false);
         else
             sdmmc_set_ddr200_tap(host, tap);
         return false;
     }
 
-    /* A control failure rules out its tap for the current link setup. */
-    if (!failed_tap)
-        sdmmc_set_ddr200_tap(host, tap);
-    unsigned selected = failed_tap ? alternate : tap;
-    if (active_tap(host) != selected)
+    sdmmc_set_ddr200_tap(host, tap);
+    if (active_tap(host) != tap)
         return false;
     read_ahead.adma_verified = true;
-    if (eight) {
-        read_ahead.verified_eight = eye;
-        read_ahead.verified_tap = selected;
-    }
+    read_ahead.verified_tap[0] = tap;
+    read_ahead.verified_tap[1] = alternate;
+    read_ahead.verified_upgrade = storage->ddr.upgrades;
     return true;
 }
 
@@ -279,12 +274,13 @@ static bool fill_adma(sdmmc_storage_t *storage, u32 sector)
 {
     ddr_eye_t eye = storage->ddr.history[0].eyes[0];
     unsigned tap = active_tap(storage->sdmmc);
-    bool eight = ddr_eye_width(eye) == 2 * DdrTapMargin + 2;
-    if (!eight)
-        read_ahead.verified_eight = (ddr_eye_t){0};
-    if (!read_ahead.adma_verified || (eight && (read_ahead.verified_eight.left != eye.left ||
-        read_ahead.verified_eight.right != eye.right || read_ahead.verified_tap != tap)))
-        return qualify_adma(storage, sector, eye, tap, eight);
+    unsigned guard = adma_guard(eye);
+    unsigned a = read_ahead.verified_tap[0], b = read_ahead.verified_tap[1];
+    if (!read_ahead.adma_verified || read_ahead.verified_upgrade != storage->ddr.upgrades ||
+        (tap != a && tap != b) || !guarded_tap(eye, a, guard) || !guarded_tap(eye, b, guard)) {
+        unsigned alternate = guarded_tap(eye, tap + 1, guard) ? tap + 1 : tap - 1;
+        return qualify_adma(storage, sector, eye, tap, alternate);
+    }
 
     u64 elapsed;
     if (transfer(storage, SdmmcDmaAdma2, sector, ReadAheadBlocks, read_window.data, &elapsed))
@@ -303,25 +299,18 @@ static bool read_ahead_eye_ready(const sdmmc_storage_t *storage)
         return false;
     ddr_eye_t eye = history->eyes[0];
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (sdmmc_adma2_supported(host)) {
-        unsigned tap = active_tap(host);
-        return ddr_eye_width(eye) >= 2 * DdrTapMargin + 2 &&
-            tap >= eye.left + DdrTapMargin && tap <= eye.right - DdrTapMargin;
-    }
-#endif
+    unsigned guard = adma_guard(eye);
+    return sdmmc_adma2_supported(host) && ddr_eye_width(eye) >= 2 * guard + 2 &&
+        guarded_tap(eye, active_tap(host), guard);
+#else
     return ddr_eye_width(eye) >= ReadAheadMinEye;
+#endif
 }
 
+#ifndef EMUMMC_DDR200_ADMA_PROBE
 static bool fill_sdma(sdmmc_storage_t *storage, u32 sector)
 {
     sdmmc_t *host = storage->sdmmc;
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-    u64 elapsed;
-    bool ok = transfer(storage, SdmmcDmaSdma512, sector, ReadAheadBlocks, read_window.data, &elapsed);
-    if (!ok && data_command_failed(host))
-        sdmmc_ddr200_recover(storage, sector, false);
-    return ok;
-#else
     u32 done = 0;
     u64 start = get_tmr_us();
     u64 previous_deadline = host->deadline_us;
@@ -336,8 +325,8 @@ static bool fill_sdma(sdmmc_storage_t *storage, u32 sector)
         return false;
     sdmmc_ddr200_count_io(storage, done, get_tmr_us() - start);
     return true;
-#endif
 }
+#endif
 
 bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out)
 {
@@ -371,7 +360,7 @@ bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bloc
             return false;
         read_ahead.blocks = 0;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-        bool ok = sdmmc_adma2_supported(host) ? fill_adma(storage, sector) : fill_sdma(storage, sector);
+        bool ok = fill_adma(storage, sector);
 #else
         bool ok = fill_sdma(storage, sector);
 #endif

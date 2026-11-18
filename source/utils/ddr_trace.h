@@ -37,8 +37,9 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);
 #include "../emmc/ddr200_policy.h"
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-enum DdrDmaSample { DdrDmaReference, DdrDmaBaseline, DdrDmaSdma512, DdrDmaSdma256,
-    DdrDmaAlternate, DdrDmaLastError, DdrDmaTotals, DdrDmaHost, DdrDmaSamples };
+/* Slots 2 and 3 held bulk SDMA controls in report version 22. */
+enum DdrDmaSample { DdrDmaReference, DdrDmaBaseline, DdrDmaAlternate = 4,
+    DdrDmaLastError, DdrDmaTotals, DdrDmaHost, DdrDmaSamples };
 enum DdrDmaResult { DdrDmaOk = 1, DdrDmaFailed, DdrDmaMismatch };
 
 void ddr_trace_dma_begin(void);

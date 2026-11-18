@@ -323,7 +323,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_ADMA_PROBE)
-    ctx->gprs[0] = 0x4444523230300016ull;
+    ctx->gprs[0] = 0x4444523230300017ull;
 #elif defined(EMUMMC_DDR200_COUNTED_READS)
     ctx->gprs[0] = 0x4444523230300015ull;
 #elif defined(EMUMMC_DDR200_READ_AHEAD)

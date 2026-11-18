@@ -32,7 +32,7 @@ static bool stale_data, stop_failure;
 
 u64 get_tmr_us(void) { return ++time_us; }
 bool sdmmc_get_sd_inserted(void) { return true; }
-void ddr_trace_read_ahead(unsigned blocks) { assert(blocks == sizeof(output) / 512); }
+void ddr_trace_read_ahead(unsigned blocks) { assert(blocks >= ReadAheadRequest && blocks <= sizeof(output) / 512); }
 void ddr_trace_read_ahead_map(Result result) { assert(!result); }
 void ddr_trace_read_ahead_fill(bool succeeded) { ++filled[succeeded]; }
 void ddr_trace_dma_begin(void)
@@ -43,7 +43,7 @@ void ddr_trace_dma_begin(void)
 void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *target, ddr_eye_t eye,
     u64 elapsed, u32 blocks, u32 resumes, enum DdrDmaResult result)
 {
-    assert(target == &host && ddr_eye_width(eye) >= 8 && elapsed && blocks == ReadAheadBlocks);
+    assert(target == &host && ddr_eye_width(eye) >= 6 && elapsed && blocks == ReadAheadBlocks);
     assert(sample != DdrDmaReference || resumes == 0);
     samples[sample] = result;
     sample_taps[sample] = active_tap(target);
@@ -111,15 +111,13 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 
         regs.hostctl &= ~SDHCI_CTRL_DMA_MASK;
     } else {
         assert((regs.hostctl & SDHCI_CTRL_DMA_MASK) == SDHCI_CTRL_SDMA);
-        u32 boundary = mode == SdmmcDmaSdma256 ? 256 * 1024 : 512 * 1024;
-        assert(regs.admaaddr == dma && !regs.admaaddr_hi && host.dma_boundary_bytes == boundary);
-        assert(regs.blksize == (512 | ((boundary == 512 * 1024 ? 7 : 6) << 12)));
-        assert(host.dma_addr_next == ((dma + boundary) & ~((u64)boundary - 1)));
-        host.dma_resumes = ((dma & (boundary - 1)) + 512 * blocks - 1) / boundary;
-        if (blocks < ReadAheadBlocks)
-            assert(!host.dma_resumes);
+        const u32 boundary = 512 * 1024;
+        assert(mode == SdmmcDmaSdma512 && blocks == DdrVerifyBlocks);
+        assert(regs.admaaddr == dma && !regs.admaaddr_hi && !(dma & (boundary - 1)));
+        assert(regs.blksize == (512 | (7 << 12)) && host.dma_addr_next == dma + boundary);
+        assert(!host.dma_boundaries_left);
     }
-    if (mode == fault_mode && tap == fault_tap && blocks == ReadAheadBlocks) {
+    if (mode == fault_mode && tap == fault_tap) {
         if (stale_data)
             return 1;
         host.command_failure = DdrCommandTransfer;
@@ -149,6 +147,8 @@ bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
     assert(storage == &card && sector < card.sec_cnt && !degrade);
     assert(host.read_ahead_dma == SdmmcDmaDefault && fault_irq != SDHCI_ERR_INT_ADMA_ERROR);
     assert(active_tap(&host) == fault_tap);
+    if (!storage->ddr.ready)
+        return false;
     ++recoveries;
     return true;
 }
@@ -182,22 +182,24 @@ int main(void)
     assert(!read_next(1, 0));
     assert(read_next(1, 1024) && compares == 1 && filled[true] == 1 && !recoveries);
     assert(output[0] == 8 && output[128 * 512] == 9);
-    for (unsigned i = DdrDmaReference; i <= DdrDmaAlternate; ++i)
-        assert(samples[i] == DdrDmaOk && sample_taps[i] == (i == DdrDmaAlternate ? 33 : 32));
+    assert(samples[DdrDmaReference] == DdrDmaOk && sample_taps[DdrDmaReference] == 32);
+    assert(samples[DdrDmaBaseline] == DdrDmaOk && sample_taps[DdrDmaBaseline] == 32);
+    assert(samples[DdrDmaAlternate] == DdrDmaOk && sample_taps[DdrDmaAlternate] == 33);
     assert(active_tap(&host) == 32 && host.read_ahead_dma == SdmmcDmaDefault);
     assert(!sdmmc_read_ahead_dma(read_window.data + ReadAheadBytes, 1));
     assert(!sdmmc_read_ahead_dma(read_window.data + ReadAheadBytes - 512, 2));
     assert(!sdmmc_read_ahead_adma_table(read_ahead.dma + ReadAheadBytes, 512));
     assert(!sdmmc_read_ahead_adma_table(read_ahead.dma, ReadAheadBytes + 512));
     unsigned qualified = command_count;
+    assert(qualified == ReferenceSlices + 2);
     assert(read_next(1, 2048) && read_next(1, 3072) && read_next(1, 4096) && command_count == qualified);
     assert(read_next(1, 5120) && command_count == qualified + 1 && commands[qualified].mode == SdmmcDmaAdma2);
     sdmmc_read_ahead_reset();
     assert(unmaps == 1 && !read_ahead.adma_verified && !read_ahead.dma);
     assert(!read_next(2, 0) && read_next(2, 1024));
-    assert(compares == 1 && maps == 2 && read_ahead.adma_verified);
+    assert(compares == 2 && maps == 2 && read_ahead.adma_verified);
 
-    reset((ddr_eye_t){30, 36}, 33);
+    reset((ddr_eye_t){32, 36}, 34);
     assert(!read_next(1, 0) && !read_next(1, 1024) && !maps && !command_count && card.ddr.ready);
     reset(eight, 31);
     assert(!read_next(1, 0) && !read_next(1, 1024) && !maps && !command_count);
@@ -208,17 +210,9 @@ int main(void)
     reset(eight, 32);
     fault_mode = SdmmcDmaSdma512;
     fault_tap = 32;
-    assert(!read_next(1, 0) && read_next(1, 1024));
-    assert(samples[DdrDmaBaseline] == DdrDmaOk && samples[DdrDmaSdma512] == DdrDmaFailed);
-    assert(!samples[DdrDmaSdma256] && samples[DdrDmaAlternate] == DdrDmaOk && !recoveries);
-    assert(active_tap(&host) == 33 && host.read_ahead_dma == SdmmcDmaDefault);
-
-    reset(eight, 32);
-    fault_mode = SdmmcDmaSdma512;
-    fault_tap = 32;
     stop_failure = true;
     assert(!read_next(1, 0) && !read_next(1, 1024) && !card.ddr.ready && !read_ahead.blocks);
-    assert(!samples[DdrDmaAlternate] && !recoveries);
+    assert(samples[DdrDmaReference] == DdrDmaFailed && !samples[DdrDmaAlternate] && !recoveries);
 
     reset(eight, 32);
     fault_mode = SdmmcDmaAdma2;
@@ -243,10 +237,32 @@ int main(void)
     assert(samples[DdrDmaAlternate] == DdrDmaMismatch && active_tap(&host) == 32);
     assert(output[0] == 0x7f && !read_ahead.blocks && read_ahead.fill_failed);
 
-    reset((ddr_eye_t){29, 43}, 32);
+    reset(eight, 32);
     assert(!read_next(1, 0) && read_next(1, 1024));
-    ddr_remember_eye(&card.ddr.history[0], eight);
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){31, 36});
+    sdmmc_set_ddr200_tap(&host, 33);
     assert(read_next(1, 2048) && read_next(1, 3072) && read_next(1, 4096) && read_next(1, 5120));
-    assert(compares == 2 && samples[DdrDmaAlternate] == DdrDmaOk);
-    puts("DDR200 ADMA2 qualifies both guarded taps, compares SDMA boundaries and withholds unverified cache data");
+    assert(compares == 2 && samples[DdrDmaAlternate] == DdrDmaOk && sample_taps[DdrDmaAlternate] == 34);
+    ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){30, 36});
+    assert(read_next(1, 6144) && read_next(1, 7168) && read_next(1, 8192) && read_next(1, 9216));
+    assert(compares == 2 && command_count == 2 * qualified + 1);
+    ++card.ddr.upgrades;
+    assert(read_next(1, 10240) && read_next(1, 11264) && read_next(1, 12288) && read_next(1, 13312));
+    assert(compares == 3);
+
+    reset((ddr_eye_t){31, 36}, 33);
+    const u32 small = 64 * 1024 / 512;
+    for (u32 sector = 0; sector < ReadAheadRunIn; sector += small)
+        assert(!sdmmc_read_ahead(&card, 1, sector, small, output));
+    assert(!maps && !command_count);
+    u32 sector = ReadAheadRunIn * 2;
+    for (u32 end = sector + ReadAheadRunIn; sector < end; sector += small)
+        assert(!sdmmc_read_ahead(&card, 1, sector, small, output));
+    assert(sdmmc_read_ahead(&card, 1, sector, small, output) && command_count == qualified);
+    assert(output[0] == sector / small);
+    assert(sdmmc_read_ahead(&card, 1, sector + small, small, output) && command_count == qualified);
+    assert(output[0] == sector / small + 1);
+    sdmmc_read_ahead_invalidate(sector + 2 * small, small);
+    assert(!sdmmc_read_ahead(&card, 1, sector + 2 * small, small, output) && command_count == qualified);
+    puts("DDR200 ADMA2 verifies guarded tap pairs with boundary-free slices and batches adjacent reads");
 }

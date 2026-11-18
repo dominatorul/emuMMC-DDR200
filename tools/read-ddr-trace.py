@@ -105,8 +105,8 @@ def print_sweeps(data, sweeps, full_khz, trace_version):
               f'CPU temperature {temperature}, SD I/O setting {volts}')
 
 
-def print_dma_comparison(data, offset):
-    print('DDR200 DMA comparison')
+def print_dma_comparison(data, offset, version):
+    print('DDR200 DMA qualification' if version >= 23 else 'DDR200 DMA comparison')
     caps, config = struct.unpack_from('<QQ', data, offset + (len(DMA_SAMPLES) + 1) * 16)
     if config >> 32:
         supported = (config & 0xFF) >= 3 and (caps & 0x80000) and ((config >> 16) & 0x3000) == 0x3000
@@ -130,7 +130,8 @@ def print_dma_comparison(data, offset):
     if elapsed:
         print(f'  ADMA2 commands averaged {blocks * 512 / elapsed:.2f} MB/s across {blocks / 2048:.2f} MiB')
     if not any(data[offset:offset + 16]):
-        print('  No same-sector comparison recorded. It requires ADMA2, a guarded 8+ tap eye and sequential reads.')
+        minimum = 6 if version >= 23 else 8
+        print(f'  No same-sector check recorded. It requires ADMA2, a guarded {minimum}+ tap eye and sequential reads.')
 
 
 def print_policy_trace(data, gprs):
@@ -217,7 +218,7 @@ def print_policy_trace(data, gprs):
                   f'card support {bool(flags & 0x40)}, disabled after failure {bool(flags & 0x80)}')
     dma_capacity = len(DMA_SAMPLES) + 2 if perf_version >= 22 else 0
     if dma_capacity:
-        print_dma_comparison(data, 0x150 + (48 - dma_capacity) * 16)
+        print_dma_comparison(data, 0x150 + (48 - dma_capacity) * 16, perf_version)
     runtime_capacity = 48 - matrix_capacity - dma_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -261,7 +262,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 22:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 23:
         raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

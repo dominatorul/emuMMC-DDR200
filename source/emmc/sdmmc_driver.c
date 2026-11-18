@@ -1191,16 +1191,12 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	if (dma_address & 7)
 		return 0;
 
-	u32 boundary = 512 * 1024;
-	u16 boundary_bits = 7 << 12;
+	const u32 boundary = 512 * 1024;
 	u64 address_register = dma_address;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	sdmmc->dma_progress.mode = mode;
 	sdmmc->dma_progress.blocks = blkcnt;
-	if (mode == SdmmcDmaSdma256) {
-		boundary = 256 * 1024;
-		boundary_bits = 6 << 12;
-	} else if (mode == SdmmcDmaAdma2) {
+	if (mode == SdmmcDmaAdma2) {
 		if (!sdmmc_adma2_supported(sdmmc))
 			return 0;
 		address_register = sdmmc_read_ahead_adma_table(dma_address, blkcnt * req->blksize);
@@ -1214,14 +1210,13 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	sdmmc->regs->admaaddr = (u32)address_register;
 	sdmmc->regs->admaaddr_hi = (u32)(address_register >> 32);
 
-	sdmmc->dma_boundary_bytes = boundary;
 	sdmmc->dma_addr_next = (dma_address + boundary) & ~((u64)boundary - 1);
 	sdmmc->dma_boundaries_left = ((dma_address & (boundary - 1)) + (u64)blkcnt * req->blksize) / boundary;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	if (mode == SdmmcDmaAdma2)
 		sdmmc->dma_boundaries_left = 0;
 #endif
-	sdmmc->regs->blksize = req->blksize | boundary_bits;
+	sdmmc->regs->blksize = req->blksize | (7 << 12);
 	sdmmc->regs->blkcnt = blkcnt;
 
 	if (blkcnt_out)
@@ -1270,7 +1265,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 			++sdmmc->dma_resumes;
 			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
-			sdmmc->dma_addr_next += sdmmc->dma_boundary_bytes;
+			sdmmc->dma_addr_next += 512 * 1024;
 		}
 		/* Keep the boundary interrupt hot path to one status read.
 		   A short cadence is enough for timeout and progress checks. */

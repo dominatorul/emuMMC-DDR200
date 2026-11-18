@@ -222,7 +222,7 @@
 #define SDMMC_SWITCH(mode, index, value) (((mode) << 24) | ((index) << 16) | ((value) << 8))
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-enum SdmmcDmaMode { SdmmcDmaDefault, SdmmcDmaSdma512, SdmmcDmaSdma256, SdmmcDmaAdma2 };
+enum SdmmcDmaMode { SdmmcDmaDefault, SdmmcDmaSdma512, SdmmcDmaAdma2 = 3 };
 
 enum {
     SdmmcAdmaChunk = 32 * 1024,
@@ -267,7 +267,6 @@ typedef struct _sdmmc_t
 	u64 deadline_us;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
-	u32 dma_boundary_bytes;
 	u32 dma_boundaries_left;
 	u32 dma_resumes;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
