@@ -225,7 +225,10 @@
 enum SdmmcDmaMode { SdmmcDmaDefault, SdmmcDmaSdma512, SdmmcDmaAdma2 = 3 };
 
 enum {
-    SdmmcAdmaChunk = 32 * 1024,
+    SdmmcAdmaBytes = 2 * 1024 * 1024,
+    /* Tegra210 rejects the zero length encoding for exactly 64 KiB. */
+    SdmmcAdmaChunk = 64 * 1024 - 512,
+    SdmmcAdmaDescriptors = (SdmmcAdmaBytes + SdmmcAdmaChunk - 1) / SdmmcAdmaChunk,
     SdmmcAdmaTransferValid = 0x21,
     SdmmcAdmaEnd = 2,
 };
@@ -238,7 +241,9 @@ _Static_assert(sizeof(sdmmc_adma2_descriptor_t) == 16, "SDHCI v4 ADMA2 descripto
 
 typedef struct {
     enum SdmmcDmaMode mode;
-    u16 blocks, remaining;
+    u32 address_low;
+    u16 blocks, remaining, block_bytes;
+    u8 descriptors;
     u8 adma_error;
     bool sampled;
 } sdmmc_dma_progress_t;
@@ -270,7 +275,7 @@ typedef struct _sdmmc_t
 	u32 dma_boundaries_left;
 	u32 dma_resumes;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	enum SdmmcDmaMode read_ahead_dma;
+	bool prefetch;
 	sdmmc_dma_progress_t dma_progress;
 #endif
 	u32 rsp[4];

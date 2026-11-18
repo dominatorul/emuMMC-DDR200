@@ -28,8 +28,8 @@ Result svcUnmapDeviceAddressSpace(Handle das, Handle process, u64 address, u64 s
     u64 device_address)
 {
     ++unmaps;
-    assert(das == read_ahead.das && process == current_process &&
-        address == (uintptr_t)read_window.data && size == ReadAheadBytes && device_address == read_ahead.dma);
+    assert(das == read_ahead.mapping.das && process == current_process &&
+        address == (uintptr_t)read_window.data && size == ReadAheadBytes && device_address == read_ahead.mapping.dma);
     return 0;
 }
 

@@ -14,27 +14,43 @@ static mmc_obj_t device;
 static sdmmc_accessor_t accessor = {.parent = &device};
 sdmmc_accessor_t *_current_accessor = &accessor;
 bool sdmmc_memcpy_buf;
-static u64 time_us;
+static Handle das = 1;
+volatile Handle *sdmmc_das_handle = &das;
+static u64 time_us = 10;
+static _Alignas(8) u8 direct[512 * 1024], bounce[512 * 1024];
 static u8 output[512 * 1024];
 
-static struct {
-    enum SdmmcDmaMode mode;
-    unsigned tap;
-    unsigned blocks;
-} commands[40];
 static enum DdrDmaResult samples[DdrDmaSamples];
-static unsigned sample_taps[DdrDmaSamples];
-static unsigned command_count, compares, maps, unmaps, recoveries, filled[2];
-static enum SdmmcDmaMode fault_mode;
-static unsigned fault_tap;
+static unsigned sample_taps[DdrDmaSamples], refusals[DdrBatchRefusals];
+static unsigned commands, compares, maps, unmaps, recoveries, resets, restarts;
+static u32 sequential, served;
+static int fault_tap;
 static u16 fault_irq;
-static bool stale_data, stop_failure;
+static bool stale_data, mapping_ok = true;
 
 u64 get_tmr_us(void) { return ++time_us; }
+u64 get_tmr_ms(void)
+{
+    if (regs.swrst) {
+        assert(regs.swrst == (SDHCI_RESET_CMD | SDHCI_RESET_DATA));
+        ++resets;
+        regs.swrst = 0;
+    }
+    return ++time_us;
+}
+
 bool sdmmc_get_sd_inserted(void) { return true; }
-void ddr_trace_read_ahead(unsigned blocks) { assert(blocks >= ReadAheadRequest && blocks <= sizeof(output) / 512); }
-void ddr_trace_read_ahead_map(Result result) { assert(!result); }
-void ddr_trace_read_ahead_fill(bool succeeded) { ++filled[succeeded]; }
+void ddr_trace_read_ahead(unsigned blocks) { assert(blocks && blocks <= sizeof(output) / 512); }
+void ddr_trace_read_ahead_map(Result result) { assert((result == 0) == mapping_ok); }
+void ddr_trace_read_ahead_fill(bool succeeded) { (void)succeeded; }
+void ddr_trace_batch_refused(enum DdrBatchRefusal reason) { ++refusals[reason]; }
+void ddr_trace_sdma_restart(void) { ++restarts; }
+void ddr_trace_batch_seq(u32 blocks, bool hit)
+{
+    sequential += blocks;
+    if (hit)
+        served += blocks;
+}
 void ddr_trace_dma_begin(void)
 {
     ++compares;
@@ -44,7 +60,7 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *target, ddr_e
     u64 elapsed, u32 blocks, u32 resumes, enum DdrDmaResult result)
 {
     assert(target == &host && ddr_eye_width(eye) >= 6 && elapsed && blocks == ReadAheadBlocks);
-    assert(sample != DdrDmaReference || resumes == 0);
+    assert(!resumes);
     samples[sample] = result;
     sample_taps[sample] = active_tap(target);
 }
@@ -52,77 +68,82 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *target, ddr_e
 Result svcMapDeviceAddressSpaceAligned(Handle handle, Handle process, u64 address,
     u64 size, u64 dma, u32 permission)
 {
-    assert(handle && process == current_process && address == (uintptr_t)&read_window);
-    assert(size == ReadAheadBytes + 4096 && permission == Perm_Rw);
+    assert(handle && process == current_process);
     assert(((address ^ dma) & (DeviceAlignment - 1)) == 0);
+    if (address == (uintptr_t)&descriptor_table)
+        assert(size == 0x1000 && permission == Perm_R);
+    else
+        assert(address == (uintptr_t)&read_window && size == ReadAheadBytes && permission == Perm_W);
     ++maps;
-    return 0;
+    return mapping_ok ? 0 : 1;
 }
 
 Result svcUnmapDeviceAddressSpace(Handle handle, Handle process, u64 address, u64 size, u64 dma)
 {
-    assert(handle == read_ahead.das && process == current_process && address == (uintptr_t)&read_window);
-    assert(size == sizeof(read_window) && dma == read_ahead.dma);
+    assert(handle && process == current_process);
+    if (address == (uintptr_t)&descriptor_table)
+        assert(size == 0x1000 && dma == descriptor_mapping.dma);
+    else
+        assert(address == (uintptr_t)&read_window && size == ReadAheadBytes && dma == read_ahead.mapping.dma);
     ++unmaps;
     return 0;
 }
 
 intptr_t sdmmc_calculate_dma_addr(sdmmc_accessor_t *source, void *buf, unsigned int blocks)
 {
-    assert(source == &accessor && buf == output && blocks <= sizeof(output) / 512);
-    return 0x12340000;
+    assert(source == &accessor);
+    uintptr_t offset = (uintptr_t)buf - (uintptr_t)direct;
+    if (offset >= sizeof(direct) || blocks * 512 > sizeof(direct) - offset)
+        return 0;
+    sdmmc_memcpy_buf = false;
+    return 0x1237ffe0 + offset;
 }
 
 void armDCacheClean(void *buf, size_t size)
 {
-    assert(buf == read_window.table && size && size <= sizeof(read_window.table));
+    assert(buf == descriptor_table.entries && size && size <= sizeof(descriptor_table.entries));
+}
+
+static void assert_chain(u64 dma, unsigned bytes)
+{
+    unsigned count = (bytes + SdmmcAdmaChunk - 1) / SdmmcAdmaChunk;
+    for (unsigned i = 0; i < count; ++i) {
+        const sdmmc_adma2_descriptor_t *entry = &descriptor_table.entries[i];
+        unsigned end = i + 1 == count ? SdmmcAdmaEnd : 0;
+        assert(entry->attributes == (SdmmcAdmaTransferValid | end));
+        assert(entry->length == MIN(bytes, SdmmcAdmaChunk) && entry->length);
+        assert(entry->address_low == (u32)dma && entry->address_high == dma >> 32 && !entry->reserved);
+        bytes -= entry->length;
+        dma += entry->length;
+    }
+    assert(bytes == 0);
 }
 
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 blocks, void *buf, u32 write)
 {
-    assert(storage == &card && !write && command_count < sizeof(commands) / sizeof(commands[0]));
+    assert(storage == &card && !write && host.prefetch && blocks == ReadAheadBlocks);
     u64 dma = sdmmc_read_ahead_dma(buf, blocks);
     assert(dma && !host.deadline_us);
     unsigned tap = active_tap(&host);
-    enum SdmmcDmaMode mode = host.read_ahead_dma;
-    commands[command_count++] = (typeof(commands[0])){mode, tap, blocks};
+    ++commands;
     sdmmc_req_t request = {.buf = buf, .blksize = 512, .num_sectors = blocks, .is_multi_block = true,
         .auto_command = SdmmcAutoStop};
     host.dma_progress = (sdmmc_dma_progress_t){0};
-    host.command_failure = 0;
-    host.command_irq = 0;
-    host.dma_resumes = 0;
+    host.command_failure = host.command_irq = host.dma_resumes = 0;
     assert(_sdmmc_config_dma(&host, done, &request));
     assert(*done == blocks && !sdmmc_memcpy_buf && regs.blkcnt == blocks);
     assert((regs.trnmod & (SDHCI_TRNS_DMA | SDHCI_TRNS_AUTO_CMD12)) ==
         (SDHCI_TRNS_DMA | SDHCI_TRNS_AUTO_CMD12));
-    assert(host.dma_progress.blocks == blocks && host.dma_progress.mode == mode);
-    if (mode == SdmmcDmaAdma2) {
-        assert((regs.hostctl & SDHCI_CTRL_DMA_MASK) == SDHCI_CTRL_ADMA32);
-        assert(!host.dma_boundaries_left && regs.admaaddr == read_ahead.dma + ReadAheadBytes);
-        assert(!regs.admaaddr_hi && blocks == ReadAheadBlocks);
-        for (unsigned i = 0; i < sizeof(read_window.table) / sizeof(read_window.table[0]); ++i) {
-            const sdmmc_adma2_descriptor_t *entry = &read_window.table[i];
-            unsigned end = i + 1 == sizeof(read_window.table) / sizeof(read_window.table[0]) ? SdmmcAdmaEnd : 0;
-            assert(entry->attributes == (SdmmcAdmaTransferValid | end) && entry->length == SdmmcAdmaChunk);
-            assert(entry->address_low == dma + i * SdmmcAdmaChunk && !entry->address_high && !entry->reserved);
-        }
-        /* Emulate the command wrapper's restore before storage cleanup. */
-        regs.hostctl &= ~SDHCI_CTRL_DMA_MASK;
-    } else {
-        assert((regs.hostctl & SDHCI_CTRL_DMA_MASK) == SDHCI_CTRL_SDMA);
-        const u32 boundary = 512 * 1024;
-        assert(mode == SdmmcDmaSdma512 && blocks == DdrVerifyBlocks);
-        assert(regs.admaaddr == dma && !regs.admaaddr_hi && !(dma & (boundary - 1)));
-        assert(regs.blksize == (512 | (7 << 12)) && host.dma_addr_next == dma + boundary);
-        assert(!host.dma_boundaries_left);
-    }
-    if (mode == fault_mode && tap == fault_tap) {
+    assert(host.dma_progress.blocks == blocks && host.dma_progress.mode == SdmmcDmaAdma2);
+    assert((regs.hostctl & SDHCI_CTRL_DMA_MASK) == SDHCI_CTRL_ADMA32);
+    assert(!host.dma_boundaries_left && regs.admaaddr == descriptor_mapping.dma);
+    assert_chain(dma, ReadAheadBytes);
+    regs.hostctl &= ~SDHCI_CTRL_DMA_MASK;
+    if ((int)tap == fault_tap) {
         if (stale_data)
             return 1;
         host.command_failure = DdrCommandTransfer;
         host.command_irq = (u32)fault_irq << 16 | SDHCI_INT_ERROR;
-        card.ddr.ready = !stop_failure;
         return 0;
     }
     memset(buf, 0, blocks * 512);
@@ -139,16 +160,13 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 
 void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed)
 {
-    assert(storage == &card && blocks && blocks <= ReadAheadBlocks && elapsed);
+    assert(storage == &card && blocks == ReadAheadBlocks && elapsed);
 }
 
 bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
 {
-    assert(storage == &card && sector < card.sec_cnt && !degrade);
-    assert(host.read_ahead_dma == SdmmcDmaDefault && fault_irq != SDHCI_ERR_INT_ADMA_ERROR);
-    assert(active_tap(&host) == fault_tap);
-    if (!storage->ddr.ready)
-        return false;
+    assert(storage == &card && sector < card.sec_cnt && !degrade && !host.prefetch);
+    assert(fault_irq != SDHCI_ERR_INT_ADMA_ERROR && (int)active_tap(&host) == fault_tap);
     ++recoveries;
     return true;
 }
@@ -157,112 +175,138 @@ static void reset(ddr_eye_t eye, unsigned tap)
 {
     sdmmc_read_ahead_reset();
     read_ahead = (typeof(read_ahead)){0};
-    card.ddr = (ddr_policy_t){.rate = DdrRateFull, .ready = true};
+    descriptor_mapping = (dma_window_t){0};
+    das = 1;
+    card.ddr = (ddr_policy_t){.rate = DdrRateFull, .ready = true, .last_sweep_us = time_us};
     ddr_remember_eye(&card.ddr.history[0], eye);
-    regs.capareg = SDHCI_CAN_ADMA2;
-    regs.hcver = 3;
-    regs.hostctl2 = SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN | UHS_DDR50_BUS_SPEED;
-    regs.hostctl = SDHCI_CTRL_4BITBUS;
+    regs = (t210_sdmmc_t){.capareg = SDHCI_CAN_ADMA2, .hcver = 3,
+        .hostctl2 = SDHCI_HOST_VERSION_4_EN | SDHCI_ADDRESSING_64BIT_EN | UHS_DDR50_BUS_SPEED,
+        .hostctl = SDHCI_CTRL_4BITBUS};
     sdmmc_set_ddr200_tap(&host, tap);
-    command_count = compares = maps = unmaps = recoveries = filled[0] = filled[1] = 0;
-    fault_mode = SdmmcDmaDefault;
+    commands = compares = maps = unmaps = recoveries = resets = restarts = 0;
+    sequential = served = 0;
+    memset(refusals, 0, sizeof(refusals));
+    fault_tap = -1;
     fault_irq = SDHCI_ERR_INT_DATA_CRC;
-    stale_data = stop_failure = false;
+    stale_data = false;
+    mapping_ok = true;
 }
 
-static bool read_next(Handle handle, u32 sector)
+static bool read_next(u32 sector)
 {
-    return sdmmc_read_ahead(&card, handle, sector, sizeof(output) / 512, output);
+    return sdmmc_read_ahead(&card, das, sector, sizeof(output) / 512, output);
+}
+
+static void test_dma(void)
+{
+    reset((ddr_eye_t){29, 36}, 32);
+    u64 address = 0x11237ffe8ull;
+    assert(sdmmc_adma_table(address, 2 * 1024 * 1024));
+    assert_chain(address, SdmmcAdmaBytes);
+    assert(sdmmc_adma_table(address, 64 * 1024));
+    assert_chain(address, 64 * 1024);
+    assert(descriptor_table.entries[1].length == 512);
+    assert(!sdmmc_adma_table(address - 1, 4096));
+    assert(!sdmmc_adma_table(address, SdmmcAdmaBytes + 1));
+
+    sdmmc_req_t request = {.buf = direct + 8, .blksize = 512, .num_sectors = 32, .is_multi_block = true};
+    u32 blocks;
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(blocks == 32 && host.dma_progress.mode == SdmmcDmaAdma2 && !host.dma_boundaries_left);
+    assert_chain(0x1237ffe8, 32 * 512);
+    assert(host.dma_progress.address_low == 0x7ffe8 && !sdmmc_memcpy_buf);
+    regs.blkcnt = 24;
+    regs.norintsts = SDHCI_INT_ERROR;
+    regs.errintsts = SDHCI_ERR_INT_ADMA_ERROR;
+    regs.admaerr = 3;
+    assert(!_sdmmc_update_dma(&host));
+    assert(resets == 1 && !restarts && host.dma_progress.sampled &&
+        host.dma_progress.remaining == 24 && host.dma_progress.adma_error == 3);
+    assert(host.command_irq >> 16 == SDHCI_ERR_INT_ADMA_ERROR);
+
+    device.dmaBuffers[0] = (sdmmc_dma_buffer_t){(char *)bounce, sizeof(bounce), (char *)0x20000000};
+    request.buf = output;
+    request.is_write = true;
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(sdmmc_memcpy_buf && !(regs.trnmod & SDHCI_TRNS_READ));
+    assert_chain(0x20000000, 32 * 512);
+    request.buf = direct + 1;
+    assert(_sdmmc_config_dma(&host, &blocks, &request) && sdmmc_memcpy_buf);
+    device.dmaBuffers[0] = (sdmmc_dma_buffer_t){0};
+
+    request.buf = direct;
+    regs.capareg = 0;
+    regs.hostctl &= ~SDHCI_CTRL_DMA_MASK;
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(host.dma_progress.mode == SdmmcDmaSdma512 && host.dma_boundaries_left == 1);
+    reset((ddr_eye_t){29, 36}, 32);
+    mapping_ok = false;
+    assert(!_sdmmc_config_dma(&host, &blocks, &request));
+    assert(host.dma_progress.mode == SdmmcDmaAdma2);
 }
 
 int main(void)
 {
-    const ddr_eye_t eight = {29, 36};
-    reset(eight, 32);
-    assert(!read_next(1, 0));
-    assert(read_next(1, 1024) && compares == 1 && filled[true] == 1 && !recoveries);
-    assert(output[0] == 8 && output[128 * 512] == 9);
-    assert(samples[DdrDmaReference] == DdrDmaOk && sample_taps[DdrDmaReference] == 32);
+    test_dma();
+
+    reset((ddr_eye_t){29, 36}, 32);
+    assert(!read_next(0) && read_next(1024));
     assert(samples[DdrDmaBaseline] == DdrDmaOk && sample_taps[DdrDmaBaseline] == 32);
     assert(samples[DdrDmaAlternate] == DdrDmaOk && sample_taps[DdrDmaAlternate] == 33);
-    assert(active_tap(&host) == 32 && host.read_ahead_dma == SdmmcDmaDefault);
+    assert(commands == 2 && maps == 2 && !host.prefetch && output[0] == 8);
     assert(!sdmmc_read_ahead_dma(read_window.data + ReadAheadBytes, 1));
-    assert(!sdmmc_read_ahead_dma(read_window.data + ReadAheadBytes - 512, 2));
-    assert(!sdmmc_read_ahead_adma_table(read_ahead.dma + ReadAheadBytes, 512));
-    assert(!sdmmc_read_ahead_adma_table(read_ahead.dma, ReadAheadBytes + 512));
-    unsigned qualified = command_count;
-    assert(qualified == ReferenceSlices + 2);
-    assert(read_next(1, 2048) && read_next(1, 3072) && read_next(1, 4096) && command_count == qualified);
-    assert(read_next(1, 5120) && command_count == qualified + 1 && commands[qualified].mode == SdmmcDmaAdma2);
-    sdmmc_read_ahead_reset();
-    assert(unmaps == 1 && !read_ahead.adma_verified && !read_ahead.dma);
-    assert(!read_next(2, 0) && read_next(2, 1024));
-    assert(compares == 2 && maps == 2 && read_ahead.adma_verified);
-
-    reset((ddr_eye_t){32, 36}, 34);
-    assert(!read_next(1, 0) && !read_next(1, 1024) && !maps && !command_count && card.ddr.ready);
-    reset(eight, 31);
-    assert(!read_next(1, 0) && !read_next(1, 1024) && !maps && !command_count);
-    reset(eight, 32);
-    regs.capareg = 0;
-    assert(!read_next(1, 0) && !read_next(1, 1024) && !maps && !command_count);
-
-    reset(eight, 32);
-    fault_mode = SdmmcDmaSdma512;
-    fault_tap = 32;
-    stop_failure = true;
-    assert(!read_next(1, 0) && !read_next(1, 1024) && !card.ddr.ready && !read_ahead.blocks);
-    assert(samples[DdrDmaReference] == DdrDmaFailed && !samples[DdrDmaAlternate] && !recoveries);
-
-    reset(eight, 32);
-    fault_mode = SdmmcDmaAdma2;
-    fault_tap = 33;
-    fault_irq = SDHCI_ERR_INT_ADMA_ERROR;
-    assert(!read_next(1, 0) && !read_next(1, 1024));
-    assert(samples[DdrDmaAlternate] == DdrDmaFailed && card.ddr.ready && active_tap(&host) == 32);
-    assert(!recoveries && read_ahead.fill_failed && !read_ahead.blocks);
-
-    reset(eight, 32);
-    fault_mode = SdmmcDmaAdma2;
-    fault_tap = 32;
-    assert(!read_next(1, 0) && !read_next(1, 1024) && recoveries == 1);
-    assert(!read_ahead.blocks && read_ahead.fill_failed);
-
-    reset(eight, 32);
-    fault_mode = SdmmcDmaAdma2;
-    fault_tap = 33;
-    stale_data = true;
-    memset(output, 0x7f, sizeof(output));
-    assert(!read_next(1, 0) && !read_next(1, 1024));
-    assert(samples[DdrDmaAlternate] == DdrDmaMismatch && active_tap(&host) == 32);
-    assert(output[0] == 0x7f && !read_ahead.blocks && read_ahead.fill_failed);
-
-    reset(eight, 32);
-    assert(!read_next(1, 0) && read_next(1, 1024));
+    assert(read_next(2048) && read_next(3072) && read_next(4096) && commands == 2);
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){31, 36});
     sdmmc_set_ddr200_tap(&host, 33);
-    assert(read_next(1, 2048) && read_next(1, 3072) && read_next(1, 4096) && read_next(1, 5120));
-    assert(compares == 2 && samples[DdrDmaAlternate] == DdrDmaOk && sample_taps[DdrDmaAlternate] == 34);
+    assert(read_next(5120) && sample_taps[DdrDmaAlternate] == 34 && compares == 2);
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){30, 36});
-    assert(read_next(1, 6144) && read_next(1, 7168) && read_next(1, 8192) && read_next(1, 9216));
-    assert(compares == 2 && command_count == 2 * qualified + 1);
-    ++card.ddr.upgrades;
-    assert(read_next(1, 10240) && read_next(1, 11264) && read_next(1, 12288) && read_next(1, 13312));
-    assert(compares == 3);
+    assert(read_next(6144) && read_next(7168) && read_next(8192) && read_next(9216));
+    assert(compares == 2 && commands == 5);
+    sdmmc_read_ahead_reset();
+    assert(unmaps == 2 && !read_ahead.adma_verified && !descriptor_mapping.dma);
+    ++das;
+    assert(!read_next(0) && read_next(1024) && compares == 3 && maps == 4);
+
+    reset((ddr_eye_t){32, 36}, 34);
+    assert(!read_next(0) && !read_next(1024) && refusals[DdrBatchEye] == 1);
+    assert(!maps && !commands && card.ddr.ready);
+    reset((ddr_eye_t){31, 36}, 33);
+    fault_tap = 34;
+    fault_irq = SDHCI_ERR_INT_ADMA_ERROR;
+    assert(!read_next(0) && !read_next(1024));
+    assert(samples[DdrDmaAlternate] == DdrDmaFailed && refusals[DdrBatchTapPair] == 1);
+    assert(card.ddr.ready && active_tap(&host) == 33 && !recoveries && !read_ahead.blocks);
+    reset((ddr_eye_t){31, 36}, 33);
+    fault_tap = 33;
+    assert(!read_next(0) && !read_next(1024) && recoveries == 1);
+    reset((ddr_eye_t){31, 36}, 33);
+    fault_tap = 34;
+    stale_data = true;
+    memset(output, 0x7f, sizeof(output));
+    assert(!read_next(0) && !read_next(1024));
+    assert(samples[DdrDmaAlternate] == DdrDmaMismatch && output[0] == 0x7f && !read_ahead.blocks);
 
     reset((ddr_eye_t){31, 36}, 33);
     const u32 small = 64 * 1024 / 512;
+    assert(!sdmmc_read_ahead(&card, das, 20000, 1, output));
+    for (u32 sector = 0; sector < ReadAheadRunIn; sector += small) {
+        assert(!sdmmc_read_ahead(&card, das, sector, small, output));
+        assert(!sdmmc_read_ahead(&card, das, 12000 + sector, small, output));
+    }
+    assert(!commands && refusals[DdrBatchSmall] == 1 && refusals[DdrBatchNonAdjacent] == 2);
+    assert(refusals[DdrBatchRunIn] == 14);
+    time_us = card.ddr.last_sweep_us + DdrSweepFreshUs;
+    /* Keep an active stream while its last sweep expires. */
     for (u32 sector = 0; sector < ReadAheadRunIn; sector += small)
-        assert(!sdmmc_read_ahead(&card, 1, sector, small, output));
-    assert(!maps && !command_count);
-    u32 sector = ReadAheadRunIn * 2;
-    for (u32 end = sector + ReadAheadRunIn; sector < end; sector += small)
-        assert(!sdmmc_read_ahead(&card, 1, sector, small, output));
-    assert(sdmmc_read_ahead(&card, 1, sector, small, output) && command_count == qualified);
-    assert(output[0] == sector / small);
-    assert(sdmmc_read_ahead(&card, 1, sector + small, small, output) && command_count == qualified);
-    assert(output[0] == sector / small + 1);
-    sdmmc_read_ahead_invalidate(sector + 2 * small, small);
-    assert(!sdmmc_read_ahead(&card, 1, sector + 2 * small, small, output) && command_count == qualified);
-    puts("DDR200 ADMA2 verifies guarded tap pairs with boundary-free slices and batches adjacent reads");
+        assert(!sdmmc_read_ahead(&card, das, sector, small, output));
+    assert(!sdmmc_read_ahead(&card, das, ReadAheadRunIn, small, output));
+    assert(refusals[DdrBatchStale] == 1);
+    card.ddr.last_sweep_us = time_us;
+    assert(sdmmc_read_ahead(&card, das, ReadAheadRunIn + small, small, output));
+    assert(sdmmc_read_ahead(&card, das, ReadAheadRunIn + 2 * small, 1, output));
+    assert(output[0] == 10 && commands == 2 && served == small + 1 && sequential >= served);
+    sdmmc_read_ahead_invalidate(ReadAheadRunIn + 2 * small + 1, 1);
+    assert(!sdmmc_read_ahead(&card, das, ReadAheadRunIn + 2 * small + 1, small, output));
+    assert(commands == 2);
+    puts("ADMA2 chains, resets, guarded batching, stream interleaving and refusal counters passed");
 }

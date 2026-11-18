@@ -160,11 +160,9 @@ void ddr_trace_io(bool write)
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 void ddr_trace_dma_begin(void)
 {
-    for (unsigned i = DdrDmaReference; i <= DdrDmaAlternate; ++i) {
-        sweep_event_t *slot = &history[HistoryCount - DmaCount + i];
-        slot->timing = 0;
-        slot->settings = 0;
-    }
+    sweep_event_t *base = &history[HistoryCount - DmaCount];
+    base[DdrDmaBaseline].settings = 0;
+    base[DdrDmaAlternate].settings = 0;
 }
 
 void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye_t eye,
@@ -179,20 +177,62 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye
         ((u64)MIN(resumes, 0xffffu) << 16) | ((u64)tap << 32) |
         ((u64)eye.left << 40) | ((u64)eye.right << 48) | ((u64)progress->adma_error << 56);
 }
+
+void ddr_trace_sdma_restart(void)
+{
+    ++history[HistoryCount - DmaCount + DdrDmaStats].timing;
+}
+
+void ddr_trace_batch_refused(enum DdrBatchRefusal reason)
+{
+    sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaRefusals + reason / 2];
+    if (reason & 1)
+        ++slot->settings;
+    else
+        ++slot->timing;
+}
+
+void ddr_trace_batch_seq(u32 blocks, bool served)
+{
+    sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaSequential];
+    slot->timing += blocks;
+    if (served)
+        slot->settings += blocks;
+}
+
+void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
+    u8 probes, ddr_eye_t eye)
+{
+    u64 now = get_tmr_us();
+    sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaLastDrop];
+    slot->timing = now;
+    slot->settings = from | ((u64)to << 8) | ((u64)reason << 16) | ((u64)probes << 24) |
+        ((u64)eye.left << 32) | ((u64)eye.right << 40);
+    record_event(DdrSweepClockDrop, 0, eye, probes, (from << 6) | (to << 4) | reason, now);
+}
 #endif
 
 void ddr_trace_io_error(const sdmmc_t *host, u32 cmd, u32 blocks)
 {
+    u32 tap = (host->regs->venclkctl >> 16) & 0xff;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (cmd == MMC_READ_MULTIPLE_BLOCK)
-        ddr_trace_dma_sample(DdrDmaLastError, host, (ddr_eye_t){DdrTapCount, 0}, 0,
-            host->dma_progress.blocks, host->dma_resumes, DdrDmaFailed);
+    const sdmmc_dma_progress_t *dma = &host->dma_progress;
+    unsigned progress = host->dma_resumes;
+    if (dma->mode == SdmmcDmaAdma2 && dma->sampled && dma->remaining <= dma->blocks) {
+        unsigned completed_bytes = (dma->blocks - dma->remaining) * dma->block_bytes;
+        progress = dma->remaining ? completed_bytes / SdmmcAdmaChunk : dma->descriptors;
+    }
+    unsigned slot_id = HistoryCount - DmaCount + DdrDmaFailures + io_errors % DdrDmaFailureCount;
+    history[slot_id].timing = host->command_irq | ((u64)(dma->blocks ? dma->blocks : MIN(blocks, 0xffffu)) << 32) |
+        ((u64)dma->remaining << 48);
+    history[slot_id].settings = dma->address_low | ((u64)MIN(progress, 0x1ffu) << 19) |
+        ((u64)tap << 28) | ((u64)dma->mode << 36) | ((u64)dma->adma_error << 38) |
+        ((u64)cmd << 46) | ((u64)dma->sampled << 54) | ((u64)dma->descriptors << 55);
 #endif
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     if (cmd == MMC_WRITE_MULTIPLE_BLOCK)
         ++write_errors;
 #endif
-    u32 tap = (host->regs->venclkctl >> 16) & 0xff;
     last_failure[0] = ((u64)host->divisor << 32) | host->command_irq;
     last_failure[1] = ((u64)host->command_auto_stop_error << 48) |
         ((u64)tap << 40) | ((u64)host->command_failure << 32) | (cmd << 16) | MIN(blocks, 0xffffu);
@@ -222,7 +262,7 @@ void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool cop
     u64 total = atomic_fetch_add_explicit(&sd_stats[write][0], blocks, memory_order_relaxed);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     if (host->dma_progress.mode == SdmmcDmaAdma2) {
-        sweep_event_t *slot = &history[HistoryCount - DmaCount + DdrDmaTotals];
+        sweep_event_t *slot = &history[HistoryCount - DmaCount + (write ? DdrDmaWriteTotals : DdrDmaTotals)];
         slot->timing += elapsed;
         slot->settings += blocks;
     }
@@ -323,7 +363,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_ADMA_PROBE)
-    ctx->gprs[0] = 0x4444523230300017ull;
+    ctx->gprs[0] = 0x4444523230300018ull;
 #elif defined(EMUMMC_DDR200_COUNTED_READS)
     ctx->gprs[0] = 0x4444523230300015ull;
 #elif defined(EMUMMC_DDR200_READ_AHEAD)
@@ -387,6 +427,9 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
         data[i][0] = history[i].timing;
         data[i][1] = history[i].settings;
     }
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    data[HistoryCount - DmaCount + DdrDmaStats][1] = io_errors;
+#endif
     _Static_assert(sizeof(data) == sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump) + sizeof(ctx->tls),
         "sweep trace capacity");
     memcpy(ctx->stack_trace, data, sizeof(ctx->stack_trace));

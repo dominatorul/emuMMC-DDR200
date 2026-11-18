@@ -110,6 +110,99 @@ static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsi
     return ok;
 }
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+/* Only a guarded tap can be installed. Other passing taps can supply the
+   independent checksum or expose why the full-rate eye cannot be used. */
+static unsigned verify_full_rate(sdmmc_storage_t *storage, const ddr_history_t *history,
+    ddr_eye_t eye, u32 sector, unsigned guard, u32 tried[4])
+{
+    enum { MaxProbes = 6 };
+    ddr_policy_t *policy = &storage->ddr;
+    sdmmc_t *host = storage->sdmmc;
+    char *dma = borrow_dma(DdrVerifyBlocks, verify_backup);
+    if (!dma || !storage->has_sector_access || storage->sec_cnt < DdrVerifyBlocks) {
+        policy->tune_failure = DdrDropScratch;
+        return SDMMC_INVALID_TAP;
+    }
+
+    sector = MIN(sector, storage->sec_cnt - DdrVerifyBlocks);
+    host->regs->hostctl2 |= SDHCI_CTRL_TUNED_CLK;
+    u64 hashes[MaxProbes];
+    u8 taps[MaxProbes];
+    bool guarded[MaxProbes];
+    unsigned good = 0, applied = SDMMC_INVALID_TAP, partner = SDMMC_INVALID_TAP;
+    unsigned relaxed = SDMMC_INVALID_TAP, relaxed_partner = SDMMC_INVALID_TAP;
+    bool mismatch = false;
+    unsigned first_probe = 255, second_probe = 255;
+    policy->tune_failure = DdrDropMargin;
+    while (policy->tune_probes < MaxProbes && policy->rate == DdrRateFull) {
+        if (host->deadline_us && get_tmr_us() >= host->deadline_us) {
+            policy->tune_failure = DdrDropDeadline;
+            break;
+        }
+
+        int tap = good && guarded[0] ? verification_neighbor(eye, taps[0], guard, tried) :
+            ddr_pick_tap(history, tried, guard, true);
+        if (tap < 0)
+            tap = ddr_pick_tap_in_range(eye.left, eye.right, tried, false);
+        if (tap < 0)
+            break;
+
+        exclude_tap(tried, tap);
+        if (policy->tune_probes == 0)
+            first_probe = tap;
+        else if (policy->tune_probes == 1)
+            second_probe = tap;
+        ++policy->tune_probes;
+        u64 hash;
+        if (!probe_read(storage, dma, sector, tap, &hash)) {
+            policy->tune_failure = policy->rate == DdrRateUnknown ? DdrDropLinkLost : DdrDropProbeIo;
+            continue;
+        }
+        bool guarded_tap = tap >= eye.left + (int)guard && tap + (int)guard <= eye.right;
+        for (unsigned i = 0; i < good; ++i) {
+            if (hash != hashes[i]) {
+                mismatch = true;
+                continue;
+            }
+            if (guarded_tap && guarded[i]) {
+                applied = taps[i];
+                partner = tap;
+                policy->narrow_pair = true;
+                break;
+            }
+            if ((guarded_tap || guarded[i]) && relaxed == SDMMC_INVALID_TAP) {
+                relaxed = guarded[i] ? taps[i] : tap;
+                relaxed_partner = guarded[i] ? tap : taps[i];
+            }
+        }
+        if (applied != SDMMC_INVALID_TAP || (relaxed != SDMMC_INVALID_TAP && policy->tune_probes >= 3))
+            break;
+        hashes[good] = hash;
+        taps[good] = tap;
+        guarded[good++] = guarded_tap;
+    }
+    restore_dma(dma, verify_backup, sizeof(verify_backup));
+    if (applied == SDMMC_INVALID_TAP && policy->rate == DdrRateFull && policy->tune_failure != DdrDropDeadline) {
+        applied = relaxed;
+        partner = relaxed_partner;
+    }
+    if (applied == SDMMC_INVALID_TAP) {
+        if (mismatch && policy->tune_failure != DdrDropDeadline && policy->tune_failure != DdrDropLinkLost)
+            policy->tune_failure = DdrDropMismatch;
+        if (policy->tune_probes)
+            ddr_trace_verify(first_probe, second_probe, false);
+        return applied;
+    }
+
+    sdmmc_set_ddr200_tap(host, applied);
+    bool ok = tap_readback(host) == applied;
+    ddr_trace_verify(applied, partner, ok);
+    policy->tune_failure = ok ? DdrDropUnknown : DdrDropClockSetup;
+    return ok ? applied : SDMMC_INVALID_TAP;
+}
+#endif
+
 static ddr_eye_t scan_eye(sdmmc_storage_t *storage, const ddr_history_t *history,
                           bool local, u32 *raw, u32 *passing, u32 *samples)
 {
@@ -134,12 +227,17 @@ static ddr_eye_t scan_eye(sdmmc_storage_t *storage, const ddr_history_t *history
     return eye;
 }
 
-static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool local,
-                  u32 sector, int failed_tap)
+static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool local,
+                  u32 sector, int failed_tap, const u32 failed[4])
 {
     ddr_policy_t *policy = &storage->ddr;
     sdmmc_t *host = storage->sdmmc;
     bool reduced = rate == DdrRateReduced;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    policy->tune_failure = DdrDropLinkLost;
+    policy->tune_probes = 0;
+    policy->tune_eye = (ddr_eye_t){DdrTapCount, 0};
+#endif
     ddr_history_t *history = &policy->history[reduced];
     if (policy->rate == DdrRateUnknown)
         return false;
@@ -147,6 +245,9 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
     policy->rate = rate;
     if (clock_changed) {
         if (!sdmmc_setup_ddr200_clock(host, reduced)) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+            policy->tune_failure = DdrDropClockSetup;
+#endif
             policy->rate = DdrRateUnknown;
             return false;
         }
@@ -164,6 +265,12 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
     bool tracking = kind == DdrSweepTrack && !clock_changed;
     bool runtime_full = rate == DdrRateFull && kind != DdrSweepInitial;
     unsigned width = ddr_eye_width(eye);
+    if (rate == DdrRateFull)
+        policy->last_sweep_us = get_tmr_us();
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    policy->tune_eye = eye;
+    policy->tune_failure = width ? DdrDropMargin : DdrDropNoEye;
+#endif
     bool narrow = runtime_full && width >= 2 * DdrNarrowMargin + 1 && width < 2 * DdrTapMargin + 1;
     unsigned guard = narrow ? DdrNarrowMargin : DdrTapMargin;
     unsigned applied = SDMMC_INVALID_TAP;
@@ -171,15 +278,24 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
         previous.left == eye.left && previous.right == eye.right &&
         prior_tap == policy->narrow_verified_tap &&
         started - policy->narrow_verified_at < DdrNarrowVerifyUs;
-    if (tracking && (!narrow || verified_narrow) && width >= 2 * guard + 1 &&
+    bool reuse = tracking && (!narrow || verified_narrow) && width >= 2 * guard + 1 &&
         prior_tap >= eye.left + guard && prior_tap <= eye.right - guard &&
-        (!had_eye || previous.right < eye.right + 3u)) {
+        (!had_eye || previous.right < eye.right + 3u);
+    if (reuse) {
         applied = prior_tap;
     } else if (width >= (kind == DdrSweepInitial ? SDMMC_SAMPLE_WIN_SIZE_MIN : DdrRuntimeWidth)) {
         u32 tried[4] = {0};
+        if (failed)
+            memcpy(tried, failed, sizeof(tried));
         if (failed_tap >= 0)
             exclude_tap(tried, failed_tap);
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        if (runtime_full) {
+            policy->narrow_pair = false;
+            applied = verify_full_rate(storage, history, eye, sector, guard, tried);
+        } else
+#endif
         for (unsigned attempt = 0; attempt < 2; ++attempt) {
             int tap = ddr_pick_tap(history, tried, guard, runtime_full);
             if (tap < 0 || policy->rate == DdrRateUnknown)
@@ -193,13 +309,13 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
             }
             if (verify_tap(storage, eye, sector, tap, guard, tried)) {
                 applied = tap;
-                if (narrow) {
-                    policy->narrow_verified_tap = tap;
-                    policy->narrow_verified_at = get_tmr_us();
-                }
                 break;
             }
         }
+    }
+    if (narrow && applied != SDMMC_INVALID_TAP && !reuse) {
+        policy->narrow_verified_tap = applied;
+        policy->narrow_verified_at = get_tmr_us();
     }
     ddr_trace_policy_sweep(host, eye, applied, kind, policy->drive, started);
     policy->ready = applied != SDMMC_INVALID_TAP;
@@ -207,6 +323,12 @@ static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool loc
     if (policy->ready)
         ddr_trace_stage(DdrReady, host->divisor);
     return policy->ready;
+}
+
+static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool local,
+                  u32 sector, int failed_tap)
+{
+    return train_link(storage, rate, kind, local, sector, failed_tap, NULL);
 }
 
 static void remember_functions(sdmmc_storage_t *storage, const u8 *status)
@@ -308,6 +430,9 @@ static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8
     for (enum DdrRate next = ddr_failure_next(from);
          next != DdrRateUnknown && policy->rate != DdrRateUnknown;
          next = ddr_failure_next(next)) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        ddr_trace_clock_drop(policy->rate, next, policy->tune_failure, policy->tune_probes, policy->tune_eye);
+#endif
         ddr_trace_ladder(next, false, policy->unstable, policy->upgrades);
         if (next == DdrRateReduced) {
             if (!train(storage, next, DdrSweepRecovery, false, sector, -1))
@@ -368,6 +493,10 @@ static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requeste
     sdmmc_t *host = storage->sdmmc;
     /* Horizon may have restored only the controller. Try the measured
        reduced DDR clock without changing the card's command system. */
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (requested == DdrRateFull)
+        ddr_trace_clock_drop(requested, DdrRateReduced, DdrDropWakeCheck, 0, (ddr_eye_t){DdrTapCount, 0});
+#endif
     policy->rate = DdrRateReduced;
     if (!sdmmc_setup_ddr200_clock(host, true) ||
         !sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000) ||
@@ -467,6 +596,9 @@ bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *storage)
     host->deadline_us = old;
     policy->ready = ok;
     if (ok) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        ddr_trace_clock_drop(policy->resume_rate, DdrRateSdr104, DdrDropSuspend, 0, (ddr_eye_t){DdrTapCount, 0});
+#endif
         storage->csd.busspeed = 104;
         ddr_trace_stage(DdrReady, host->divisor);
     }
@@ -478,7 +610,7 @@ bool sdmmc_ddr200_profile_ready(const sdmmc_storage_t *storage)
     return storage->ddr.ready;
 }
 
-bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
+static bool recover_io(sdmmc_storage_t *storage, u32 sector, bool degrade, const u32 failed[4])
 {
     ddr_policy_t *policy = &storage->ddr;
     sdmmc_t *host = storage->sdmmc;
@@ -494,7 +626,18 @@ bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
     u64 old = begin_budget(host, 1500000);
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     ddr_trace_read_recovery(host, false);
-    bool ok = (!degrade && train(storage, rate, DdrSweepRecovery, true, sector, failed_tap)) ||
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (degrade) {
+        policy->tune_failure = failed ? DdrDropRetryLimit : DdrDropDiagnostic;
+        policy->tune_probes = 0;
+        if (failed)
+            for (unsigned i = 0; i < 4; ++i)
+                policy->tune_probes += __builtin_popcount(failed[i]);
+        policy->tune_eye = policy->history[rate == DdrRateReduced].count ?
+            policy->history[rate == DdrRateReduced].eyes[0] : (ddr_eye_t){DdrTapCount, 0};
+    }
+#endif
+    bool ok = (!degrade && train_link(storage, rate, DdrSweepRecovery, true, sector, failed_tap, failed)) ||
         fallback(storage, rate, sector, status);
     if (ok)
         ddr_trace_read_recovery(host, true);
@@ -504,6 +647,19 @@ bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
     host->deadline_us = old;
     return ok;
 }
+
+bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
+{
+    return recover_io(storage, sector, degrade, NULL);
+}
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_ddr200_retry_io(sdmmc_storage_t *storage, u32 sector, u32 failed[4], bool exhausted)
+{
+    exclude_tap(failed, tap_readback(storage->sdmmc));
+    return recover_io(storage, sector, exhausted, failed);
+}
+#endif
 
 bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 {
@@ -523,10 +679,16 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     bool guard_write = false;
 #endif
     bool lower_for_write = guard_write && policy->rate == DdrRateFull && policy->narrow;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    lower_for_write &= !policy->narrow_pair;
+#endif
     unsigned track_blocks = policy->narrow ? DdrNarrowTrackBlocks : DdrTrackBlocks;
     unsigned track_time = policy->narrow ? DdrNarrowTrackBusyUs : DdrTrackBusyUs;
     bool track = policy->rate == DdrRateFull &&
         (policy->blocks >= track_blocks || policy->busy_us >= track_time);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    track |= policy->rate == DdrRateFull && ddr_sweep_stale(policy, now);
+#endif
     bool upgrade = !writing && !policy->matrix_active && ddr_should_upgrade(policy, now);
     if (!track && !upgrade && !lower_for_write)
         return true;
@@ -538,9 +700,18 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     u64 old = begin_budget(host, 1500000);
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     if (track || lower_for_write) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        if (!train(storage, DdrRateFull, lower_for_write ? DdrSweepRecovery : DdrSweepTrack, true, sector, -1)) {
+            fallback(storage, DdrRateFull, sector, status);
+        } else if (guard_write && policy->narrow && !policy->narrow_pair) {
+            policy->tune_failure = DdrDropWriteMargin;
+            fallback(storage, DdrRateFull, sector, status);
+        }
+#else
         if (lower_for_write || !train(storage, DdrRateFull, DdrSweepTrack, true, sector, -1) ||
             (guard_write && policy->narrow))
             fallback(storage, DdrRateFull, sector, status);
+#endif
     } else {
         enum DdrRate was = policy->rate;
         ++policy->upgrades;

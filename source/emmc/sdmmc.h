@@ -118,7 +118,7 @@ int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, v
 bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out);
 u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-u64 sdmmc_read_ahead_adma_table(u64 dma, u32 bytes);
+u64 sdmmc_adma_table(u64 dma, u32 bytes);
 #endif
 void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks);
 void sdmmc_read_ahead_reset(void);
@@ -136,6 +136,9 @@ bool sdmmc_ddr200_profile_ready(const sdmmc_storage_t *storage);
 bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions);
 bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing);
 bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_ddr200_retry_io(sdmmc_storage_t *storage, u32 sector, u32 failed[4], bool exhausted);
+#endif
 void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed);
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write);
 bool sdmmc_storage_wait_ready(sdmmc_storage_t *storage, u64 deadline);

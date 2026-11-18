@@ -282,7 +282,7 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 	};
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	u64 previous_deadline = host->deadline_us;
-	if (host->read_ahead_dma != SdmmcDmaDefault) {
+	if (host->prefetch) {
 		host->deadline_us = get_tmr_us() + 200000;
 		if (previous_deadline)
 			host->deadline_us = MIN(previous_deadline, host->deadline_us);
@@ -322,9 +322,10 @@ int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	sdmmc_dma_progress_t progress = host->dma_progress;
 	u32 resumes = host->dma_resumes;
-#endif
+#else
 	if (host->id == SDMMC_1)
 		ddr_trace_io_error(host, cmd.cmd, num_sectors);
+#endif
 	if (failure >= DdrCommandResponse && !stop_failed_transfer(storage)) {
 		storage->ddr.ready = false;
 		storage->ddr.rate = DdrRateUnknown;
@@ -353,7 +354,8 @@ int sdmmc_storage_end(sdmmc_storage_t *storage)
 static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf, u32 is_write)
 {
 	u8 *bytes = buf;
-	bool sd = storage->sdmmc->id == SDMMC_1;
+	sdmmc_t *host = storage->sdmmc;
+	bool sd = host->id == SDMMC_1;
 	if (!storage->initialized)
 		return 0;
 
@@ -363,12 +365,25 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 		u32 count = MIN(num_sectors, 0xFFFF);
 		u32 blocks = 0;
 		u64 started = get_tmr_us();
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+		u32 failed[4] = {0};
+#endif
 		for (unsigned attempt = 0;
 		     !sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
 		     ++attempt) {
 			/* Retune and verify before any retry. A failed write could have
 			   programmed some blocks, so report its error to FS. */
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+			/* Mapping and descriptor faults have already been logged. A
+			   new sampling tap cannot repair either one. */
+			if (host->command_failure == DdrCommandDmaSetup ||
+			    (host->command_irq >> 16) == SDHCI_ERR_INT_ADMA_ERROR)
+				return 0;
+			if (attempt >= 5 || !sd || !sdmmc_ddr200_retry_io(storage, sector, failed,
+			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0)) || is_write)
+#else
 			if (attempt == 3 || !sd || !sdmmc_ddr200_recover(storage, sector, attempt != 0) || is_write)
+#endif
 				return 0;
 			blocks = 0;
 		}

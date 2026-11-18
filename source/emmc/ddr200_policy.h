@@ -16,6 +16,7 @@ enum {
     DdrNarrowTrackBlocks = 64 * 1024,
     DdrNarrowTrackBusyUs = 250000,
     DdrNarrowVerifyUs = 2000000,
+    DdrSweepFreshUs = 2000000,
     DdrCoolIdleUs = 5000000,
     DdrCoolBlocks = 256 * 1024,
     DdrMaxUpgrades = 6,
@@ -50,7 +51,18 @@ typedef struct {
     u64 last_write;
     u64 retry_at;
     u64 narrow_verified_at;
+    u64 last_sweep_us;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    bool narrow_pair;
+    u8 tune_failure, tune_probes;
+    ddr_eye_t tune_eye;
+#endif
 } ddr_policy_t;
+
+static inline bool ddr_sweep_stale(const ddr_policy_t *policy, u64 now)
+{
+    return !policy->last_sweep_us || now - policy->last_sweep_us >= DdrSweepFreshUs;
+}
 
 static inline unsigned ddr_eye_width(ddr_eye_t eye)
 {

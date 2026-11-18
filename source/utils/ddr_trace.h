@@ -36,20 +36,33 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);
 
 #include "../emmc/ddr200_policy.h"
 
+enum DdrBatchRefusal { DdrBatchEye, DdrBatchTapPair, DdrBatchRunIn, DdrBatchSmall,
+    DdrBatchNonAdjacent, DdrBatchStale, DdrBatchUnavailable, DdrBatchWindow, DdrBatchRefusals };
+enum DdrDropReason { DdrDropUnknown, DdrDropNoEye, DdrDropMargin, DdrDropScratch,
+    DdrDropProbeIo, DdrDropMismatch, DdrDropDeadline, DdrDropClockSetup, DdrDropWriteMargin,
+    DdrDropDiagnostic, DdrDropWakeCheck, DdrDropSuspend, DdrDropLinkLost, DdrDropRetryLimit };
+
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 /* Slots 2 and 3 held bulk SDMA controls in report version 22. */
-enum DdrDmaSample { DdrDmaReference, DdrDmaBaseline, DdrDmaAlternate = 4,
-    DdrDmaLastError, DdrDmaTotals, DdrDmaHost, DdrDmaSamples };
+enum DdrDmaSample { DdrDmaBaseline = 1, DdrDmaWriteTotals, DdrDmaAlternate = 4,
+    DdrDmaTotals = 6, DdrDmaHost, DdrDmaRefusals, DdrDmaSequential = 12,
+    DdrDmaStats, DdrDmaLastDrop, DdrDmaFailures, DdrDmaFailureCount = 8,
+    DdrDmaSamples = DdrDmaFailures + DdrDmaFailureCount };
 enum DdrDmaResult { DdrDmaOk = 1, DdrDmaFailed, DdrDmaMismatch };
 
 void ddr_trace_dma_begin(void);
 void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye_t eye,
     u64 elapsed, u32 blocks, u32 resumes, enum DdrDmaResult result);
+void ddr_trace_sdma_restart(void);
+void ddr_trace_batch_refused(enum DdrBatchRefusal reason);
+void ddr_trace_batch_seq(u32 blocks, bool served);
+void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
+    u8 probes, ddr_eye_t eye);
 #endif
 
 enum DdrSweepKind {
     DdrSweepInitial, DdrSweepHandoff, DdrSweepTrack, DdrSweepRecovery, DdrSweepUpgrade, DdrSweepLadder,
-    DdrSweepPower,
+    DdrSweepPower, DdrSweepClockDrop,
     DdrSweepNoise = 16, DdrSweepGated, DdrSweepFree,
     DdrSweepSettle0, DdrSweepSettle10, DdrSweepSettle100,
     DdrSweepLoad, DdrSweepIdle, DdrSweepDrive, DdrSweepSettleStart,

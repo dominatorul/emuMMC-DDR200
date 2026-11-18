@@ -1149,21 +1149,28 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	u32 blkcnt = req->num_sectors;
 	if (blkcnt >= 0xFFFF)
 		blkcnt = 0xFFFF;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	bool adma = sdmmc->id == SDMMC_1 && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
+	if (adma) {
+		sdmmc->dma_progress.mode = SdmmcDmaAdma2;
+		blkcnt = MIN(blkcnt, SdmmcAdmaBytes / req->blksize);
+		if (!blkcnt || (!req->is_multi_block && blkcnt < req->num_sectors))
+			return 0;
+	}
+#endif
 
 	u64 dma_address = 0;
 #ifdef EMUMMC_DDR200_READ_AHEAD
 	if (sdmmc->id == SDMMC_1 && !req->is_write && req->blksize == 512)
 		dma_address = sdmmc_read_ahead_dma(req->buf, blkcnt);
 #endif
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-	enum SdmmcDmaMode mode = dma_address ? sdmmc->read_ahead_dma : SdmmcDmaDefault;
-	if (mode == SdmmcDmaDefault)
-		mode = SdmmcDmaSdma512;
-#endif
 	if (dma_address)
 		sdmmc_memcpy_buf = false;
 	else
-		dma_address = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf, blkcnt);
+		dma_address = (u64)sdmmc_calculate_dma_addr(_current_accessor, req->buf,
+			(blkcnt * req->blksize + 511) / 512);
+	if (dma_address & 7)
+		dma_address = 0;
 	if (!dma_address)
 	{
 		/* The caller's buffer is outside the mapped windows. Keep DMA
@@ -1173,7 +1180,11 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 			const sdmmc_dma_buffer_t *pool = &_current_accessor->parent->dmaBuffers[i];
 			u64 address = (u64)pool->device_addr_buffer_masked;
 			u32 blocks = MIN(pool->device_addr_buffer_size / req->blksize, blkcnt);
-			if (!pool->device_addr_buffer || !address || (address & 7) || blocks <= capacity)
+			uintptr_t pool_start = (uintptr_t)pool->device_addr_buffer;
+			uintptr_t source = (uintptr_t)req->buf;
+			bool overlaps = source >= pool_start ? source - pool_start < pool->device_addr_buffer_size :
+				pool_start - source < (u64)blkcnt * req->blksize;
+			if (!pool_start || !address || (address & 7) || blocks <= capacity || overlaps)
 				continue;
 			capacity = blocks;
 			dma_address = address;
@@ -1194,14 +1205,18 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	const u32 boundary = 512 * 1024;
 	u64 address_register = dma_address;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	sdmmc->dma_progress.mode = mode;
+	sdmmc->dma_progress.mode = adma ? SdmmcDmaAdma2 : SdmmcDmaSdma512;
 	sdmmc->dma_progress.blocks = blkcnt;
-	if (mode == SdmmcDmaAdma2) {
+	sdmmc->dma_progress.block_bytes = req->blksize;
+	sdmmc->dma_progress.address_low = dma_address & (boundary - 1);
+	if (adma) {
 		if (!sdmmc_adma2_supported(sdmmc))
 			return 0;
-		address_register = sdmmc_read_ahead_adma_table(dma_address, blkcnt * req->blksize);
+		u32 bytes = blkcnt * req->blksize;
+		address_register = sdmmc_adma_table(dma_address, bytes);
 		if (!address_register)
 			return 0;
+		sdmmc->dma_progress.descriptors = (bytes + SdmmcAdmaChunk - 1) / SdmmcAdmaChunk;
 		/* Version 4 selects ADMA2 with bit 4. Host Control 2
 		   already enables the 64-bit address and 16-byte descriptor. */
 		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | SDHCI_CTRL_ADMA32;
@@ -1213,7 +1228,7 @@ static int _sdmmc_config_dma(sdmmc_t *sdmmc, u32 *blkcnt_out, sdmmc_req_t *req)
 	sdmmc->dma_addr_next = (dma_address + boundary) & ~((u64)boundary - 1);
 	sdmmc->dma_boundaries_left = ((dma_address & (boundary - 1)) + (u64)blkcnt * req->blksize) / boundary;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	if (mode == SdmmcDmaAdma2)
+	if (adma)
 		sdmmc->dma_boundaries_left = 0;
 #endif
 	sdmmc->regs->blksize = req->blksize | (7 << 12);
@@ -1263,6 +1278,10 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 			}
 			--sdmmc->dma_boundaries_left;
 			++sdmmc->dma_resumes;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+			if (sdmmc->id == SDMMC_1)
+				ddr_trace_sdma_restart();
+#endif
 			sdmmc->regs->admaaddr = (u32)sdmmc->dma_addr_next;
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
 			sdmmc->dma_addr_next += 512 * 1024;
@@ -1324,8 +1343,10 @@ static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_
 	_sdmmc_enable_interrupts(sdmmc);
 
 	sdmmc->command_failure = DdrCommandResponse;
-	if (!_sdmmc_send_cmd(sdmmc, cmd, is_data_present))
+	if (!_sdmmc_send_cmd(sdmmc, cmd, is_data_present)) {
+		_sdmmc_mask_interrupts(sdmmc);
 		return 0;
+	}
 
 	int result = _sdmmc_wait_response(sdmmc);
 DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
@@ -1745,13 +1766,18 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	sdmmc->command_irq = 0;
 	sdmmc->command_auto_stop_error = 0;
 	sdmmc->dma_resumes = 0;
+	bool sd_data = sdmmc->id == SDMMC_1 && req;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 	sdmmc->dma_progress = (sdmmc_dma_progress_t){0};
 #endif
-	if (!sdmmc->card_clock_enabled)
+	if (!sdmmc->card_clock_enabled) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+		if (sd_data)
+			ddr_trace_io_error(sdmmc, cmd->cmd, req->num_sectors);
+#endif
 		return 0;
-	bool sample = sdmmc->id == SDMMC_1 && req && req->blksize == 512 &&
-		(cmd->cmd == MMC_READ_MULTIPLE_BLOCK || cmd->cmd == MMC_WRITE_MULTIPLE_BLOCK);
+	}
+	bool sample = sd_data && req->blksize == 512;
 	u64 started = sample ? get_tmr_us() : 0;
 	u64 dma_us = 0;
 
@@ -1769,7 +1795,7 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 	}
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-	bool may_use_adma = req && sdmmc->read_ahead_dma == SdmmcDmaAdma2;
+	bool may_use_adma = sd_data && (sdmmc->regs->capareg & SDHCI_CAN_ADMA2);
 	u8 dma_select = may_use_adma ? sdmmc->regs->hostctl & SDHCI_CTRL_DMA_MASK : 0;
 	u16 adma_irq = may_use_adma ? sdmmc->regs->errintstsen & SDHCI_ERR_INT_ADMA_ERROR : 0;
 #endif
@@ -1779,6 +1805,8 @@ int sdmmc_execute_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *b
 		sdmmc->regs->hostctl = (sdmmc->regs->hostctl & ~SDHCI_CTRL_DMA_MASK) | dma_select;
 		sdmmc->regs->errintstsen = (sdmmc->regs->errintstsen & ~SDHCI_ERR_INT_ADMA_ERROR) | adma_irq;
 	}
+	if (!result && sd_data)
+		ddr_trace_io_error(sdmmc, cmd->cmd, req->num_sectors);
 #endif
 	usleep((8000 + sdmmc->divisor - 1) / sdmmc->divisor);
 

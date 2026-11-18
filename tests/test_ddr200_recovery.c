@@ -14,6 +14,21 @@ static ddr_eye_t full_eye, reduced_eye;
 static u64 now;
 static unsigned fail_reads, commands, verifies, failed_verifies, stops, resets;
 static bool reject_type_c;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+enum { RelaxedProbes = 3 };
+static unsigned full_probe_failures, full_data_taps[8], full_data_calls, drop_probes;
+static enum DdrDropReason drop_reason;
+void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
+    u8 probes, ddr_eye_t eye)
+{
+    assert(from > to);
+    (void)eye;
+    drop_reason = reason;
+    drop_probes = probes;
+}
+#else
+enum { RelaxedProbes = 2 };
+#endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
 static enum SdmmcAutoCommand last_auto_command;
 static unsigned counted_reads;
@@ -157,14 +172,23 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
 #endif
     ++commands;
     unsigned tap = regs.venclkctl >> 16;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (host.divisor == 199680 && req->num_sectors == 16 && full_data_calls < 8)
+        full_data_taps[full_data_calls++] = tap;
+    bool injected = host.divisor == 199680 && full_probe_failures && req->num_sectors == DdrVerifyBlocks;
+    if (injected)
+        --full_probe_failures;
+#else
+    bool injected = false;
+#endif
     if (req->num_sectors == DdrVerifyBlocks) {
         assert(cmd->cmd == MMC_READ_MULTIPLE_BLOCK);
         if (verifies < sizeof(verify_taps) / sizeof(verify_taps[0]))
             verify_taps[verifies] = tap;
         ++verifies;
         bool guarded = tap >= full_eye.left + DdrTapMargin && tap + DdrTapMargin <= full_eye.right;
-        if (!verify_rejected && (!verify_guarded_only || host.divisor != 199680 || guarded)) {
-            memset(req->buf, inconsistent && verifies % 2 == 0 ? 0x22 : 0x11, DdrVerifyBytes);
+        if (!injected && !verify_rejected && (!verify_guarded_only || host.divisor != 199680 || guarded)) {
+            memset(req->buf, inconsistent ? (int)verifies : 0x11, DdrVerifyBytes);
             *done = DdrVerifyBlocks;
             return 1;
         }
@@ -179,10 +203,10 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     host.command_failure = DdrCommandTransfer;
     host.command_irq = 0x01208000;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (host.read_ahead_dma != SdmmcDmaDefault) {
+    if (host.prefetch) {
         assert(host.deadline_us == now + 199999 && req->auto_command == SdmmcAutoStop);
-        host.dma_progress = (sdmmc_dma_progress_t){host.read_ahead_dma,
-            req->num_sectors, 128, 0, true};
+        host.dma_progress = (sdmmc_dma_progress_t){.mode = SdmmcDmaAdma2,
+            .blocks = req->num_sectors, .remaining = 128, .sampled = true};
         host.dma_resumes = 3;
         now = host.deadline_us + 1;
     }
@@ -201,7 +225,7 @@ int sdmmc_stop_transmission(sdmmc_t *target, u32 *rsp)
 {
     assert(target == &host && rsp);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (host.read_ahead_dma != SdmmcDmaDefault)
+    if (host.prefetch)
         assert(host.deadline_us > now);
 #endif
     event('A');
@@ -250,7 +274,7 @@ void ddr_trace_functions(u16 drive, u16 power, u8 chosen_drive, u8 chosen_power)
 }
 void ddr_trace_verify(unsigned tap, unsigned second, bool success)
 {
-    assert(tap != second && tap < DdrTapCount && second < DdrTapCount);
+    assert(!success || (tap != second && tap < DdrTapCount && second < DdrTapCount));
     if (verify_rejected || inconsistent)
         assert(!success);
 }
@@ -309,6 +333,11 @@ static void reset(void)
     card.sec_cnt = 0x100000;
     card.ddr.rate = DdrRateFull;
     card.ddr.ready = card.ddr.capable = true;
+    card.ddr.last_sweep_us = now;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    full_probe_failures = full_data_calls = drop_probes = 0;
+    drop_reason = DdrDropUnknown;
+#endif
     card.csd.busspeed = 200;
     _current_accessor = &accessor;
     dma.dmaBuffers[0].device_addr_buffer = window;
@@ -370,7 +399,7 @@ int main(void)
     u8 buf[16 * 512];
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     reset();
-    host.read_ahead_dma = SdmmcDmaSdma512;
+    host.prefetch = true;
     fail_reads = no_ready = 1;
     u32 completed = 0;
     assert(!sdmmc_storage_transfer(&card, &completed, 1024, 4096, window, 0));
@@ -415,7 +444,7 @@ int main(void)
     full_eye = (ddr_eye_t){30, 36};
     card.ddr.busy_us = DdrTrackBusyUs;
     assert(sdmmc_ddr200_before_io(&card, 1024, false) && tap_readback(&host) == 33);
-    assert(card.ddr.rate == DdrRateFull && verifies == 6);
+    assert(card.ddr.rate == DdrRateFull && verifies == 4 + RelaxedProbes);
 #ifdef EMUMMC_DDR200_DRIVE_C
     assert(card.ddr.drive == SD_SET_DRIVER_TYPE_C);
     reset();
@@ -444,7 +473,7 @@ int main(void)
     card_retained_ddr = true;
     assert(sdmmc_ddr200_handoff(&card));
     assert(rejected_sdr_checks == 2 && retained_restorations == 1 && !switched_to_stock);
-    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 4);
+    assert(card.ddr.ready && card.ddr.rate == DdrRateFull && verifies == 2 + RelaxedProbes);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
 
@@ -454,7 +483,7 @@ int main(void)
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 44});
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
     assert(strncmp(flow, "FASSRT", 6) == 0 && stops == 1 && resets == 1 && hint_scans);
-    assert(card.ddr.rate == DdrRateFull && card.ddr.ready && verifies == 2);
+    assert(card.ddr.rate == DdrRateFull && card.ddr.ready && verifies == RelaxedProbes);
     assert(verify_taps[0] == 32 && verify_taps[1] != 32 && verify_taps[1] != 36);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
@@ -474,27 +503,33 @@ int main(void)
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 35});
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
     assert(card.ddr.rate == DdrRateFull && tap_readback(&host) == 33);
-    assert(stops == 1 && resets == 1 && verifies == 2 && verify_taps[1] != 32);
+    assert(stops == 1 && resets == 1 && verifies == RelaxedProbes && verify_taps[1] != 32);
 
     for (unsigned edge = 33; edge <= 34; ++edge) {
         reset();
         fail_reads = 1;
         full_eye = (ddr_eye_t){29, edge};
         assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
-        assert(card.ddr.rate == DdrRateFull && card.ddr.narrow && verifies == 2);
+        unsigned expected = edge == 33 ? RelaxedProbes : 2;
+        assert(card.ddr.rate == DdrRateFull && card.ddr.narrow && verifies == expected);
         assert(tap_readback(&host) == 31 && verify_taps[0] != verify_taps[1]);
         card.ddr.busy_us = DdrNarrowTrackBusyUs;
-        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == 2 && card.ddr.ready);
+        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == expected && card.ddr.ready);
         now += DdrNarrowVerifyUs;
         card.ddr.busy_us = DdrNarrowTrackBusyUs;
-        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == 4 && card.ddr.ready);
+        assert(sdmmc_ddr200_before_io(&card, 1024, false) && verifies == expected * 2 && card.ddr.ready);
     }
 
     reset();
     fail_reads = 1;
     full_eye = (ddr_eye_t){29, 32};
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(card.ddr.rate == DdrRateReduced && card.ddr.unstable && verifies >= 5 && log_events >= 2);
+    assert(drop_reason == DdrDropMargin && drop_probes >= 3);
+#else
     assert(card.ddr.rate == DdrRateReduced && card.ddr.unstable && verifies == 2 && log_events >= 2);
+#endif
     assert(!ddr_should_upgrade(&card.ddr, now));
     now += DdrCoolIdleUs * 2;
     full_eye = (ddr_eye_t){29, 44};
@@ -503,8 +538,16 @@ int main(void)
 
     reset();
     card.ddr.narrow = true;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    full_eye = (ddr_eye_t){29, 33};
+#endif
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, window, 1));
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(card.ddr.rate == DdrRateReduced && host.divisor == 166400 && commands == 6 && verifies == 5);
+    assert(drop_reason == DdrDropWriteMargin);
+#else
     assert(card.ddr.rate == DdrRateReduced && host.divisor == 166400 && commands == 3 && verifies == 2);
+#endif
     assert(card.ddr.last_write != 0 && !card.ddr.upgrades);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
@@ -526,7 +569,12 @@ int main(void)
     card.ddr.busy_us = DdrTrackBusyUs;
     full_eye = (ddr_eye_t){29, 34};
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 1));
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(card.ddr.rate == DdrRateFull && card.ddr.narrow_pair && verifies == 2 && commands == 3);
+    assert(verify_taps[0] == 31 && verify_taps[1] == 32 && drop_reason == DdrDropUnknown);
+#else
     assert(card.ddr.rate == DdrRateReduced && verifies == 4 && commands == 5);
+#endif
 
     reset();
     inconsistent = true;
@@ -540,7 +588,32 @@ int main(void)
     fail_reads = 1;
     reduced_eye = (ddr_eye_t){32, 36};
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    assert(card.ddr.rate == DdrRateSdr104 && failed_verifies >= 4 && switched_to_stock == 1);
+#else
     assert(card.ddr.rate == DdrRateSdr104 && failed_verifies == 1 && switched_to_stock == 1);
+#endif
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    reset();
+    full_eye = (ddr_eye_t){31, 36};
+    full_probe_failures = 8;
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false) && card.ddr.rate == DdrRateReduced);
+    assert(drop_reason == DdrDropProbeIo && drop_probes >= 3);
+    for (unsigned i = 0; i < drop_probes; ++i)
+        for (unsigned j = i + 1; j < drop_probes; ++j)
+            assert(verify_taps[i] != verify_taps[j]);
+
+    reset();
+    full_eye = (ddr_eye_t){29, 44};
+    fail_reads = 4;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+    assert(full_data_calls == 4 && drop_reason == DdrDropRetryLimit);
+    for (unsigned i = 0; i < full_data_calls; ++i)
+        for (unsigned j = i + 1; j < full_data_calls; ++j)
+            assert(full_data_taps[i] != full_data_taps[j]);
+#endif
 
     reset();
     fail_reads = 1;
@@ -552,7 +625,7 @@ int main(void)
     reset();
     fail_reads = 1;
     assert(!_sdmmc_storage_readwrite(&card, 1024, 16, buf, 1));
-    assert(stops == 1 && resets == 1 && verifies == 2 && commands == 3);
+    assert(stops == 1 && resets == 1 && verifies == RelaxedProbes && commands == RelaxedProbes + 1);
 
 #ifdef EMUMMC_DDR200_MATRIX
     reset();

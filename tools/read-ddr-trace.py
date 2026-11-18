@@ -45,6 +45,14 @@ DMA_SAMPLES = ('SDMA reference slices', 'ADMA2 primary', 'SDMA 512 KiB boundary'
                'SDMA 256 KiB boundary', 'ADMA2 alternate', 'Last failed read')
 DMA_MODES = ('unconfigured DMA', 'SDMA 512 KiB', 'SDMA 256 KiB', 'ADMA2')
 DMA_RESULTS = ('unavailable', 'passed', 'command failed', 'data mismatch')
+BATCH_REFUSALS = ('eye too narrow or tap outside margin', 'tap pair qualification failed',
+                  '512 KiB run-in pending', 'request under 64 KiB', 'non-adjacent request',
+                  'stale sweep', 'batching unavailable', 'window or DMA map unavailable')
+DROP_REASONS = ('unspecified', 'no passing eye', 'no verified guarded pair', 'verification buffer unavailable',
+                'verification command failed', 'verification data differed', 'verification timed out',
+                'clock or tap readback failed', 'writes require two guarded taps', 'diagnostic transition',
+                'retained-link wake verification', 'native close for sleep', 'card stopped responding',
+                'distinct I/O retries exhausted')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
 OP_PHASES = ('none', 'entering', 'waiting on SD mutex', 'waiting on NAND mutex',
              'inside operation', 'releasing mutexes')
@@ -113,6 +121,8 @@ def print_dma_comparison(data, offset, version):
         print(f'  Host ADMA2 availability {bool(supported)}, capabilities {caps:#010x}, '
               f'Host Control 2 {(config >> 16) & 0xFFFF:#06x}')
     for i, label in enumerate(DMA_SAMPLES):
+        if version >= 24 and i not in (1, 4):
+            continue
         elapsed, blocks, remaining, mode, status, restarts, tap, left, right, adma_error = struct.unpack_from(
             '<IHHBBHBBBB', data, offset + i * 16)
         result = status & 0x7F
@@ -126,12 +136,55 @@ def print_dma_comparison(data, offset, version):
         error = f', ADMA error register {adma_error:#04x}' if adma_error else ''
         print(f'  {label}: {outcome}, {engine}, tap {tap}{eye}, '
               f'{blocks / 2:.1f} KiB{timing}, {restarts} SDMA restarts{progress}{error}')
-    elapsed, blocks = struct.unpack_from('<QQ', data, offset + len(DMA_SAMPLES) * 16)
-    if elapsed:
-        print(f'  ADMA2 commands averaged {blocks * 512 / elapsed:.2f} MB/s across {blocks / 2048:.2f} MiB')
-    if not any(data[offset:offset + 16]):
+    for slot, label in ((6, 'read commands' if version >= 24 else 'commands'), (2, 'write commands')):
+        if slot == 2 and version < 24:
+            continue
+        elapsed, blocks = struct.unpack_from('<QQ', data, offset + slot * 16)
+        if elapsed:
+            print(f'  ADMA2 {label} averaged {blocks * 512 / elapsed:.2f} MB/s across {blocks / 2048:.2f} MiB')
+    first_check = offset + (16 if version >= 24 else 0)
+    if not any(data[first_check:first_check + 16]):
         minimum = 6 if version >= 23 else 8
         print(f'  No same-sector check recorded. It requires ADMA2, a guarded {minimum}+ tap eye and sequential reads.')
+
+
+def format_drop(source, target, reason, probes, left, right):
+    detail = DROP_REASONS[reason] if reason < len(DROP_REASONS) else f'reason {reason}'
+    eye = f'{left}–{right}' if left <= right else 'unavailable'
+    return f'{RATES[source]} → {RATES[target]}, {detail}, {probes} distinct taps attempted, eye {eye}'
+
+
+def print_batch_trace(data, offset):
+    refused = struct.unpack_from('<8Q', data, offset + 8 * 16)
+    print('Batching refusals by request')
+    for label, count in zip(BATCH_REFUSALS, refused):
+        print(f'  {label}: {count}')
+    sequential, served = struct.unpack_from('<QQ', data, offset + 12 * 16)
+    if sequential:
+        print(f'Batched {served / sequential:.1%} of recognized sequential traffic '
+              f'({served / 2048:.2f}/{sequential / 2048:.2f} MiB)')
+    restarts, failures = struct.unpack_from('<QQ', data, offset + 13 * 16)
+    print(f'SDMA boundary restarts across all emuMMC SD data commands: {restarts}')
+    when, drop = struct.unpack_from('<QQ', data, offset + 14 * 16)
+    if when:
+        print('Latest clock drop ' + format_drop(drop & 3, (drop >> 8) & 3, (drop >> 16) & 0xFF,
+              (drop >> 24) & 0xFF, (drop >> 32) & 0xFF, (drop >> 40) & 0xFF))
+    if failures > 8:
+        print(f'{failures - 8} earlier DMA failure records exceeded capacity')
+    for i in range(max(0, failures - 8), failures):
+        irq, blocks, remaining, flags = struct.unpack_from('<IHHQ', data, offset + (15 + i % 8) * 16)
+        mode = (flags >> 36) & 3
+        cmd, tap = (flags >> 46) & 0xFF, (flags >> 28) & 0xFF
+        adma_error, progress = (flags >> 38) & 0xFF, (flags >> 19) & 0x1FF
+        sampled, descriptors = (flags >> 54) & 1, flags >> 55
+        if mode == 3:
+            report = f'{progress}/{descriptors} whole descriptors by block count' if sampled else 'progress unavailable'
+            report += f', ADMA error {adma_error:#04x}'
+        else:
+            report = f'{progress} restarts'
+        remaining_text = f', {remaining} blocks remaining' if sampled else ''
+        print(f'  Failed CMD{cmd}, {DMA_MODES[mode]}, tap {tap}, {blocks} blocks{remaining_text}, '
+              f'DMA offset {flags & 0x7FFFF:#07x}, {report}, IRQ {irq:#010x}')
 
 
 def print_policy_trace(data, gprs):
@@ -216,9 +269,11 @@ def print_policy_trace(data, gprs):
             flags = (state >> 24) & 0xFF
             print(f'Auto CMD23 completed {gprs[5] >> 48} reads, host version field {flags & 0x3F}, '
                   f'card support {bool(flags & 0x40)}, disabled after failure {bool(flags & 0x80)}')
-    dma_capacity = len(DMA_SAMPLES) + 2 if perf_version >= 22 else 0
+    dma_capacity = 23 if perf_version >= 24 else len(DMA_SAMPLES) + 2 if perf_version >= 22 else 0
     if dma_capacity:
         print_dma_comparison(data, 0x150 + (48 - dma_capacity) * 16, perf_version)
+    if perf_version >= 24:
+        print_batch_trace(data, 0x150 + (48 - dma_capacity) * 16)
     runtime_capacity = 48 - matrix_capacity - dma_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -242,6 +297,10 @@ def print_policy_trace(data, gprs):
                 status = 'OK' if right else 'failed'
                 print(f'  +{usec} us {event}, {status}')
                 continue
+            if kind == 7:
+                print(f'  +{usec} us clock drop ' + format_drop(drive >> 6, (drive >> 4) & 3,
+                      drive & 15, tap, left, right))
+                continue
             if kind == 25:
                 switched_at = usec
                 print(f'  +{usec} us CMD6 switch complete at {clock / 100:.2f} MHz')
@@ -262,7 +321,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 23:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 24:
         raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
