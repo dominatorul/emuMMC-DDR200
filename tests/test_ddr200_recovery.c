@@ -403,7 +403,8 @@ int main(void)
     full_eye = (ddr_eye_t){29, 44};
     card.ddr.drive_support = 3;
     for (unsigned step = 0; sdmmc_ddr200_matrix_step(&card); ++step) {
-        assert(step < 160 && host.deadline_us == 0 && card.ddr.ready);
+        assert(step < 2 * (MatrixLoadBlocks + MatrixSpeedBlocks) / MatrixSliceBlocks + 40 &&
+               host.deadline_us == 0 && card.ddr.ready);
         now += matrix.phase == MatrixIdle ? MatrixIdleUs : 100000;
     }
     assert(matrix_result == DdrMatrixComplete && !card.ddr.matrix_active);

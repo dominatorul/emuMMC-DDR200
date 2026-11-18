@@ -43,16 +43,16 @@ to restore the previous DDR200 rate. Both wake paths preserve DMA scratch.
 The diagnostic boots with the release runtime policy. Its first step runs
 on a normal SD filesystem request at least 20 seconds after the first
 successful native DDR200 handoff. Upcoming requests advance the experiment.
-Hold Volume Down by itself during SD activity to skip or end it.
+Hold Volume Down by itself for three seconds to skip or end it.
 It compares five repeated scans per clock, gating
 between tap samples versus leaving the clock on, and the 0, 10 and 100 ms
 settling targets after a confirmed DDR200 switch. The report measures each
 settling scan's start relative to the switch. Later scans may start after
 their target as earlier scans finish.
 
-The diagnostic reads 64 MiB in 8 MiB slices at each clock, samples during the
-load and after idle, and times up to 256 MiB of sequential reading at each
-clock. It logs the card's driver strength and power limits from CMD6
+The diagnostic reads 64 MiB in 2 MiB slices at each clock, sweeps every
+8 MiB and again after idle, and times up to 256 MiB of sequential reads at
+each clock. It logs the card's driver strength and power limits from CMD6
 and tests advertised standard driver strengths. It runs the CMD6 changes
 after the read comparisons. Each step uses the caller's storage locks and a
 250 ms command budget. The next request after an idle interval captures the

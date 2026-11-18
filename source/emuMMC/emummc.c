@@ -401,10 +401,9 @@ static void _ddr200_matrix_poll(void)
 {
     if (matrix_finished || !matrix_next_step)
         return;
-    if (ddr_watchdog_volume_down()) {
+    if (ddr_watchdog_matrix_cancelled()) {
         matrix_finished = true;
-        sd_storage.ddr.matrix_active = false;
-        ddr_trace_matrix(DdrMatrixSkipped, 0, 0);
+        sdmmc_ddr200_matrix_skip(&sd_storage);
         return;
     }
     if (get_tmr_us() < matrix_next_step)

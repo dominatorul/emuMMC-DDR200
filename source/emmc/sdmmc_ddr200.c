@@ -521,7 +521,8 @@ enum MatrixPhase {
     MatrixNoise, MatrixGated, MatrixFree, MatrixLoad, MatrixIdle, MatrixDrive, MatrixSpeed, MatrixSettle
 };
 enum {
-    MatrixSliceBlocks = 8 * 1024 * 1024 / 512,
+    MatrixSliceBlocks = 2 * 1024 * 1024 / 512,
+    MatrixSweepBlocks = 8 * 1024 * 1024 / 512,
     MatrixLoadBlocks = 64 * 1024 * 1024 / 512,
     MatrixSpeedBlocks = 256 * 1024 * 1024 / 512,
     MatrixIdleUs = 30000000,
@@ -622,6 +623,7 @@ static bool matrix_set_rate(sdmmc_storage_t *storage)
     bool ready = train(storage, want, matrix.phase == MatrixIdle ? DdrSweepIdle : DdrSweepRecovery,
                        false, 0, -1);
     sdmmc_card_clock_powersave(storage->sdmmc, SDMMC_POWER_SAVE_ENABLE);
+    ddr_trace_ladder(storage->ddr.rate, ready, storage->ddr.unstable, storage->ddr.upgrades);
     return ready;
 }
 
@@ -794,7 +796,8 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
             u32 count = MIN(MatrixSliceBlocks, target - matrix.blocks);
             u32 blocks = matrix_read_slice(storage, count, timed);
             matrix.blocks += blocks;
-            if (!timed && storage->ddr.ready)
+            if (!timed && storage->ddr.ready &&
+                (blocks != count || matrix.blocks % MatrixSweepBlocks == 0))
                 matrix_sweep(storage, DdrSweepLoad, false);
             if (blocks != count) {
                 if (!timed)
@@ -833,6 +836,14 @@ bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage)
             break;
     }
     host->deadline_us = old;
+    if (more)
+        ddr_trace_matrix(DdrMatrixRunning, matrix.phase | (matrix.reduced ? 0x80 : 0), matrix.details);
     return more;
+}
+
+void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage)
+{
+    storage->ddr.matrix_active = false;
+    ddr_trace_matrix(DdrMatrixSkipped, matrix.phase | (matrix.reduced ? 0x80 : 0), matrix.details);
 }
 #endif

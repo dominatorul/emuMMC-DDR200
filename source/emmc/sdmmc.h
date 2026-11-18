@@ -135,6 +135,7 @@ void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 
 
 #ifdef EMUMMC_DDR200_MATRIX
 bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage);
+void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage);
 #endif
 
 #endif

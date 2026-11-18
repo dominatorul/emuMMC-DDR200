@@ -27,11 +27,14 @@ static op_slot_t slots[SlotCount];
 static _Alignas(16) u8 watchdog_stack[0x4000];
 static _Atomic(volatile const u32 *) button_input;
 
-bool ddr_watchdog_volume_down(void)
+#ifdef EMUMMC_DDR200_MATRIX
+static atomic_bool matrix_cancelled;
+
+bool ddr_watchdog_matrix_cancelled(void)
 {
-    const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
-    return input && ((*input & VOLUME_PINS) == VOLUME_UP_PIN);
+    return atomic_load_explicit(&matrix_cancelled, memory_order_relaxed);
 }
+#endif
 
 static u32 find_slot(uintptr_t thread)
 {
@@ -122,6 +125,9 @@ static void watchdog_entry(void *unused)
 {
     (void)unused;
     u64 last_poll = get_tmr_us(), pressed_at = 0;
+#ifdef EMUMMC_DDR200_MATRIX
+    u64 down_at = 0;
+#endif
     bool released = false;
     const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
     for (;;) {
@@ -130,6 +136,9 @@ static void watchdog_entry(void *unused)
         if (now - last_poll >= SUSPEND_GAP_US) {
             ignore_suspend_gap(last_poll, now);
             pressed_at = 0;
+#ifdef EMUMMC_DDR200_MATRIX
+            down_at = 0;
+#endif
         }
         last_poll = now;
 
@@ -140,6 +149,16 @@ static void watchdog_entry(void *unused)
 
         /* Volume buttons X6/X7 are active low. Arm after both are released. */
         u32 volume = *input & VOLUME_PINS;
+#ifdef EMUMMC_DDR200_MATRIX
+        if (volume == VOLUME_UP_PIN && released) {
+            if (!down_at)
+                down_at = now;
+            if (now - down_at >= BUTTON_HOLD_US)
+                atomic_store_explicit(&matrix_cancelled, true, memory_order_relaxed);
+        } else {
+            down_at = 0;
+        }
+#endif
         if (volume) {
             if (volume == VOLUME_PINS)
                 released = true;
