@@ -5,18 +5,20 @@
 #include "ddr_watchdog.h"
 #include "util.h"
 #include "../soc/clock.h"
+#include "../soc/gpio.h"
 #include "../soc/pinmux.h"
 #include "../soc/t210.h"
 
 enum { SnapshotWords = 24 };
 static _Atomic u32 snapshots[DdrSnapshotCount][SnapshotWords];
+static _Atomic u32 power_pins[DdrSnapshotCount][3];
 static _Atomic u32 first_maps[8], latest_maps[8];
 static _Atomic u64 checkpoint;
 static _Atomic u32 reads, writes, attempts, sweeps;
 static _Atomic u32 first_window, latest_window, first_card[2], latest_card[2];
 static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
 static _Atomic u32 last_full_window, last_reduced_window;
-static _Atomic bool boot_power_recovery;
+static _Atomic u32 boot_power_recoveries;
 static _Atomic u64 first_io_error[3], latest_io_error[3];
 
 /* SD operations serialize trace writes. Atomic reads let a watchdog capture
@@ -60,6 +62,9 @@ void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
     };
     for (u32 i = 1; i < SnapshotWords; ++i)
         atomic_store_explicit(&snapshots[slot][i], values[i], memory_order_relaxed);
+    power_pins[slot][0] = gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4);
+    power_pins[slot][1] = PINMUX_AUX(PINMUX_AUX_DMIC3_CLK);
+    power_pins[slot][2] = gpio_get_pin_state(GPIO_PORT_Z, GPIO_PIN_1);
     atomic_store_explicit(&snapshots[slot][0], values[0], memory_order_release);
 }
 
@@ -117,14 +122,13 @@ void ddr_trace_reassert(void) { ++attempts; }
 
 void ddr_trace_boot_power(void)
 {
-    boot_power_recovery = true;
-    ddr_trace_stage(DdrBootPower, 0);
+    ddr_trace_stage(DdrBootPower, ++boot_power_recoveries);
 }
 
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x4444523230300008ull;
+    ctx->gprs[0] = 0x4444523230300009ull;
     ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
@@ -144,7 +148,7 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[23] = ((u64)last_full_window << 32) | last_reduced_window;
     /* Use reserved report space while leaving actual stack lengths zero. */
     ddr_watchdog_report(&ctx->gprs[24]);
-    ctx->gprs[28] = boot_power_recovery;
+    ctx->gprs[28] = boot_power_recoveries;
     u32 saved[DdrSnapshotCount][SnapshotWords];
     for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
         saved[slot][0] = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
@@ -155,4 +159,11 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     memcpy(ctx->stack_trace, saved, sizeof(ctx->stack_trace));
     memcpy(ctx->stack_dump, (const u8 *)saved + sizeof(ctx->stack_trace),
         sizeof(saved) - sizeof(ctx->stack_trace));
+    /* The reserved TLS dump holds GPIO input, drive and pinmux state. */
+    u32 pins[DdrSnapshotCount][3];
+    for (u32 slot = 0; slot < DdrSnapshotCount; ++slot)
+        for (u32 i = 0; i < 3; ++i)
+            pins[slot][i] = atomic_load_explicit(&power_pins[slot][i], memory_order_relaxed);
+    _Static_assert(sizeof(pins) <= sizeof(ctx->tls), "GPIO trace too large");
+    memcpy(ctx->tls, pins, sizeof(pins));
 }

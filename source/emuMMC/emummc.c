@@ -79,7 +79,10 @@ static bool _ddr200_power_ready(void)
 }
 
 #ifdef EMUMMC_FORCE_DDR200
+enum { BootPowerRecoveryLimit = 2, BootPowerWindowUs = 10000000 };
 static bool boot_power_window_closed;
+static u64 boot_power_deadline;
+static u32 boot_power_recoveries;
 
 static void _ddr200_close_boot_power_window(void)
 {
@@ -87,17 +90,18 @@ static void _ddr200_close_boot_power_window(void)
     i2c_release_boot_bus();
 }
 
-/* The boot process can drop the card's GPIO before native FS is ready to
-   reopen SD. Complete the original fork's early recovery once at that point. */
+/* The original fork's early recovery while boot owns the SD power pin.
+   Native open or expiration of either limit ends raw I2C5 access. */
 static int _ddr200_recover_boot_power(void)
 {
-    boot_power_window_closed = true;
+    ++boot_power_recoveries;
     ddr_trace_boot_power();
     sdmmc_end(&sd_sdmmc);
     sd_storage.initialized = 0;
     clock_sdmmc_invalidate_clock_source(SDMMC_1);
     int ok = nx_sd_initialize(false);
-    _ddr200_close_boot_power_window();
+    if (!ok || boot_power_recoveries == BootPowerRecoveryLimit)
+        _ddr200_close_boot_power_window();
     return ok;
 }
 
@@ -165,6 +169,8 @@ static void _ddr200_reassert(int mmc_id)
     reasserting = true;
 #ifdef EMUMMC_FORCE_DDR200
     int ok;
+    if (!boot_power_window_closed && get_tmr_us() >= boot_power_deadline)
+        _ddr200_close_boot_power_window();
     if (cold && !boot_power_window_closed && !sdmmc_get_sd_power_enabled()) {
         ok = _ddr200_recover_boot_power();
         goto recovered;
@@ -259,6 +265,9 @@ static void _sdmmc_ensure_initialized(void)
     // First Initial init
     if (!sdmmc_first_init)
     {
+#ifdef EMUMMC_FORCE_DDR200
+        boot_power_deadline = get_tmr_us() + BootPowerWindowUs;
+#endif
         sdmmc_initialize();
         sdmmc_first_init = true;
     }

@@ -33,9 +33,12 @@ def decode(path):
         raise ValueError(f'{path} is too short for a DDR200 trace')
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
-    if magic != 0x32454641 or gprs[0] not in (0x4444523230300006, 0x4444523230300007, 0x4444523230300008):
+    trace_version = gprs[0] & 0xFF
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or trace_version not in (6, 7, 8, 9):
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
-    has_rates = gprs[0] >= 0x4444523230300007
+    if trace_version >= 9 and len(data) < 0x350 + len(SNAPSHOTS) * 12:
+        raise ValueError(f'{path} is too short for a GPIO trace')
+    has_rates = trace_version >= 7
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
@@ -74,8 +77,10 @@ def decode(path):
                       f'{(rate_irq >> 32) / 1000:.2f} MHz, error {(rate_irq >> 16) & 0xFFFF:04X}, '
                       f'IRQ {rate_irq & 0xFFFF:04X}, present state {state >> 32:08X}, blocks {state & 0xFFFFFFFF}')
 
-    if gprs[0] == 0x4444523230300008:
-        if gprs[28]:
+    if trace_version >= 8:
+        if trace_version >= 9:
+            print(f'Early SD power recoveries attempted: {gprs[28]}')
+        elif gprs[28]:
             print('One-time early SD power recovery was attempted')
         op, phase, age, depth = gprs[24:28]
         if depth:
@@ -96,6 +101,11 @@ def decode(path):
         print(f'{label} (host accessible: {bool(values[0] & 2)}, Mariko: {bool(values[0] & 4)})')
         for name, val in zip(REGISTERS[1:], values[1:]):
             print(f'  {name:24s} {val:08X}')
+        if trace_version >= 9:
+            power, mux, detect = struct.unpack_from('<3I', data, 0x350 + i * 12)
+            print(f'  Power pin: input {power & 1}, GPIO {(power >> 1) & 1}, '
+                  f'output enable {(power >> 2) & 1}, output {(power >> 3) & 1}, pinmux {mux:08X}')
+            print(f'  Card detect input: {detect & 1} (active low)')
     for left, right in (('before native open', 'after native open'), ('initial tune', 'latest tune')):
         if left not in states or right not in states:
             continue

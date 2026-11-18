@@ -1230,9 +1230,17 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 	return result;
 }
 
-int sdmmc_get_sd_power_enabled()
+int sdmmc_get_sd_power_enabled(void)
 {
-	return gpio_read(GPIO_PORT_E, GPIO_PIN_4);
+	u32 mux = PINMUX_AUX(PINMUX_AUX_DMIC3_CLK);
+	if (mux & PINMUX_INPUT_ENABLE)
+		return gpio_read(GPIO_PORT_E, GPIO_PIN_4);
+
+	/* The boot pinmux setup can disable the input buffer while keeping
+	   the GPIO output active. In that case IN is not a power indication. */
+	u32 output_high = GpioPinModeGpio | GpioPinOutputEnabled | GpioPinOutputHigh;
+	return !(mux & PINMUX_TRISTATE) &&
+		(gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4) & output_high) == output_high;
 }
 
 bool sdmmc_get_sd_inserted()

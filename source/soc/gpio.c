@@ -98,6 +98,14 @@ int gpio_read(u32 port, u32 pins)
 	return (GPIO(port_offset) & pins) ? 1 : 0;
 }
 
+u32 gpio_get_pin_state(u32 port, u32 pin)
+{
+	return ((GPIO(GPIO_IN_OFFSET(port)) & pin) ? GpioPinInputHigh : 0) |
+		((GPIO(GPIO_CNF_OFFSET(port)) & pin) ? GpioPinModeGpio : 0) |
+		((GPIO(GPIO_OE_OFFSET(port)) & pin) ? GpioPinOutputEnabled : 0) |
+		((GPIO(GPIO_OUT_OFFSET(port)) & pin) ? GpioPinOutputHigh : 0);
+}
+
 static void _gpio_interrupt_clear(u32 port, u32 pins)
 {
 	u32 port_offset = GPIO_INT_CLR_OFFSET(port);

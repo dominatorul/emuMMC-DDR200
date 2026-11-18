@@ -50,14 +50,21 @@ to native FS and changed read retries to retune the powered card in place.
 PCV-test report `00000000001648d8` now shows the earlier boot transition.
 The driver completed 98 reads and 36 writes at 199.68 MHz with a 17-tap window.
 SD power GPIO was then low while the host still held the DDR settings. Native
-SD open returned `0x218` (NoDevice), leaving the card off. This revision allows
-the original fork's early cold initialization once if the GPIO drops before
-native FS begins SD open. Finishing that recovery or invoking native SD open
-closes direct I²C5 access for the remainder of the boot. Later power recovery
-uses native FS and read retries retune in place. HOC clock and SysFanControl
-startup flags remain backed up under `ddr200-debug/previous-fusee-stall-trace`.
+SD open returned `0x218` (NoDevice), leaving the card off. The boot-handoff
+build restored power once and trained another 17-tap window at 199.68 MHz.
+Report `000000000058a4a8` failed on another low reading after 101 reads and 36
+writes. The report captured no data command failures.
 
-Use **More Configs → Fusee DDR200 boot handoff (1.11.2)**. The entry chainloads the
+Atmosphère applies a late pinmux configuration that clears input-enable on
+DMIC3_CLK, the SD power GPIO pad. A low input reading can then coexist with a
+high GPIO output. Check the driven output in that configuration and capture
+both values, output-enable, GPIO mode and card detect in the trace. If power
+really drops, allow up to two early cold recoveries within ten seconds of
+initial setup. Native SD open permanently closes direct I²C5 access. Later
+power recovery uses native FS and read retries retune in place. HOC clock and
+SysFanControl startup flags remain under `ddr200-debug/previous-fusee-stall-trace`.
+
+Use **More Configs → Fusee DDR200 power pin (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
