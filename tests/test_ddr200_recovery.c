@@ -13,6 +13,7 @@ static sdmmc_accessor_t accessor = {.parent = &dma};
 static ddr_eye_t full_eye, reduced_eye;
 static u64 now;
 static unsigned fail_reads, commands, verifies, failed_verifies, stops, resets;
+static bool reject_type_c;
 static unsigned no_ready, hint_scans, switched_to_stock, log_events;
 static bool stop_ok, inconsistent, verify_rejected;
 static bool card_retained_ddr;
@@ -125,7 +126,7 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
         }
         memset(req->buf, 0, 64);
         u8 *reply = req->buf;
-        reply[9] = 3;
+        reply[9] = 7;
         reply[16] = cmd->arg & 0xff;
         if (cmd->arg == 0x00ffffff)
             reply[16] = UHS_SDR104_BUS_SPEED;
@@ -137,6 +138,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
             ++switched_to_stock;
         if (((cmd->arg >> 8) & 15) != 15)
             reply[15] = (cmd->arg >> 8) & 15;
+        if (reject_type_c && !(cmd->arg & 0x80000000) && reply[15] == SD_SET_DRIVER_TYPE_C)
+            reply[15] = 15;
         return 1;
     }
     assert(req->blksize == 512);
@@ -283,6 +286,7 @@ static void reset(void)
     stops = resets = no_ready = verifies = failed_verifies = commands = fail_reads = 0;
     hint_scans = switched_to_stock = log_events = cursor = 0;
     stop_ok = true;
+    reject_type_c = false;
     inconsistent = verify_rejected = card_retained_ddr = false;
     rejected_sdr_checks = retained_restorations = 0;
     flow[0] = 0;
@@ -328,7 +332,7 @@ static void test_eye_model(void)
 int main(void)
 {
     test_eye_model();
-    u8 functions[64] = {[10] = 0x40};
+    u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
     reset();
     host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
@@ -342,8 +346,16 @@ int main(void)
     full_eye = (ddr_eye_t){29, 44};
     assert(sdmmc_ddr200_handoff(&card) && tap_readback(&host) == 35 && verifies == 2);
     assert(strchr(flow, 'H'));
-#ifdef EMUMMC_DDR200_PERF_TRIAL
-    assert(card.ddr.drive == 1);
+#ifdef EMUMMC_DDR200_DRIVE_C
+    assert(card.ddr.drive == SD_SET_DRIVER_TYPE_C);
+    reset();
+    reject_type_c = true;
+    full_eye = (ddr_eye_t){32, 48};
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    assert(sdmmc_ddr200_initial(&card, functions));
+    assert(card.ddr.drive == SD_SET_DRIVER_TYPE_A);
+#elif defined(EMUMMC_DDR200_PERF_TRIAL)
+    assert(card.ddr.drive == SD_SET_DRIVER_TYPE_A);
 #endif
 
     reset();

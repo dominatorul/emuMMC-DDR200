@@ -3,10 +3,11 @@ set -eu
 cd "$(dirname "$0")/.."
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT HUP INT TERM
-for variant in release matrix performance; do
+for variant in release matrix performance drive-c; do
     set --
     if [ "$variant" = matrix ]; then set -- -DEMUMMC_DDR200_MATRIX; fi
     if [ "$variant" = performance ]; then set -- -DEMUMMC_DDR200_PERF_TRIAL; fi
+    if [ "$variant" = drive-c ]; then set -- -DEMUMMC_DDR200_PERF_TRIAL -DEMUMMC_DDR200_DRIVE_C; fi
     "${CC:-clang}" -std=gnu2x -O1 -g -ffunction-sections -fdata-sections \
         -fsanitize=address,undefined -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT \
         -DINNER_HEAP_SIZE=0x8000 "$@" tests/test_ddr200_recovery.c \

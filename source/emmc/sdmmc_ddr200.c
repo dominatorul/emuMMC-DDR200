@@ -224,11 +224,22 @@ static bool enter_ddr(sdmmc_storage_t *storage, u8 status[64])
     const u32 no_drive_change = 0x00ffffef;
     u32 arg = no_drive_change;
 #ifdef EMUMMC_DDR200_PERF_TRIAL
-    /* Type A is group 3 function 1. Probe it while the bus is still SDR. */
-    const u32 type_a = 0x00fff1ef;
-    if ((storage->ddr.drive_support & SD_DRIVER_TYPE_A) &&
-        check_ddr_switch(storage, status, type_a) && (status[15] & 15) == 1)
-        arg = type_a;
+    /* Try the advertised card drive settings while the bus is still SDR. */
+    const u8 drives[] = {
+#ifdef EMUMMC_DDR200_DRIVE_C
+        SD_SET_DRIVER_TYPE_C,
+#endif
+        SD_SET_DRIVER_TYPE_A,
+    };
+    for (unsigned i = 0; i < sizeof(drives); ++i) {
+        u8 drive = drives[i];
+        u32 candidate = (no_drive_change & ~(15u << 8)) | ((u32)drive << 8);
+        if ((storage->ddr.drive_support & (1u << drive)) &&
+            check_ddr_switch(storage, status, candidate) && (status[15] & 15) == drive) {
+            arg = candidate;
+            break;
+        }
+    }
 #endif
     if (arg == no_drive_change && !check_ddr_switch(storage, status, arg))
         return false;
