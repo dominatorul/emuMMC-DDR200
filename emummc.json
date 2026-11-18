@@ -47,15 +47,6 @@
             }
         },
         {
-            "type": "map",
-            "value": {
-                "address": "0x700e2000",
-                "size": "0x1000",
-                "is_ro": true,
-                "is_io": true
-            }
-        },
-        {
             "type": "handle_table_size",
             "value": 256
         },

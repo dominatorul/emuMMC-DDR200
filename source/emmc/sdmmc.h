@@ -21,6 +21,7 @@
 #include "../utils/types.h"
 #include "../FS/FS.h"
 #include "sdmmc_driver.h"
+#include "ddr200_policy.h"
 
 typedef struct _mmc_cid
 {
@@ -103,6 +104,7 @@ typedef struct _sdmmc_storage_t
 	mmc_csd_t     csd;
 	mmc_ext_csd_t ext_csd;
 	sd_scr_t      scr;
+	ddr_policy_t ddr;
 	int initialized;
 } sdmmc_storage_t;
 
@@ -119,5 +121,20 @@ int sdmmc_storage_init_gc(sdmmc_storage_t *storage, sdmmc_t *sdmmc);
 intptr_t sdmmc_calculate_dma_addr(sdmmc_accessor_t *_this, void *buf, unsigned int num_sectors);
 int sdmmc_calculate_dma_index(sdmmc_accessor_t *_this, void *buf, unsigned int num_sectors);
 int sdmmc_calculate_fitting_dma_index(sdmmc_accessor_t *_this, unsigned int num_sectors);
+bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage);
+bool sdmmc_ddr200_profile_ready(const sdmmc_storage_t *storage);
+bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions);
+bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector);
+bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade);
+void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed);
+int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write);
+bool sdmmc_storage_wait_ready(sdmmc_storage_t *storage, u64 deadline);
+int sdmmc_sd_switch(sdmmc_storage_t *storage, u8 *status, u32 argument);
+void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *status);
+
+#ifdef EMUMMC_DDR200_MATRIX
+bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage);
+void sdmmc_ddr200_matrix_settle(sdmmc_storage_t *storage, u64 switched_at);
+#endif
 
 #endif

@@ -64,15 +64,15 @@ void clock_disable_i2c5()
 	clock_disable(&_clock_i2c5);
 }
 
-static void _clock_enable_pllc4()
+static bool _clock_enable_pllc4(void)
 {
 	u32 old_base = CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
 	u32 old_misc = CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC);
 	if ((old_base & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | 0xFFFFFF))
 		== (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK | (104 << 8) | 4))
-		return;
-	if ((old_base & (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK)) == (PLLCX_BASE_ENABLE | PLLCX_BASE_LOCK))
-		fatal_abort(Fatal_DdrPll);
+		return true;
+	if (old_base & PLLCX_BASE_ENABLE)
+		return false;
 
 	// Enable Phase and Frequency lock detection.
 	CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC) |= PLLC4_MISC_EN_LCKDET;
@@ -94,11 +94,12 @@ static void _clock_enable_pllc4()
 		if (get_tmr_us() >= deadline) {
 			CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE) = old_base;
 			CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC) = old_misc;
-			fatal_abort(Fatal_DdrPll);
+			return false;
 		}
 	}
 
 	msleep(1); // Wait a bit for PLL to stabilize.
+	return true;
 }
 
 #define L_SWR_SDMMC1_RST (1 << 14)
@@ -323,13 +324,15 @@ static int _clock_sdmmc_config_clock_host(u32 *pclock, u32 id, u32 val)
 		source = SDMMC_CLOCK_SRC_PLLC4_OUT0;
 		*pclock = 399360;
 		divisor = 3;  // 2.5 div.
-		_clock_enable_pllc4();
+		if (!_clock_enable_pllc4())
+			return 0;
 		break;
 	case SDMMC_DDR200_RECOVERY_SRC_KHZ:
 		source = SDMMC_CLOCK_SRC_PLLC4_OUT0;
 		*pclock = 2 * SDMMC_DDR200_RECOVERY_CARD_KHZ;
 		divisor = 4;  // 3 div.
-		_clock_enable_pllc4();
+		if (!_clock_enable_pllc4())
+			return 0;
 		break;
 #endif
 	default:
@@ -378,7 +381,7 @@ void clock_sdmmc_invalidate_clock_source(u32 id)
 }
 #endif
 
-void clock_sdmmc_config_clock_source(u32 *pclock, u32 id, u32 val)
+bool clock_sdmmc_config_clock_source(u32 *pclock, u32 id, u32 val)
 {
 	if (_clock_sdmmc_table[id].clock == val)
 	{
@@ -389,11 +392,13 @@ void clock_sdmmc_config_clock_source(u32 *pclock, u32 id, u32 val)
 		int is_enabled = _clock_sdmmc_is_enabled(id);
 		if (is_enabled)
 			_clock_sdmmc_clear_enable(id);
-		_clock_sdmmc_config_clock_host(pclock, id, val);
+		bool configured = _clock_sdmmc_config_clock_host(pclock, id, val);
 		if (is_enabled)
 			_clock_sdmmc_set_enable(id);
 		_clock_sdmmc_is_reset(id);
+		return configured;
 	}
+	return true;
 }
 
 void clock_sdmmc_get_card_clock_div(u32 *pclock, u16 *pdivisor, u32 type)

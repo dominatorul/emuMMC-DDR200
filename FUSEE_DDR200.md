@@ -1,137 +1,84 @@
-# Fusee DDR200 diagnostic
+# DDR200 release and matrix package
 
-This build starts from Lightos1 develop at `108f1632`. It retains the original
-single manual sweep and reassert sequence. The test build requires a successful
-DDR200 switch and a passing interval of at least eight taps. It captures both
-the hardware comparator results and the subset with completed commands.
+The target is the Samsung PRO Plus on HOS 21.2.0 with Atmosphère 1.11.2.
+The driver tracks DDR200 at 199.68 MHz and 166.40 MHz. The release profile
+uses official Fusee. The matrix and known-good payloads use its 1.11.2
+program with a different emuMMC KIP filename. Each uses the same package3
+and emuMMC configuration.
 
-The last Hekate test, report `0000000000a49f0b`, reached DDR200, completed
-3,097 reads and 73 writes, then failed during recovery with `DD202011`.
-The center moved from tap 40 to 33 and the measured width dropped from 17 to 5.
-The log showed changes in clock source, host mode, divider and tap.
+## Runtime policy
 
-Fusee report `0000000000bf143a` ended with `DD200063` after 3,102 reads, 81
-writes, three reassert attempts and five completed sweeps. CMD6 confirmed
-command system 14 and Access Mode 0. Initial and final sweeps had identical SD
-clock, host mode, pad, pinmux and calibration values. The window again shrank
-from 17 taps at center 40 to 5 taps at center 33. This narrowed window persists
-after resetting Access Mode and using the official Fusee boot path.
+Initial DDR200 qualification requires an eight-tap window. After it qualifies,
+local sweeps cover the previous eye within 16 taps of its center. The driver
+checks after a native handoff, approximately 256 MiB, or two seconds of
+transfer time. The intersection of up to three measured windows supplies
+candidate taps. A receding right edge tightens the eligible interval. The
+picked tap keeps at least three taps of margin from each measured edge and
+from the current eye. A newly applied runtime tap requires matching 256 KiB
+DMA reads at two distinct passing taps. The four-tap measurement floor
+allows a narrow eye into the trace. The final three-tap margin needs at least
+seven passing taps.
 
-Hekate and L4T use CMD6 vendor command-system function 14 with the Access Mode
-group at SDR12. Native FS can configure that group during SD open. The new build
-returns the host and card to low-clock SDR12 before reselecting DDR200 during
-in-place recovery. Actual SD power, controller clock, voltage or width loss
-reopens the card through native FS before reselecting DDR200. Recovery preserves the 512-byte DMA
-scratch sector. The capture includes the original and latest sweeps, card CMD6
-status, registers before and after native open, and the reassert entry state.
+The driver first repairs a failed data command with explicit CMD12, waits
+for CMD13 transfer state and READY_FOR_DATA, and resets CMD/DAT. Read recovery
+tries new taps at the current clock, then validated DDR200 at 166.40 MHz,
+then standard SDR104 timing. SDR104 uses the serialized emuMMC transport.
+An ambiguous protocol switch or failed stop returns a storage error. A failed
+write can have programmed some blocks, so the caller receives its error after
+link recovery. At a degraded rate the driver schedules up to six full-rate
+retries with a 5–300 second backoff after idle or enough traffic. The trace
+marks the boot as unstable if it needed to leave full rate.
 
-The previous recovery build tried 199.68 MHz first and used the original
-fork's 166.4 MHz clock in the same vendor DDR200 mode if tuning or card status
-failed. It retrained the powered card after repeated read failures.
-It retained a successful reduced clock setting through reopens and resume
-for that boot. Both clocks required eight passing
-taps and a valid card status response. The updated trace saves the measured
-clock and window at each rate plus the first and latest failed data commands
-and interrupt status, before command cleanup overwrites that status.
+After the boot power window closes, Horizon owns SD power. On a cold
+access the emuMMC wrapper checks the power GPIO and pinmux, yields the locks
+while waiting for Horizon, and reasserts on its initialized SDR104 state.
+The native SD open callback is reached through the OS lifecycle. Reassertion,
+retry and diagnostic code use the already powered controller. Training
+restores the DDR200 pad configuration and preserves the affected DMA scratch.
 
-The recovery build reached the Nintendo logo but did not produce a new report
-after 30 seconds. This revision adds an independent watchdog. It saves a report
-if an SDMMC wrapper takes 15 active seconds, including time waiting for either
-storage mutex. It also caps SDMA polling at 5 seconds overall and 1.5 seconds
-without block progress. Boundary interrupts can advance only through the
-programmed transfer length. The active DDR200 clock policy is the same.
+## Matrix
 
-The stall-trace boot produced an Atmosphère fatal report from `pcv`, Program ID
-`010000000000001A`, with result `0x265` (`2101-0001`, I²C NoAck). The associated
-PTM and OMM crashes share that boot. The PCV test moved later SD power recovery
-to native FS and changed read retries to retune the powered card in place.
+The diagnostic starts at the first eligible native DDR200 handoff. Hold
+Volume Down by itself to skip or end it. It compares five repeated scans
+per clock, gating between tap samples versus leaving the clock on between
+samples, and the 0, 10 and 100 ms settling targets after the first confirmed
+DDR200 switch. The report measures each settling scan's start relative to
+the switch. Later samples can start after their target as earlier scans finish.
 
-PCV-test report `00000000001648d8` now shows the earlier boot transition.
-The driver completed 98 reads and 36 writes at 199.68 MHz with a 17-tap window.
-SD power GPIO was then low while the host still held the DDR settings. Native
-SD open returned `0x218` (NoDevice), leaving the card off. The boot-handoff
-build restored power once and trained another 17-tap window at 199.68 MHz.
-Report `000000000058a4a8` failed on another low reading after 101 reads and 36
-writes. The report captured no data command failures.
+The worker reads 64 MiB in 8 MiB slices at each clock, samples during the
+load and after idle, and times up to 256 MiB of sequential reading at each
+clock. It logs the card's driver strength and power limits from CMD6
+and tests advertised standard driver strengths. Read slices share the normal
+storage locks and command timeouts. Each clock's 30-second quiet period runs
+outside those locks. The report identifies shortened load tests and idle
+periods if the system keeps using the card. Matching reads protect the
+normal profile while the experiment changes clocks.
 
-Atmosphère applies a late pinmux configuration that clears input-enable on
-DMIC3_CLK, the SD power GPIO pad. A low input reading can then coexist with a
-high GPIO output. Check the driven output in that configuration and capture
-both values, output-enable, GPIO mode and card detect in the trace. If power
-really drops, allow up to two early cold recoveries within ten seconds of
-initial setup. Native SD open permanently closes direct I²C5 access. Later
-power recovery uses native FS and read retries retune in place. HOC clock and
-SysFanControl startup flags remain under `ddr200-debug/previous-fusee-stall-trace`.
+The trace holds 40 experimental records and eight recent runtime records in
+matrix mode. The release profile uses all 48 records for runtime events. Each
+sweep includes the sampled eye, applied tap, elapsed microseconds, bytes
+transferred since reassertion, rate and driver strength. It also records
+actual clock registers, CMD12/CMD13 cleanup, profile transitions and timed
+throughput. The logs can show whether contraction correlates with load and
+whether the eye recovers after idle. A physical measurement is needed to
+attribute a reversible change to heat or rail droop.
 
-The power-pin build reached HOME on the Samsung PRO Plus. The SD card had no
-new fatal report or saved benchmark, so the active clock and the cause of the
-reported slowdown are still unknown. This build retains that clock and recovery
-policy. Its trace records the last sampled data command clock and controller
-registers, plus command size, elapsed time, failures and the share transferred
-through a DMA bounce buffer. SD command totals include emulated NAND I/O.
-Separate SD filesystem request totals include mutex wait and retry time.
+## Console test
 
-The speed trace reproduced five CMD18 data CRC errors at 199.68 MHz with
-and without sys-clk. Its latest full-rate window narrowed from 17 to 15
-passing taps with sys-clk. Both runs spent roughly 99% of write command time
-waiting for DMA. Both finished at 166.40 MHz in DDR200 mode.
+1. Boot **Fusee DDR200 matrix (diagnostic)** from Hekate More Configs. Leave
+   the console at HOME for about two minutes.
+2. Hold **Volume + and Volume −** together for three seconds, then reconnect
+   in SD UMS. Collect the new file from `atmosphere/fatal_errors`.
+3. Boot **Fusee DDR200 (release policy)** and record the read and write
+   benchmark results.
+4. Run three sleep/wake cycles and benchmark after each. Save another report
+   with both volume buttons and reconnect SD UMS.
 
-This forced build uses 199.68 MHz for data transfers, including after
-reassertion. If a sweep or card status check fails, it restores the SD pad
-configuration, recalibrates it, and sweeps again at 199.68 MHz.
-After a read CRC or data end-bit error, it retunes the powered
-card once and repeats the original DMA read. If that still fails with a
-timing error, it tries the center of a second passing window, when one exists,
-and two interior taps of the largest window. It keeps the tap that passes the
-actual read. It stops with a report if recovery fails. Windows still need
-eight passing taps. The report saves the last eight sweeps with reassert and
-data error counts, the failure tap and Auto CMD12 status, and read recovery
-results.
+The manual report opens the Atmosphère fatal screen. The **Fusee DDR200
+(known-good power pin)** entry uses the earlier HOME-booting build.
 
-Report `0000000000aa0640` showed full-rate sweep centers of 40, 40, 36, 32
-and 32. The second reassertion still had 16 passing taps. The following
-32-block CMD18 failed at tap 36, and both recovery sweeps had seven passing taps.
-The native card-reopen build stalled at the Nintendo logo and left no report.
-
-This build resets the card's command system in place after an unsuccessful
-full-rate read recovery. It uses a verified 166.40 MHz tap for CMD6 control
-commands to exit vendor DDR200, negotiates again from SDR12, and returns to
-199.68 MHz before issuing filesystem data transfers. Both data and control
-tuning require at least eight passing taps. If negotiation fails, the driver
-rejects further transfers on that card session and saves a report.
-
-Reports record up to 32 sweeps in order, including the center and passing
-interval, clock, elapsed time, reassertions and data-command errors at each
-sweep. They also include a read-only Tegra CPU thermal sensor sample when
-the sensor is active and valid, and the controller's configured SD signaling
-voltage. The measurement is CPU temperature. The controller voltage field
-reports its setting. Measuring voltage at the card requires an external probe.
-Reports keep full initial and latest sweep registers plus clock, divider,
-tap and GPIO state around handoffs.
-
-Use **More Configs → Fusee DDR200 sweep history (1.11.2)**. The entry chainloads the
-official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
-kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
-Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a
-report automatically.
-
-Run the same benchmark and record its read and write speeds. Once the benchmark
-finishes, exit the app. Hold Volume + and Volume − together for three seconds
-to intentionally open the Atmosphère report screen and save the driver trace.
-Return to Hekate SD UMS to collect the report. The totals include activity since
-boot. On a separate boot, sleep and wake the console, run the same benchmark
-again, and capture another report to check the clock and tuning after resume.
-
-Decode this build's report with `python3 tools/read-ddr-trace.py report_*.bin`
-using a report from the Fusee test. `DD200062` means DDR200 recovery failed.
-`DD200063` and `DD200064` identify read and write failure, `DD200065` is a manual
-snapshot, `DD200066` is a clock lock or clock ownership error, `DD200067` is an
-operation timeout and `DD200068` is a watchdog setup failure.
-
-Host regression check for tuning and read recovery:
-
-    clang -std=gnu2x -O1 -g -ffunction-sections -fdata-sections \
-        -fsanitize=address,undefined -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT \
-        -DEMUMMC_FORCE_DDR200 -DINNER_HEAP_SIZE=0x8000 tests/test_ddr200_recovery.c \
-        -Wl,--gc-sections -o /tmp/test_ddr200_recovery
-    UBSAN_OPTIONS=halt_on_error=1 /tmp/test_ddr200_recovery
+Use `python3 tools/read-ddr-trace.py report_*.bin` to decode the reports.
+Use `sh tests/run.sh` for the release and matrix host checks with ASan and
+UBSan. Host checks simulate the measured eye drift, compare the two-tap
+reads, exercise command cleanup and fallback, and run the matrix schedule.
+They cannot verify sleep, link stability, or the physical cause on the console.

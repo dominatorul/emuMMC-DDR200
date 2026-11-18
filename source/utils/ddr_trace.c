@@ -1,306 +1,250 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#include <string.h>
 #include <stdatomic.h>
+#include <string.h>
 #include "ddr_trace.h"
 #include "ddr_watchdog.h"
 #include "util.h"
-#include "../nx/svc.h"
 #include "../soc/clock.h"
 #include "../soc/gpio.h"
 #include "../soc/pinmux.h"
 #include "../soc/t210.h"
 
-enum { SnapshotWords = 24, SweepHistoryLength = 32, NoTemperature = 0x1FF };
-static _Atomic u32 snapshots[DdrSnapshotCount][SnapshotWords];
-static _Atomic u32 power_pins[DdrSnapshotCount][3];
-static _Atomic u32 first_maps[8], latest_maps[8];
-static _Atomic u64 checkpoint;
-static _Atomic u32 reads, writes, attempts, sweeps;
-static _Atomic u32 first_window, latest_window, first_card[2], latest_card[2];
-static _Atomic u32 first_khz, latest_khz, ready_khz, io_errors;
-static _Atomic u32 last_full_window, last_reduced_window;
-static _Atomic u32 boot_power_recoveries;
-static _Atomic u64 first_io_error[3], latest_io_error[3];
-static _Atomic u64 first_error_hw, latest_error_hw;
-static _Atomic u32 read_recovery_attempts, read_recovery_successes, read_recovery_tap;
-static _Atomic u32 link_resets;
-static _Atomic u64 sweep_history[SweepHistoryLength];
-static u64 first_sweep_us;
-/* SD commands include both the SD filesystem and emulated NAND. The outer
-   FS counters select only SD filesystem I/O, including mutex wait time. */
-enum { PerfCalls, PerfBlocks, PerfElapsed, PerfDma, PerfBounce, PerfErrors, PerfFields };
-static _Atomic u64 sd_perf[2][PerfFields], fs_perf[2][3];
-static _Atomic u32 perf_clock[5];
+enum {
+    HistoryCount = 48,
+#ifdef EMUMMC_DDR200_MATRIX
+    MatrixCount = 40,
+#else
+    MatrixCount = 0,
+#endif
+    RuntimeCount = HistoryCount - MatrixCount
+};
+typedef struct {
+    _Atomic u64 timing;
+    _Atomic u64 settings;
+} sweep_event_t;
 
-/* SD operations serialize trace writes. Atomic reads let a watchdog capture
-   the current trace even while a worker owns both storage mutexes. */
-void ddr_trace_stage(enum DdrStage next, u32 info)
+static sweep_event_t history[HistoryCount];
+static u64 trace_started;
+static _Atomic u32 runtime_events, matrix_events;
+static _Atomic u32 reads, writes, reasserts, io_errors, ready_khz;
+static _Atomic u32 boot_power_recoveries, waiting_native;
+static _Atomic u32 verify_attempts, verify_passed, verify_pair;
+static _Atomic u32 recovery_attempts, recovery_passed;
+static _Atomic u32 hygiene_attempts, hygiene_passed, hygiene_last;
+static _Atomic u32 function_status;
+static _Atomic u64 checkpoint, functions, ladder, bytes_since_reassert;
+static _Atomic u64 first_failure[2], last_failure[2];
+static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
+static _Atomic u64 matrix_status;
+static _Atomic u64 bus_registers, clock_registers;
+static _Atomic u64 native_before, native_after;
+static _Atomic u32 sampled_rate;
+
+void ddr_trace_stage(enum DdrStage stage, u32 detail)
 {
-    atomic_store_explicit(&checkpoint, ((u64)next << 32) | info, memory_order_relaxed);
-    if (next == DdrReady)
-        ready_khz = info;
+    atomic_store_explicit(&checkpoint, ((u64)stage << 32) | detail, memory_order_relaxed);
+    if (stage == DdrReady)
+        ready_khz = detail;
 }
 
 void ddr_trace_host(enum DdrSnapshot slot, const sdmmc_t *host)
 {
-    const bool live = host->regs && clock_sdmmc_is_not_reset_and_enabled(SDMMC_1);
-    const t210_sdmmc_t *regs = host->regs;
-    const u32 values[SnapshotWords] = {
-        1u | (live ? 2u : 0u) | (host->t210b01 ? 4u : 0u),
-        CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1),
-        CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE),
-        CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC),
-        CLOCK(CLK_RST_CONTROLLER_RST_DEVICES_L),
-        CLOCK(CLK_RST_CONTROLLER_CLK_OUT_ENB_L),
-        APB_MISC(APB_MISC_GP_SDMMC1_PAD_CFGPADCTRL),
-        APB_MISC(APB_MISC_GP_SDMMC1_CLK_LPBK_CONTROL),
-        PINMUX_AUX(PINMUX_AUX_SDMMC1_CLK),
-        PINMUX_AUX(PINMUX_AUX_SDMMC1_CMD),
-        PINMUX_AUX(PINMUX_AUX_SDMMC1_DAT0),
-        sdmmc_get_sd_power_enabled(),
-        live ? ((u32)regs->hostctl2 << 16) | regs->clkcon : 0,
-        live ? ((u32)regs->hostctl << 8) | regs->pwrcon : 0,
-        live ? regs->venclkctl : 0,
-        live ? regs->ventunctl0 : 0,
-        live ? regs->ventunctl1 : 0,
-        live ? regs->autocalcfg : 0,
-        live ? regs->autocalsts : 0,
-        live ? regs->sdmemcmppadctl : 0,
-        live ? regs->veniotrimctl : 0,
-        live ? regs->iospare : 0,
-        live ? regs->venmiscctl : 0,
-        live ? ((u32)regs->errintsts << 16) | regs->norintsts : 0,
-    };
-    for (u32 i = 1; i < SnapshotWords; ++i)
-        atomic_store_explicit(&snapshots[slot][i], values[i], memory_order_relaxed);
-    power_pins[slot][0] = gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4);
-    power_pins[slot][1] = PINMUX_AUX(PINMUX_AUX_DMIC3_CLK);
-    power_pins[slot][2] = gpio_get_pin_state(GPIO_PORT_Z, GPIO_PIN_1);
-    atomic_store_explicit(&snapshots[slot][0], values[0], memory_order_release);
+    if (slot != DdrBeforeOpen && slot != DdrAfterOpen && slot != DdrReassert)
+        return;
+    u32 power = gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4);
+    u32 mux = PINMUX_AUX(PINMUX_AUX_DMIC3_CLK);
+    bool live = host->regs && clock_sdmmc_is_not_reset_and_enabled(SDMMC_1);
+    u64 state = ((u64)mux << 32) | ((u64)power << 16) | (live ? host->regs->hostctl2 : 0);
+    if (slot == DdrAfterOpen)
+        native_after = state;
+    else
+        native_before = state;
 }
 
-static u32 cpu_temperature_code(void)
+static void record_event(u8 kind, u32 khz, ddr_eye_t eye, unsigned tap, u8 drive, u64 time)
 {
-    enum {
-        SocThermBase = 0x700E2000, SocThermClock = 1u << 14,
-        Cpu0Config = 0xC4, Cpu0Status = 0xD0,
-    };
-    const u32 enabled = 1u << 31;
-    if (!(CLOCK(CLK_RST_CONTROLLER_CLK_OUT_ENB_U) & SocThermClock) ||
-        (CLOCK(CLK_RST_CONTROLLER_RST_DEVICES_U) & SocThermClock))
-        return NoTemperature;
+    if (!trace_started)
+        trace_started = time;
+    bool experimental = kind >= DdrSweepNoise;
+    _Atomic u32 *count = experimental ? &matrix_events : &runtime_events;
+    unsigned capacity = experimental ? MatrixCount : RuntimeCount;
+    if (!capacity)
+        return;
+    unsigned index = *count % capacity + (experimental ? RuntimeCount : 0);
+    u64 elapsed = MIN(time - trace_started, 0xffffffffull);
+    u64 bytes = MIN(bytes_since_reassert, 0xffffffffull);
+    history[index].timing = elapsed | (bytes << 32);
+    history[index].settings = (khz / 10) | ((u64)MIN(reasserts, 255u) << 16) |
+        ((u64)kind << 24) | ((u64)eye.left << 32) | ((u64)eye.right << 40) |
+        ((u64)(tap < DdrTapCount ? tap : 255) << 48) | ((u64)drive << 56);
+    ++*count;
+}
 
-    u64 mapped, size;
-    Result result = emuMMC_ctx.fs_ver >= FS_VER_10_0_0
-        ? svcQueryIoMapping(&mapped, &size, SocThermBase, 0x1000)
-        : svcLegacyQueryIoMapping(&mapped, SocThermBase, 0x1000);
-    if (result)
-        return NoTemperature;
-    const volatile u32 *therm = (const volatile u32 *)(uintptr_t)mapped;
-    if (!(therm[Cpu0Config / 4] & enabled))
-        return NoTemperature;
-    u32 value = therm[Cpu0Status / 4];
-    if (!(value & enabled))
-        return NoTemperature;
-
-    /* Tegra's readback uses an 8-bit magnitude, a half-degree bit and a sign. */
-    int halves = (value >> 7) & 0x1FF;
-    if (value & 1)
-        halves = -halves;
-    return halves >= -256 && halves < 255 ? (u32)(halves + 256) : NoTemperature;
+void ddr_trace_policy_sweep(const sdmmc_t *host, ddr_eye_t eye, unsigned tap, u8 kind, u8 drive, u64 started)
+{
+    record_event(kind, host->divisor, eye, tap, drive, started);
+    bus_registers = ((u64)host->divisor << 32) | ((u32)host->regs->hostctl2 << 16) | host->regs->clkcon;
+    clock_registers = ((u64)CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1) << 32) | host->regs->venclkctl;
 }
 
 void ddr_trace_tuning(sdmmc_t *host, const u32 raw[4], const u32 complete[4],
-                      u32 count, u32 tap, u32 width)
+                      u32 count, u32 tap, u32 width, u32 selected)
 {
-    u32 khz = host->divisor;
-    /* 9 bits for count (128 is valid), then 8 for tap, then width. */
-    latest_window = count | (tap << 9) | (width << 17);
-    latest_khz = khz;
-    if (khz == SDMMC_DDR200_RECOVERY_CARD_KHZ)
-        last_reduced_window = latest_window;
-    else
-        last_full_window = latest_window;
-    for (u32 i = 0; i < 4; ++i) {
-        atomic_store_explicit(&latest_maps[i], raw[i], memory_order_relaxed);
-        atomic_store_explicit(&latest_maps[i + 4], complete[i], memory_order_relaxed);
-    }
-    u64 now = get_tmr_us();
-    if (!sweeps)
-        first_sweep_us = now;
-    u64 centiseconds = (now - first_sweep_us) / 10000;
-    u32 environment = cpu_temperature_code() |
-        ((u32)(khz == SDMMC_DDR200_RECOVERY_CARD_KHZ) << 9) |
-        ((sdmmc_get_io_power(host) & 3u) << 10);
-    /* One atomic record preserves the window and its conditions together. */
-    sweep_history[sweeps % SweepHistoryLength] = tap | (width << 8) |
-        (MIN(attempts, 255u) << 16) | (MIN(io_errors, 255u) << 24) |
-        ((u64)environment << 32) | (MIN(centiseconds, 0xFFFFu) << 48);
-    if (++sweeps == 1) {
-        first_window = latest_window;
-        first_khz = khz;
-        for (u32 i = 0; i < 4; ++i) {
-            atomic_store_explicit(&first_maps[i], raw[i], memory_order_relaxed);
-            atomic_store_explicit(&first_maps[i + 4], complete[i], memory_order_relaxed);
-        }
-    }
+    (void)raw;
+    (void)complete;
+    (void)count;
+    unsigned start = width ? tap - (width - 1) / 2 : DdrTapCount;
+    ddr_eye_t eye = {start, width ? start + width - 1 : 0};
+    ddr_trace_policy_sweep(host, eye, selected, DdrSweepInitial, 0, get_tmr_us());
+}
+
+void ddr_trace_ladder(enum DdrRate rate, bool ready, bool unstable, unsigned upgrades)
+{
+    ladder = (u64)rate | ((u64)ready << 8) | ((u64)unstable << 9) | ((u64)upgrades << 16);
+    record_event(DdrSweepLadder, 0, (ddr_eye_t){rate, ready}, 255,
+                 (u8)(unstable ? 0x80 | upgrades : upgrades), get_tmr_us());
+}
+
+void ddr_trace_verify(unsigned tap, unsigned second, bool passed)
+{
+    verify_pair = (tap << 8) | second;
+    ++verify_attempts;
+    if (passed)
+        ++verify_passed;
+}
+
+void ddr_trace_hygiene(bool stopped, bool ready, bool reset)
+{
+    hygiene_last = stopped | ((u32)ready << 1) | ((u32)reset << 2);
+    ++hygiene_attempts;
+    if (reset)
+        ++hygiene_passed;
+}
+
+void ddr_trace_functions(u16 drive, u16 power, u8 selected_drive, u8 selected_power)
+{
+    functions = ((u64)drive << 32) | power | ((u32)selected_drive << 16) | ((u32)selected_power << 24);
 }
 
 void ddr_trace_card(const u8 *status, bool selected)
 {
-    /* CMD6 neutral query and SET response, one word each. Byte 16 holds
-       command-system and access-mode fields. Bytes 10/11 advertise group 2. */
-    u32 packed = ((u32)status[16] << 24) | ((u32)status[13] << 16) |
-        ((u32)status[10] << 8) | status[11];
-    latest_card[selected] = packed;
-    if (!sweeps)
-        first_card[selected] = packed;
+    if (selected)
+        function_status = ((u32)status[16] << 8) | status[15];
 }
 
 void ddr_trace_io(bool write)
 {
-    if (write) ++writes;
-    else ++reads;
+    if (write)
+        ++writes;
+    else
+        ++reads;
 }
 
-void ddr_trace_io_error(const sdmmc_t *host, u32 command, u32 blocks)
+void ddr_trace_io_error(const sdmmc_t *host, u32 cmd, u32 blocks)
 {
-    latest_io_error[0] = ((u64)host->command_failure << 32) | command;
-    latest_io_error[1] = ((u64)host->divisor << 32) | host->command_irq;
-    latest_io_error[2] = ((u64)host->regs->prnsts << 32) | blocks;
-    latest_error_hw = ((u64)host->regs->venclkctl << 32) |
-        ((u32)host->regs->hostctl2 << 16) | host->command_auto_stop_error;
+    u32 tap = (host->regs->venclkctl >> 16) & 0xff;
+    last_failure[0] = ((u64)host->divisor << 32) | host->command_irq;
+    last_failure[1] = ((u64)host->command_auto_stop_error << 48) |
+        ((u64)tap << 40) | ((u64)host->command_failure << 32) | (cmd << 16) | MIN(blocks, 0xffffu);
     if (++io_errors == 1) {
-        for (u32 i = 0; i < 3; ++i)
-            first_io_error[i] = latest_io_error[i];
-        first_error_hw = latest_error_hw;
+        first_failure[0] = last_failure[0];
+        first_failure[1] = last_failure[1];
     }
 }
 
 void ddr_trace_read_recovery(const sdmmc_t *host, bool succeeded)
 {
-    if (succeeded) {
-        read_recovery_tap = (host->regs->venclkctl >> 16) & 0xFF;
-        ++read_recovery_successes;
-    } else {
-        ++read_recovery_attempts;
-    }
+    (void)host;
+    if (succeeded)
+        ++recovery_passed;
+    else
+        ++recovery_attempts;
 }
-
-void ddr_trace_link_reset(void) { ++link_resets; }
 
 void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool copied,
-                       u32 blocks, u64 elapsed_us, u64 dma_us)
+                       u32 blocks, u64 elapsed, u64 dma)
 {
-    _Atomic u64 *totals = sd_perf[write];
-    u64 calls = atomic_fetch_add_explicit(&totals[PerfCalls], 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&totals[PerfElapsed], elapsed_us, memory_order_relaxed);
-    atomic_fetch_add_explicit(&totals[PerfDma], dma_us, memory_order_relaxed);
-    if (!succeeded) {
-        atomic_fetch_add_explicit(&totals[PerfErrors], 1, memory_order_relaxed);
+    (void)copied;
+    (void)dma;
+    u64 previous_time = atomic_fetch_add_explicit(&sd_stats[write][1], elapsed, memory_order_relaxed);
+    if (!succeeded)
         return;
-    }
-    atomic_fetch_add_explicit(&totals[PerfBlocks], blocks, memory_order_relaxed);
-    if (copied)
-        atomic_fetch_add_explicit(&totals[PerfBounce], blocks, memory_order_relaxed);
-
-    /* Sample concrete clock registers periodically and on clock changes. */
-    if (!(calls & 255) || perf_clock[0] != host->divisor) {
-        perf_clock[0] = host->divisor;
-        perf_clock[1] = CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1);
-        perf_clock[2] = CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE);
-        perf_clock[3] = ((u32)host->regs->hostctl2 << 16) | host->regs->clkcon;
-        perf_clock[4] = host->regs->venclkctl;
+    u64 total = atomic_fetch_add_explicit(&sd_stats[write][0], blocks, memory_order_relaxed);
+    atomic_fetch_add_explicit(&bytes_since_reassert, (u64)blocks * 512, memory_order_relaxed);
+    if (!previous_time || (total >> 12) != ((total + blocks) >> 12) || sampled_rate != host->divisor) {
+        sampled_rate = host->divisor;
+        bus_registers = ((u64)host->divisor << 32) | ((u32)host->regs->hostctl2 << 16) | host->regs->clkcon;
+        clock_registers = ((u64)CLOCK(CLK_RST_CONTROLLER_CLK_SOURCE_SDMMC1) << 32) | host->regs->venclkctl;
     }
 }
 
-void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed_us)
+void ddr_trace_fs_perf(bool write, u32 blocks, u64 elapsed)
 {
-    atomic_fetch_add_explicit(&fs_perf[write][PerfCalls], 1, memory_order_relaxed);
-    atomic_fetch_add_explicit(&fs_perf[write][PerfBlocks], blocks, memory_order_relaxed);
-    atomic_fetch_add_explicit(&fs_perf[write][PerfElapsed], elapsed_us, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fs_stats[write][0], blocks, memory_order_relaxed);
+    atomic_fetch_add_explicit(&fs_stats[write][1], elapsed, memory_order_relaxed);
 }
 
-void ddr_trace_reassert(void) { ++attempts; }
-
-void ddr_trace_boot_power(void)
+void ddr_trace_reassert(void)
 {
-    ddr_trace_stage(DdrBootPower, ++boot_power_recoveries);
+    ++reasserts;
+    bytes_since_reassert = 0;
+}
+
+void ddr_trace_boot_power(void) { ddr_trace_stage(DdrBootPower, ++boot_power_recoveries); }
+void ddr_trace_wait_native(void) { ++waiting_native; }
+
+void ddr_trace_matrix(enum DdrMatrixStage state, unsigned phase, u32 detail)
+{
+    matrix_status = ((u64)detail << 32) | ((u64)phase << 8) | state;
+}
+
+void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed)
+{
+    matrix_stats[reduced][0] += blocks;
+    matrix_stats[reduced][1] += elapsed;
 }
 
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
-    ctx->gprs[0] = 0x444452323030000Dull;
-    ctx->gprs[1] = atomic_load_explicit(&checkpoint, memory_order_relaxed);
+    ctx->gprs[0] = 0x444452323030000full;
+    ctx->gprs[1] = checkpoint;
     ctx->gprs[2] = ((u64)reads << 32) | writes;
-    ctx->gprs[3] = ((u64)attempts << 32) | sweeps;
-    ctx->gprs[4] = ((u64)first_window << 32) | latest_window;
-    ctx->gprs[5] = ((u64)first_card[0] << 32) | first_card[1];
-    ctx->gprs[6] = ((u64)latest_card[0] << 32) | latest_card[1];
-    ctx->gprs[7] = ((u64)first_khz << 32) | latest_khz;
-    for (u32 i = 0; i < 4; ++i) {
-        ctx->gprs[8 + i] = ((u64)first_maps[2 * i + 1] << 32) | first_maps[2 * i];
-        ctx->gprs[12 + i] = ((u64)latest_maps[2 * i + 1] << 32) | latest_maps[2 * i];
+    ctx->gprs[3] = ((u64)reasserts << 32) | runtime_events;
+    ctx->gprs[4] = ((u64)matrix_events << 32) | MatrixCount;
+    ctx->gprs[5] = functions;
+    ctx->gprs[6] = ((u64)io_errors << 32) | ready_khz;
+    ctx->gprs[7] = last_failure[1];
+    ctx->gprs[8] = last_failure[0];
+    ctx->gprs[9] = first_failure[1];
+    ctx->gprs[10] = first_failure[0];
+    ctx->gprs[11] = ((u64)hygiene_attempts << 32) | ((u64)MIN(hygiene_passed, 0xffffffu) << 8) | hygiene_last;
+    ctx->gprs[12] = ((u64)verify_attempts << 32) | ((u64)MIN(verify_passed, 0xffffu) << 16) | verify_pair;
+    ctx->gprs[13] = ((u64)waiting_native << 32) | boot_power_recoveries;
+    for (unsigned i = 0; i < 2; ++i) {
+        ctx->gprs[14 + i * 2] = sd_stats[i][0];
+        ctx->gprs[15 + i * 2] = sd_stats[i][1];
+        ctx->gprs[18 + i * 2] = fs_stats[i][0];
+        ctx->gprs[19 + i * 2] = fs_stats[i][1];
+        ctx->gprs[22 + i] = ((u64)MIN(matrix_stats[i][1], 0xffffffffull) << 32) | matrix_stats[i][0];
     }
-    ctx->gprs[16] = ((u64)io_errors << 32) | ready_khz;
-    for (u32 i = 0; i < 3; ++i) {
-        ctx->gprs[17 + i] = first_io_error[i];
-        ctx->gprs[20 + i] = latest_io_error[i];
-    }
-    ctx->gprs[23] = ((u64)last_full_window << 32) | last_reduced_window;
-    /* Use reserved report space while leaving actual stack lengths zero. */
     ddr_watchdog_report(&ctx->gprs[24]);
-    ctx->gprs[28] = boot_power_recoveries;
-    ctx->gprs[29] = first_error_hw;
-    ctx->gprs[30] = latest_error_hw;
-    ctx->gprs[31] = ((u64)read_recovery_tap << 56) |
-        ((u64)MIN(read_recovery_successes, 0xFFFFFFu) << 32) |
-        (MIN(link_resets, 0xFFFFu) << 16) | MIN(read_recovery_attempts, 0xFFFFu);
-    struct {
-        u32 tuning[2][SnapshotWords];
-        u32 handoff[3][4];
-        u64 sweeps[SweepHistoryLength];
-    } saved;
-    for (u32 slot = 0; slot < DdrSnapshotCount; ++slot) {
-        u32 flags = atomic_load_explicit(&snapshots[slot][0], memory_order_acquire);
-        if (slot < DdrBeforeOpen) {
-            saved.tuning[slot][0] = flags;
-            for (u32 i = 1; i < SnapshotWords; ++i)
-                saved.tuning[slot][i] = atomic_load_explicit(&snapshots[slot][i], memory_order_relaxed);
-        } else {
-            u32 *handoff = saved.handoff[slot - DdrBeforeOpen];
-            handoff[0] = flags;
-            handoff[1] = atomic_load_explicit(&snapshots[slot][1], memory_order_relaxed);  /* CAR source */
-            handoff[2] = atomic_load_explicit(&snapshots[slot][12], memory_order_relaxed); /* host mode and divider */
-            handoff[3] = atomic_load_explicit(&snapshots[slot][14], memory_order_relaxed); /* tap and trim */
-        }
+    ctx->gprs[28] = bus_registers;
+    ctx->gprs[29] = clock_registers;
+    ctx->gprs[30] = ladder | ((u64)function_status << 32);
+    ctx->gprs[31] = matrix_status;
+    ctx->afsr0 = native_before >> 16;
+    ctx->afsr1 = native_after >> 16;
+    ctx->esr = (MIN(recovery_attempts, 0xffffu) << 16) | MIN(recovery_passed, 0xffffu);
+
+    u64 data[HistoryCount][2];
+    for (unsigned i = 0; i < HistoryCount; ++i) {
+        data[i][0] = history[i].timing;
+        data[i][1] = history[i].settings;
     }
-    for (u32 i = 0; i < SweepHistoryLength; ++i)
-        saved.sweeps[i] = atomic_load_explicit(&sweep_history[i], memory_order_relaxed);
-    _Static_assert(sizeof(saved) <= sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump), "trace too large");
-    memcpy(ctx->stack_trace, &saved, sizeof(ctx->stack_trace));
-    memcpy(ctx->stack_dump, (const u8 *)&saved + sizeof(ctx->stack_trace),
-        sizeof(saved) - sizeof(ctx->stack_trace));
-    /* The reserved TLS dump holds GPIO input, drive and pinmux state. */
-    u32 pins[DdrSnapshotCount][3];
-    for (u32 slot = 0; slot < DdrSnapshotCount; ++slot)
-        for (u32 i = 0; i < 3; ++i)
-            pins[slot][i] = atomic_load_explicit(&power_pins[slot][i], memory_order_relaxed);
-    _Static_assert(sizeof(pins) <= sizeof(ctx->tls), "GPIO trace too large");
-    memcpy(ctx->tls, pins, sizeof(pins));
-    u64 performance[2 * PerfFields + 2 * 3];
-    for (u32 dir = 0; dir < 2; ++dir) {
-        for (u32 i = 0; i < PerfFields; ++i)
-            performance[dir * PerfFields + i] = atomic_load_explicit(&sd_perf[dir][i], memory_order_relaxed);
-        for (u32 i = 0; i < 3; ++i)
-            performance[2 * PerfFields + dir * 3 + i] = atomic_load_explicit(&fs_perf[dir][i], memory_order_relaxed);
-    }
-    u32 clocks[5];
-    for (u32 i = 0; i < 5; ++i)
-        clocks[i] = atomic_load_explicit(&perf_clock[i], memory_order_relaxed);
-    _Static_assert(sizeof(pins) + sizeof(performance) + sizeof(clocks)
-        <= sizeof(ctx->tls), "performance trace too large");
-    memcpy(ctx->tls + sizeof(pins), performance, sizeof(performance));
-    memcpy(ctx->tls + sizeof(pins) + sizeof(performance), clocks, sizeof(clocks));
+    _Static_assert(sizeof(data) == sizeof(ctx->stack_trace) + sizeof(ctx->stack_dump) + sizeof(ctx->tls),
+        "sweep trace capacity");
+    memcpy(ctx->stack_trace, data, sizeof(ctx->stack_trace));
+    memcpy(ctx->stack_dump, data + 16, sizeof(ctx->stack_dump));
+    memcpy(ctx->tls, data + 32, sizeof(ctx->tls));
 }

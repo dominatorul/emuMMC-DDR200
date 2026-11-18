@@ -37,18 +37,6 @@ sdmmc_accessor_t *_current_accessor = NULL;
 bool sdmmc_memcpy_buf = false;
 extern bool custom_driver;
 
-#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
-#ifndef EMUMMC_FORCE_DDR200
-/* Keep the last stable DDR200 profile across native FS reopen and suspend. */
-static bool sd_ddr200_reduced;
-#endif
-static int _sd_storage_train_DDR200(sdmmc_storage_t *storage);
-#ifdef EMUMMC_FORCE_DDR200
-int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group, u32 arg);
-int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf);
-#endif
-#endif
-
 static inline u32 unstuff_bits(u32 *resp, u32 start, u32 size)
 {
 	const u32 mask = (size < 32 ? 1 << size : 0) - 1;
@@ -271,37 +259,62 @@ static int _sdmmc_storage_check_status(sdmmc_storage_t *storage)
 	return _sdmmc_storage_get_status(storage, &tmp, 0);
 }
 
-static int _sdmmc_storage_readwrite_ex(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors, void *buf, u32 is_write)
+bool sdmmc_storage_wait_ready(sdmmc_storage_t *storage, u64 deadline)
 {
-	u32 tmp = 0;
-	sdmmc_cmd_t cmdbuf;
-	sdmmc_req_t reqbuf;
+	sdmmc_t *host = storage->sdmmc;
+	if (host->deadline_us)
+		deadline = MIN(deadline, host->deadline_us);
+	do {
+		u32 response;
+		if (_sdmmc_storage_get_status(storage, &response, 0) &&
+		    (response & R1_READY_FOR_DATA))
+			return true;
+		usleep(1000);
+	} while (get_tmr_us() < deadline);
+	return false;
+}
 
-	sdmmc_init_cmd(&cmdbuf, is_write ? MMC_WRITE_MULTIPLE_BLOCK : MMC_READ_MULTIPLE_BLOCK, sector, SDMMC_RSP_TYPE_1, 0);
+static bool stop_failed_transfer(sdmmc_storage_t *storage)
+{
+	sdmmc_t *host = storage->sdmmc;
+	u64 previous = host->deadline_us;
+	host->deadline_us = get_tmr_us() + 250000;
+	if (previous)
+		host->deadline_us = MIN(host->deadline_us, previous);
 
-	reqbuf.buf = buf;
-	reqbuf.num_sectors = num_sectors;
-	reqbuf.blksize = 512;
-	reqbuf.is_write = is_write;
-	reqbuf.is_multi_block = 1;
-	reqbuf.is_auto_cmd12 = 1;
+	u32 response;
+	bool stopped = sdmmc_stop_transmission(host, &response);
+	bool ready = stopped && sdmmc_storage_wait_ready(storage, host->deadline_us);
+	bool reset = ready && sdmmc_reset_transfer(host);
+	host->deadline_us = previous;
+	ddr_trace_hygiene(stopped, ready, reset);
+	return reset;
+}
 
-	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, blkcnt_out))
-	{
-		sdmmc_t *host = storage->sdmmc;
-		u32 failure = host->command_failure;
-		u32 irq = host->command_irq;
-		if (host->id == SDMMC_1)
-			ddr_trace_io_error(host, cmdbuf.cmd, num_sectors);
-		sdmmc_stop_transmission(storage->sdmmc, &tmp);
-		_sdmmc_storage_get_status(storage, &tmp, 0);
-		host->command_failure = failure;
-		host->command_irq = irq;
+int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors, void *buf, u32 is_write)
+{
+	sdmmc_t *host = storage->sdmmc;
+	sdmmc_cmd_t cmd;
+	sdmmc_init_cmd(&cmd, is_write ? MMC_WRITE_MULTIPLE_BLOCK : MMC_READ_MULTIPLE_BLOCK,
+		sector, SDMMC_RSP_TYPE_1, 0);
+	sdmmc_req_t req = {
+		.buf = buf, .num_sectors = num_sectors, .blksize = 512,
+		.is_write = is_write, .is_multi_block = 1, .is_auto_cmd12 = 1,
+	};
+	if (sdmmc_execute_cmd(host, &cmd, &req, blkcnt_out))
+		return 1;
 
-		return 0;
+	u32 failure = host->command_failure;
+	u32 irq = host->command_irq;
+	if (host->id == SDMMC_1)
+		ddr_trace_io_error(host, cmd.cmd, num_sectors);
+	if (failure >= DdrCommandResponse && !stop_failed_transfer(storage)) {
+		storage->ddr.ready = false;
+		storage->ddr.rate = DdrRateUnknown;
 	}
-
-	return 1;
+	host->command_failure = failure;
+	host->command_irq = irq;
+	return 0;
 }
 
 int sdmmc_storage_end(sdmmc_storage_t *storage)
@@ -315,187 +328,36 @@ int sdmmc_storage_end(sdmmc_storage_t *storage)
 	return idle;
 }
 
-#ifdef EMUMMC_FORCE_DDR200
-static bool _sd_storage_ddr200_ready_for_retry(const sdmmc_storage_t *storage)
-{
-	sdmmc_t *host = storage->sdmmc;
-	return host->id == SDMMC_1 && storage->csd.busspeed == 200 &&
-		sdmmc_get_sd_power_enabled() && clock_sdmmc_is_not_reset_and_enabled(SDMMC_1) &&
-		(host->regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED &&
-		sdmmc_get_io_power(host) == SDMMC_POWER_1_8 &&
-		sdmmc_get_bus_width(host) == SDMMC_BUS_WIDTH_4;
-}
-
-static bool _sdmmc_read_timing_error(const sdmmc_t *host)
-{
-	return host->command_failure == DdrCommandTransfer &&
-		((host->command_irq >> 16) & (SDHCI_ERR_INT_DATA_CRC | SDHCI_ERR_INT_DATA_END_BIT));
-}
-
-static int _sd_storage_reset_DDR200_link(sdmmc_storage_t *storage)
-{
-	sdmmc_t *host = storage->sdmmc;
-	if (!_current_accessor || !_current_accessor->parent)
-		return 0;
-	int index = sdmmc_calculate_fitting_dma_index(_current_accessor, 1);
-	sdmmc_dma_buffer_t *pool = &_current_accessor->parent->dmaBuffers[index];
-	u8 saved[512], status[64];
-	if (!pool->device_addr_buffer || pool->device_addr_buffer_size < sizeof(saved))
-		return 0;
-
-	/* CMD6 falls back to this DMA sector for its local status buffer. */
-	armDCacheFlush(pool->device_addr_buffer, sizeof(saved));
-	memcpy(saved, pool->device_addr_buffer, sizeof(saved));
-	ddr_trace_link_reset();
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-	int ready = 0;
-	ddr_trace_stage(DdrResetLink, 0);
-	if (!sdmmc_setup_ddr200_clock(host, true) ||
-	    !sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK) ||
-	    !_sdmmc_storage_check_status(storage))
-		goto out;
-
-	/* Keep DDR signaling for the switch command's status block. The card
-	   takes the new command system after the status block and eight clocks. */
-	ddr_trace_stage(DdrResetLink, 1);
-	if (!_sd_storage_switch(storage, status, SD_SWITCH_CHECK, SD_SWITCH_GRP_CMDSYS, 0) || status[16] != 0)
-		goto out;
-	ddr_trace_stage(DdrResetLink, 2);
-	if (!_sd_storage_switch(storage, status, SD_SWITCH_SET, SD_SWITCH_GRP_CMDSYS, 0) || status[16] != 0)
-		goto out;
-	ddr_trace_stage(DdrResetLink, 3);
-	if (sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR12))
-		ready = _sd_storage_enable_DDR200(storage, status);
-
-out:
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
-	memcpy(pool->device_addr_buffer, saved, sizeof(saved));
-	armDCacheFlush(pool->device_addr_buffer, sizeof(saved));
-	if (!ready)
-		storage->initialized = 0;
-	return ready;
-}
-
-static int _sd_storage_read_DDR200_taps(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
-{
-	sdmmc_t *host = storage->sdmmc;
-	/* Confirm each candidate under real DMA and normal clock gating. */
-	for (u32 attempt = 0; ; ++attempt) {
-		if (_sdmmc_storage_readwrite_ex(storage, blocks, sector, count, buf, 0)) {
-			ddr_trace_read_recovery(host, true);
-			return 1;
-		}
-		if (attempt == host->ddr200_retry_count || !_sdmmc_read_timing_error(host) ||
-		    !_sd_storage_ddr200_ready_for_retry(storage))
-			return 0;
-		sdmmc_set_ddr200_tap(host, host->ddr200_retry_taps[attempt]);
-	}
-}
-
-static int _sd_storage_retry_DDR200_read(sdmmc_storage_t *storage, u32 *blocks, u32 sector, u32 count, void *buf)
-{
-	sdmmc_t *host = storage->sdmmc;
-	bool timing_error = _sdmmc_read_timing_error(host);
-	ddr_trace_read_recovery(host, false);
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
-	int tuned = _sd_storage_train_DDR200(storage);
-	sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
-	if (tuned) {
-		if (_sd_storage_read_DDR200_taps(storage, blocks, sector, count, buf))
-			return 1;
-		timing_error = _sdmmc_read_timing_error(host);
-	}
-
-	if (!timing_error || !_sd_storage_ddr200_ready_for_retry(storage) || !_sd_storage_reset_DDR200_link(storage))
-		return 0;
-	return _sd_storage_read_DDR200_taps(storage, blocks, sector, count, buf);
-}
-#endif
-
 static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf, u32 is_write)
 {
-	u8 *bbuf = (u8 *)buf;
-	u32 sct_off = sector;
-	u32 sct_total = num_sectors;
-	bool first_reinit = true;
-
-	// Exit if not initialized.
+	u8 *bytes = buf;
+	bool sd = storage->sdmmc->id == SDMMC_1;
 	if (!storage->initialized)
 		return 0;
 
-	while (sct_total)
-	{
-		u32 blkcnt = 0;
-		u32 count = MIN(sct_total, 0xFFFF);
-#ifdef EMUMMC_FORCE_DDR200
-		sdmmc_t *host = storage->sdmmc;
-#endif
-		// Retry 5 times if failed.
-		u32 retries = 5;
-		do
-		{
-#ifndef EMUMMC_FORCE_DDR200
-reinit_try:
-#endif
-			if (_sdmmc_storage_readwrite_ex(storage, &blkcnt, sct_off, count, bbuf, is_write))
-				goto out;
-#ifdef EMUMMC_FORCE_DDR200
-			if (!is_write && _sdmmc_read_timing_error(host) && _sd_storage_ddr200_ready_for_retry(storage))
-				break;
-#endif
-			retries--;
-
-			msleep(50);
-		} while (retries);
-
-#ifdef EMUMMC_FORCE_DDR200
-		/* Recovery changes only the powered card's signaling and retries reads. */
-		if (!first_reinit || is_write || host->command_failure < DdrCommandResponse ||
-		    !_sd_storage_ddr200_ready_for_retry(storage))
+	while (num_sectors) {
+		if (sd && !sdmmc_ddr200_before_io(storage, sector))
 			return 0;
-		blkcnt = 0;
-		first_reinit = false;
-		if (!_sd_storage_retry_DDR200_read(storage, &blkcnt, sct_off, count, bbuf))
-			return 0;
-		goto out;
-#else
-		// Disk IO failure! Reinit SD Card to a lower speed.
-		if (storage->sdmmc->id == SDMMC_1)
-		{
-			int res;
-
-			if (first_reinit)
-				res = nx_sd_initialize(true);
-			else
-				res = nx_sd_init_retry(true);
-
-			// Reset values for a retry.
-			blkcnt = 0;
-			retries = 3;
-			first_reinit = false;
-
-			// If succesful reinit, restart xfer.
-			if (res)
-			{
-				bbuf = (u8 *)buf;
-				sct_off = sector;
-				sct_total = num_sectors;
-				count = MIN(sct_total, 0xFFFF);
-
-				goto reinit_try;
-			}
+		u32 count = MIN(num_sectors, 0xFFFF);
+		u32 blocks = 0;
+		u64 started = get_tmr_us();
+		for (unsigned attempt = 0;
+		     !sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
+		     ++attempt) {
+			/* Retune and verify before any retry. A failed write could have
+			   programmed some blocks, so report its error to FS. */
+			if (attempt == 3 || !sd || !sdmmc_ddr200_recover(storage, sector, attempt != 0) || is_write)
+				return 0;
+			blocks = 0;
 		}
-#endif
-
-		// Failed.
-		return 0;
-
-out:
-		sct_off += blkcnt;
-		sct_total -= blkcnt;
-		bbuf += 512 * blkcnt;
+		if (!blocks || blocks > count)
+			return 0;
+		if (sd)
+			sdmmc_ddr200_count_io(storage, blocks, get_tmr_us() - started);
+		sector += blocks;
+		num_sectors -= blocks;
+		bytes += blocks * 512u;
 	}
-
 	return 1;
 }
 
@@ -1167,50 +1029,29 @@ int _sd_storage_get_scr(sdmmc_storage_t *storage, u8 *buf)
 
 int _sd_storage_switch_get(sdmmc_storage_t *storage, void *buf)
 {
-	sdmmc_cmd_t cmdbuf;
-	sdmmc_init_cmd(&cmdbuf, SD_SWITCH, 0xFFFFFF, SDMMC_RSP_TYPE_1, 0);
+	return sdmmc_sd_switch(storage, buf, 0x00ffffff);
+}
 
-	sdmmc_req_t reqbuf;
-	reqbuf.buf = buf;
-	reqbuf.blksize = 64;
-	reqbuf.num_sectors = 1;
-	reqbuf.is_write = 0;
-	reqbuf.is_multi_block = 0;
-	reqbuf.is_auto_cmd12 = 0;
-
-	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, 0))
-		return 0;
-
-	u32 tmp = 0;
-	sdmmc_get_rsp(storage->sdmmc, &tmp, 4, SDMMC_RSP_TYPE_1);
-	return _sdmmc_storage_check_result(tmp);
+int sdmmc_sd_switch(sdmmc_storage_t *storage, u8 *status, u32 argument)
+{
+	sdmmc_cmd_t cmd;
+	sdmmc_init_cmd(&cmd, SD_SWITCH, argument, SDMMC_RSP_TYPE_1, 0);
+	sdmmc_req_t req = {.buf = status, .blksize = 64, .num_sectors = 1};
+	u32 response;
+	return sdmmc_execute_cmd(storage->sdmmc, &cmd, &req, NULL) &&
+		sdmmc_get_rsp(storage->sdmmc, &response, sizeof(response), SDMMC_RSP_TYPE_1) &&
+		_sdmmc_storage_check_result(response);
 }
 
 int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group, u32 arg)
 {
-	sdmmc_cmd_t cmdbuf;
-	u32 switchcmd = (u32)mode << 31 | 0x00FFFFFF;
-	switchcmd &= ~(0xF << (group * 4));
-	switchcmd |= arg << (group * 4);
-	sdmmc_init_cmd(&cmdbuf, SD_SWITCH, switchcmd, SDMMC_RSP_TYPE_1, 0);
-
-	sdmmc_req_t reqbuf;
-	reqbuf.buf = buf;
-	reqbuf.blksize = 64;
-	reqbuf.num_sectors = 1;
-	reqbuf.is_write = 0;
-	reqbuf.is_multi_block = 0;
-	reqbuf.is_auto_cmd12 = 0;
-
-	if (!sdmmc_execute_cmd(storage->sdmmc, &cmdbuf, &reqbuf, 0))
-		return 0;
-
-	u32 tmp = 0;
-	sdmmc_get_rsp(storage->sdmmc, &tmp, 4, SDMMC_RSP_TYPE_1);
-	return _sdmmc_storage_check_result(tmp);
+	u32 argument = (u32)mode << 31 | 0x00FFFFFF;
+	argument &= ~(0xF << (group * 4));
+	argument |= arg << (group * 4);
+	return sdmmc_sd_switch(storage, buf, argument);
 }
 
-void _sd_storage_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf)
+void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf)
 {
 	u32 pwr = SD_SET_CURRENT_LIMIT_200;
 
@@ -1276,74 +1117,6 @@ DPRINTF("[SD] card max current over limit\n");
 	return 0;
 }
 
-#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
-static int _sd_storage_train_DDR200_clock(sdmmc_storage_t *storage, bool reduced)
-{
-	sdmmc_t *host = storage->sdmmc;
-	ddr_trace_stage(DdrSetClock, reduced);
-	if (!sdmmc_setup_ddr200_clock(host, reduced) ||
-	    !sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_DDR200, MMC_SEND_TUNING_BLOCK))
-		return 0;
-	ddr_trace_stage(DdrCheckStatus, host->divisor);
-	if (!_sdmmc_storage_check_status(storage))
-		return 0;
-	ddr_trace_stage(DdrReady, host->divisor);
-	return 1;
-}
-
-static int _sd_storage_train_DDR200(sdmmc_storage_t *storage)
-{
-#ifdef EMUMMC_FORCE_DDR200
-	if (_sd_storage_train_DDR200_clock(storage, false))
-		return 1;
-
-	/* Native FS can leave different pad state. Restore the same settings
-	   used by reassertion, then give full rate one fresh sweep. */
-	sdmmc_ddr200_restore_host_cfg(storage->sdmmc);
-	return _sd_storage_train_DDR200_clock(storage, false);
-#else
-	if (!sd_ddr200_reduced && _sd_storage_train_DDR200_clock(storage, false))
-		return 1;
-	sd_ddr200_reduced = true;
-	return _sd_storage_train_DDR200_clock(storage, true);
-#endif
-}
-
-int _sd_storage_enable_DDR200(sdmmc_storage_t *storage, u8 *buf)
-{
-	u32 cmd_system = UHS_DDR200_BUS_SPEED;
-
-	ddr_trace_stage(DdrCheckFunction, 0);
-	if (!_sd_storage_switch(storage, buf, SD_SWITCH_CHECK, SD_SWITCH_GRP_CMDSYS, cmd_system))
-		return 0;
-
-	u32 system_out = (buf[16] >> 4) & 0xF;
-	if (system_out != cmd_system)
-		return 0;
-
-DPRINTF("[SD] supports DDR200 mode\n");
-
-	u16 total_pwr_consumption = ((u16)buf[0] << 8) | buf[1];
-DPRINTF("[SD] total max current: %d\n", total_pwr_consumption);
-
-	if (total_pwr_consumption > 800)
-	{
-DPRINTF("[SD] card max current over limit\n");
-		return 0;
-	}
-
-	ddr_trace_stage(DdrSetFunction, 0);
-	if (!_sd_storage_switch(storage, buf, SD_SWITCH_SET, SD_SWITCH_GRP_CMDSYS, cmd_system))
-		return 0;
-	ddr_trace_card(buf, true);
-
-	if (system_out != ((buf[16] >> 4) & 0xF))
-		return 0;
-DPRINTF("[SD] card accepted DDR200\n");
-
-	return _sd_storage_train_DDR200(storage);
-}
-#endif
 
 int _sd_storage_enable_uhs_low_volt(sdmmc_storage_t *storage, u32 type, u8 *buf)
 {
@@ -1365,17 +1138,14 @@ DPRINTF("[SD] access: %02X, current: %02X\n", access_mode, current_limit);
 #endif
 
 	// Try to raise the current limit to let the card perform better.
-	_sd_storage_set_current_limit(storage, current_limit, buf);
+	sdmmc_sd_set_current_limit(storage, current_limit, buf);
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 	if (type == SDHCI_TIMING_UHS_DDR200)
 	{
 		if (cmd_system & SD_MODE_UHS_DDR200)
 		{
-			if (!_sd_storage_enable_DDR200(storage, buf))
-				return 0;
-			storage->csd.busspeed = 200;
-			return 1;
+			return sdmmc_ddr200_initial(storage, buf);
 		}
 
 #ifdef EMUMMC_FORCE_DDR200
@@ -1461,7 +1231,7 @@ int _sd_storage_enable_hs_high_volt(sdmmc_storage_t *storage, u8 *buf)
 	u16 current_limit = buf[7] | buf[6] << 8;
 
 	// Try to raise the current limit to let the card perform better.
-	_sd_storage_set_current_limit(storage, current_limit, buf);
+	sdmmc_sd_set_current_limit(storage, current_limit, buf);
 
 	if (!(access_mode & SD_MODE_HIGH_SPEED))
 		return 1;
@@ -1668,6 +1438,10 @@ DPRINTF("[SD] enabled HS\n");
 	if (storage->csd.busspeed != 200 || sdmmc_get_bus_width(sdmmc) != SDMMC_BUS_WIDTH_4)
 		return 0;
 #endif
+	if (!storage->ddr.capable) {
+		storage->ddr.rate = DdrRateSdr104;
+		storage->ddr.ready = true;
+	}
 	storage->initialized = 1;
 	ddr_trace_stage(DdrReady, sdmmc->divisor);
 

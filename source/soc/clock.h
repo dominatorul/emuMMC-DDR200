@@ -164,7 +164,7 @@ void clock_disable(const sclock_t *clk);
 /*! Clock control for specific hardware portions. */
 void clock_enable_i2c5();
 void clock_disable_i2c5();
-void clock_sdmmc_config_clock_source(u32 *pclock, u32 id, u32 val);
+bool clock_sdmmc_config_clock_source(u32 *pclock, u32 id, u32 val);
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 void clock_sdmmc_invalidate_clock_source(u32 id);
 #endif

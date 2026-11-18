@@ -5,7 +5,7 @@
 #include "fatal.h"
 
 #define OP_TIMEOUT_US 15000000u
-#define BUTTON_HOLD_US 2000000u
+#define BUTTON_HOLD_US 3000000u
 #define SUSPEND_GAP_US 2000000u
 #define POLL_NS 100000000
 
@@ -23,6 +23,12 @@ typedef struct {
 static op_slot_t slots[SlotCount];
 static _Alignas(16) u8 watchdog_stack[0x4000];
 static _Atomic(volatile const u32 *) button_input;
+
+bool ddr_watchdog_volume_down(void)
+{
+    const volatile u32 *input = atomic_load_explicit(&button_input, memory_order_acquire);
+    return input && ((*input & ((1u << 6) | (1u << 7))) == (1u << 6));
+}
 
 static u32 find_slot(uintptr_t thread)
 {
@@ -124,8 +130,10 @@ static void watchdog_entry(void *unused)
         }
         last_poll = now;
 
+#ifdef EMUMMC_FORCE_DDR200
         if (oldest_operation(now).age >= OP_TIMEOUT_US)
             fatal_abort(Fatal_DdrStalled);
+#endif
 
         /* Volume buttons X6/X7 are active low. Arm after both are released. */
         u32 volume = *input & ((1u << 6) | (1u << 7));
@@ -146,10 +154,17 @@ void ddr_watchdog_start(volatile const u32 *buttons)
 {
     Handle thread;
     atomic_store_explicit(&button_input, buttons, memory_order_release);
-    if (svcCreateThread(&thread, watchdog_entry, NULL, watchdog_stack + sizeof(watchdog_stack), 0x10, 3))
+    Result result = svcCreateThread(&thread, watchdog_entry, NULL, watchdog_stack + sizeof(watchdog_stack), 0x10, 3);
+    if (!result) {
+        result = svcStartThread(thread);
+        svcCloseHandle(thread);
+    }
+#ifdef EMUMMC_FORCE_DDR200
+    if (result)
         fatal_abort(Fatal_DdrWatchdog);
-    if (svcStartThread(thread))
-        fatal_abort(Fatal_DdrWatchdog);
+#else
+    (void)result;
+#endif
 }
 
 void ddr_watchdog_report(u64 *out)

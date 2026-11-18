@@ -235,6 +235,9 @@ typedef struct _sdmmc_t
 	u16 command_auto_stop_error;
 	u8 ddr200_retry_taps[3];
 	u8 ddr200_retry_count;
+	bool ddr200_use_lower_tap;
+	bool ddr200_scan_gated;
+	u64 deadline_us;
 	u64 last_dma_idx;
 	u64 dma_addr_next;
 	u32 dma_boundaries_left;
@@ -273,11 +276,13 @@ int  sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type);
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 int  sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced);
 void sdmmc_set_ddr200_tap(sdmmc_t *sdmmc, u32 tap);
+u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 complete[4]);
 #endif
 void sdmmc_card_clock_powersave(sdmmc_t *sdmmc, int powersave_enable);
 int  sdmmc_get_rsp(sdmmc_t *sdmmc, u32 *rsp, u32 size, u32 type);
 int  sdmmc_tuning_execute(sdmmc_t *sdmmc, u32 type, u32 cmd);
 int  sdmmc_stop_transmission(sdmmc_t *sdmmc, u32 *rsp);
+bool sdmmc_reset_transfer(sdmmc_t *sdmmc);
 int  sdmmc_get_sd_power_enabled();
 bool sdmmc_get_sd_inserted();
 int  sdmmc_init(sdmmc_t *sdmmc, u32 id, u32 power, u32 bus_width, u32 type, int powersave_enable);

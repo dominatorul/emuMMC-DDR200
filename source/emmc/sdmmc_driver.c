@@ -17,6 +17,7 @@
 
 #include <string.h>
 #include "mmc.h"
+#include "sd.h"
 #include "sdmmc.h"
 #include "../nx/cache.h"
 #include "../power/max7762x.h"
@@ -266,20 +267,31 @@ out:;
 	return result;
 }
 
+static u64 _sdmmc_limit_ms(const sdmmc_t *sdmmc, u64 timeout)
+{
+	return sdmmc->deadline_us ? MIN(timeout, (sdmmc->deadline_us + 999) / 1000) : timeout;
+}
+
 static void _sdmmc_reset(sdmmc_t *sdmmc)
 {
 	sdmmc->regs->swrst |= SDHCI_RESET_CMD | SDHCI_RESET_DATA;
 	_sdmmc_commit_changes(sdmmc);
-	u64 timeout = get_tmr_ms() + 2000;
+	u64 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 	while ((sdmmc->regs->swrst & (SDHCI_RESET_CMD | SDHCI_RESET_DATA)) && get_tmr_ms() < timeout)
 		;
+}
+
+bool sdmmc_reset_transfer(sdmmc_t *sdmmc)
+{
+	_sdmmc_reset(sdmmc);
+	return !(sdmmc->regs->swrst & (SDHCI_RESET_CMD | SDHCI_RESET_DATA));
 }
 
 static void _sdmmc_reset_all(sdmmc_t *sdmmc)
 {
 	sdmmc->regs->swrst |= SDHCI_RESET_ALL;
 	_sdmmc_commit_changes(sdmmc);
-	u32 timeout = get_tmr_ms() + 2000;//100ms
+	u32 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);//100ms
 	while ((sdmmc->regs->swrst & SDHCI_RESET_ALL) && get_tmr_ms() < timeout)
 		;
 }
@@ -355,7 +367,8 @@ static int _sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type, u32 source_override)
 	clock_sdmmc_get_card_clock_div(&clock, &divisor, type);
 	if (source_override)
 		clock = source_override;
-	clock_sdmmc_config_clock_source(&clock, sdmmc->id, clock);
+	if (!clock_sdmmc_config_clock_source(&clock, sdmmc->id, clock))
+		return 0;
 	sdmmc->divisor = (clock + divisor - 1) / divisor;
 
 	//if divisor != 1 && divisor << 31 -> error
@@ -514,7 +527,7 @@ static int _sdmmc_wait_cmd_data_inhibit(sdmmc_t *sdmmc, bool wait_dat)
 {
 	_sdmmc_commit_changes(sdmmc);
 
-	u64 timeout = get_tmr_ms() + 2000;
+	u64 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 	while(sdmmc->regs->prnsts & SDHCI_CMD_INHIBIT)
 		if (get_tmr_ms() > timeout)
 		{
@@ -524,7 +537,7 @@ static int _sdmmc_wait_cmd_data_inhibit(sdmmc_t *sdmmc, bool wait_dat)
 
 	if (wait_dat)
 	{
-		timeout = get_tmr_ms() + 2000;
+		timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 		while (sdmmc->regs->prnsts & SDHCI_DATA_INHIBIT)
 			if (get_tmr_ms() > timeout)
 			{
@@ -540,7 +553,7 @@ static int _sdmmc_wait_card_busy(sdmmc_t *sdmmc)
 {
 	_sdmmc_commit_changes(sdmmc);
 
-	u64 timeout = get_tmr_ms() + 2000;
+	u64 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 	while (!(sdmmc->regs->prnsts & SDHCI_DATA_0_LVL_MASK))
 		if (get_tmr_ms() > timeout)
 		{
@@ -603,6 +616,8 @@ static int _sdmmc_send_cmd(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, bool is_data_presen
 		return 0;
 	}
 
+	if (cmd->cmd == MMC_STOP_TRANSMISSION)
+		cmdflags |= SDHCI_CMD_ABORTCMD;
 	if (is_data_present)
 		cmdflags |= SDHCI_CMD_DATA;
 	sdmmc->regs->argument = cmd->arg;
@@ -655,6 +670,8 @@ static int _sdmmc_tuning_execute_once(sdmmc_t *sdmmc, u32 cmd, u32 tap)
 	_sdmmc_commit_changes(sdmmc);
 
 	u64 timeout = get_tmr_us() + 5000;
+	if (sdmmc->deadline_us)
+		timeout = MIN(timeout, sdmmc->deadline_us);
 	while (get_tmr_us() < timeout)
 	{
 		if (sdmmc->regs->norintsts & SDHCI_INT_DATA_AVAIL)
@@ -756,7 +773,21 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 	u32 best_size;
 	u32 best_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &best_size);
 	int pass = best_size >= SDMMC_SAMPLE_WIN_SIZE_MIN;
-	ddr_trace_tuning(sdmmc, tuning->raw, tuning->result, tuning->iter_done, best_tap, best_size);
+	u32 selected_tap = best_tap;
+#ifdef EMUMMC_FORCE_DDR200
+	/* After Horizon takes over, this card lost the high side of its full-rate
+	   window. Select an interior tap on the low side of the measured run. */
+	bool prefer_lower = sdmmc->ddr200_use_lower_tap &&
+		sdmmc->divisor != SDMMC_DDR200_RECOVERY_CARD_KHZ;
+	if (pass && prefer_lower)
+		selected_tap = sdmmc_tuning_lower_quarter(best_tap, best_size);
+#endif
+	if (pass) {
+		sdmmc_set_ddr200_tap(sdmmc, selected_tap);
+		selected_tap = (sdmmc->regs->venclkctl >> 16) & 0xFF;
+	}
+	ddr_trace_tuning(sdmmc, tuning->raw, tuning->result, tuning->iter_done, best_tap,
+		best_size, pass ? selected_tap : SDMMC_INVALID_TAP);
 
 	_sdmmc_manual_tuning_log(sdmmc, tuning, best_tap, best_size, pass);
 
@@ -767,60 +798,78 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 #ifdef EMUMMC_FORCE_DDR200
 	/* On a read CRC error, try a separate passing window first, then two
 	   interior taps from the winning window. Keep the eight-tap minimum. */
-	u32 start = best_tap - (best_size - 1) / 2;
+	u32 start = sdmmc_tuning_window_start(best_tap, best_size);
 	for (u32 tap = start; tap < start + best_size; ++tap)
 		tuning->result[tap / 32] &= ~(1u << (tap % 32));
 	u32 other_size;
 	u32 other_tap = sdmmc_tuning_select_window(tuning->result, tuning->iter_done, &other_size);
 	if (other_size >= SDMMC_SAMPLE_WIN_SIZE_MIN)
 		sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = other_tap;
-	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = best_tap - best_size / 4;
-	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = best_tap + best_size / 4;
+	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] =
+		prefer_lower ? best_tap : sdmmc_tuning_lower_quarter(best_tap, best_size);
+	sdmmc->ddr200_retry_taps[sdmmc->ddr200_retry_count++] = start + best_size - 1 - best_size / 4;
 #endif
-	sdmmc_set_ddr200_tap(sdmmc, best_tap);
 	return 1;
+}
+
+u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 complete[4])
+{
+	if (sdmmc->powersave_enabled || first >= end || end > 128)
+		return 0;
+
+	u32 saved_tap = (sdmmc->regs->venclkctl >> 16) & 0xFF;
+	u16 saved_tuned = sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK;
+	u16 saved_clock = sdmmc->regs->clkcon & SDHCI_CLOCK_CARD_EN;
+	sdmmc->regs->ventunctl1 = 0;
+	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFF1FFF) | (2 << 13);
+	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFFE03F) | (1 << 6);
+	sdmmc->regs->ventunctl0 |= TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
+	sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
+	sdmmc->regs->hostctl2 |= SDHCI_CTRL_EXEC_TUNING;
+
+	u32 tap = first;
+	for (; tap < end; ++tap) {
+		if (sdmmc->deadline_us && get_tmr_us() >= sdmmc->deadline_us)
+			break;
+		int finished = _sdmmc_tuning_execute_once(sdmmc, MMC_SEND_TUNING_BLOCK, tap);
+		if (sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK) {
+			raw[tap / 32] |= 1u << (tap % 32);
+			if (finished)
+				complete[tap / 32] |= 1u << (tap % 32);
+		}
+		if (!(sdmmc->regs->hostctl2 & SDHCI_CTRL_EXEC_TUNING)) {
+			++tap;
+			break;
+		}
+		if (sdmmc->ddr200_scan_gated) {
+			sdmmc->regs->clkcon &= ~SDHCI_CLOCK_CARD_EN;
+			_sdmmc_commit_changes(sdmmc);
+			usleep(1);
+		}
+	}
+	sdmmc->regs->hostctl2 = (sdmmc->regs->hostctl2 &
+		~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK)) | saved_tuned;
+	sdmmc_set_ddr200_tap(sdmmc, saved_tap);
+	sdmmc->regs->clkcon = (sdmmc->regs->clkcon & ~SDHCI_CLOCK_CARD_EN) | saved_clock;
+	return tap - first;
 }
 
 static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 {
 	static bool first = true;
+	if (cmd != MMC_SEND_TUNING_BLOCK)
+		return 0;
 	ddr_trace_stage(DdrSweep, sdmmc->divisor);
 	if (first) {
 		ddr_trace_host(DdrInitialTune, sdmmc);
 		first = false;
 	}
 	ddr_trace_host(DdrLatestTune, sdmmc);
-	sdmmc_manual_tuning_t manual_tuning = { 0 };
-	manual_tuning.num_iter = 128;
-
-	sdmmc->regs->ventunctl1  = 0; // step_size 1.
-	sdmmc->regs->ventunctl0  = (sdmmc->regs->ventunctl0 & 0xFFFF1FFF) | (2 << 13); // 128 Tries.
-	sdmmc->regs->ventunctl0  = (sdmmc->regs->ventunctl0 & 0xFFFFE03F) | (1 << 6);  // 1x Multiplier.
-	sdmmc->regs->ventunctl0 |= TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
-
-	sdmmc->regs->hostctl2   |= SDHCI_CTRL_EXEC_TUNING;
-
-	for (u32 i = 0; i < manual_tuning.num_iter; i++)
-	{
-		int completed = _sdmmc_tuning_execute_once(sdmmc, cmd, i);
-
-		u32 sampled = (sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK) ? 1 : 0;
-		manual_tuning.raw[i / 32] |= sampled << (i % 32);
-		if (completed && sampled)
-			manual_tuning.result[i / 32] |= 1u << (i % 32);
-
-		manual_tuning.iter_done = i + 1;
-
-		if (!(sdmmc->regs->hostctl2 & SDHCI_CTRL_EXEC_TUNING))
-			break;
-	}
-
-	int res = _sdmmc_manual_tuning_set_tap(sdmmc, &manual_tuning);
-	if (!res)
-		sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
-
-	return res;
+	sdmmc_manual_tuning_t tuning = {.num_iter = 128};
+	tuning.iter_done = sdmmc_scan_ddr200(sdmmc, 0, tuning.num_iter, tuning.raw, tuning.result);
+	return _sdmmc_manual_tuning_set_tap(sdmmc, &tuning);
 }
+
 #endif
 
 int sdmmc_tuning_execute(sdmmc_t *sdmmc, u32 type, u32 cmd)
@@ -885,7 +934,7 @@ static int _sdmmc_enable_internal_clock(sdmmc_t *sdmmc)
 	//Enable internal clock and wait till it is stable.
 	sdmmc->regs->clkcon |= SDHCI_CLOCK_INT_EN;
 	_sdmmc_commit_changes(sdmmc);
-	u64 timeout = get_tmr_ms() + 2000;
+	u64 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 	while (!(sdmmc->regs->clkcon & SDHCI_CLOCK_INT_STABLE))
 	{
 		if (get_tmr_ms() > timeout)
@@ -998,7 +1047,7 @@ static int _sdmmc_wait_response(sdmmc_t *sdmmc)
 {
 	_sdmmc_commit_changes(sdmmc);
 
-	u64 timeout = get_tmr_ms() + 2000;
+	u64 timeout = _sdmmc_limit_ms(sdmmc, get_tmr_ms() + 2000);
 	while (true)
 	{
 		int result = _sdmmc_check_mask_interrupt(sdmmc, NULL, SDHCI_INT_RESPONSE);
@@ -1119,7 +1168,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 {
 	u16 remaining = sdmmc->regs->blkcnt;
 	u64 now = get_tmr_ms();
-	u64 deadline = now + 5000;
+	u64 deadline = _sdmmc_limit_ms(sdmmc, now + 5000);
 	u64 stalled = now + 1500;
 	while (now < deadline && now < stalled) {
 		u16 intr;
@@ -1206,7 +1255,10 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 		if (req && result) {
 			sdmmc->command_failure = DdrCommandTransfer;
 			if (sdmmc->id == SDMMC_1)
-				ddr_trace_stage(DdrDma, ((u32)cmd->cmd << 16) | blkcnt);
+			{
+				u32 detail = cmd->cmd == SD_SWITCH ? ((cmd->arg >> 16) & 0x8000) | (cmd->arg & 0x0fff) : blkcnt;
+				ddr_trace_stage(DdrDma, ((u32)cmd->cmd << 16) | detail);
+			}
 			u64 dma_start = dma_us ? get_tmr_us() : 0;
 			result = _sdmmc_update_dma(sdmmc);
 			if (dma_us)
@@ -1256,14 +1308,12 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 int sdmmc_get_sd_power_enabled(void)
 {
 	u32 mux = PINMUX_AUX(PINMUX_AUX_DMIC3_CLK);
-	if (mux & PINMUX_INPUT_ENABLE)
-		return gpio_read(GPIO_PORT_E, GPIO_PIN_4);
-
-	/* The boot pinmux setup can disable the input buffer while keeping
-	   the GPIO output active. In that case IN is not a power indication. */
-	u32 output_high = GpioPinModeGpio | GpioPinOutputEnabled | GpioPinOutputHigh;
-	return !(mux & PINMUX_TRISTATE) &&
-		(gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4) & output_high) == output_high;
+	u32 pin = gpio_get_pin_state(GPIO_PORT_E, GPIO_PIN_4);
+	u32 driven = GpioPinModeGpio | GpioPinOutputEnabled;
+	if (!(mux & PINMUX_TRISTATE) && (pin & driven) == driven)
+		return (pin & GpioPinOutputHigh) &&
+			(!(mux & PINMUX_INPUT_ENABLE) || (pin & GpioPinInputHigh));
+	return (mux & PINMUX_INPUT_ENABLE) && (pin & GpioPinInputHigh);
 }
 
 bool sdmmc_get_sd_inserted()

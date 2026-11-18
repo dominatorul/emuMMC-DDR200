@@ -11,7 +11,7 @@ STAGES = (
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
     'DMA polling', 'native SD power recovery', 'early SD power recovery', 'verify SD card identity',
-    'verify DMA buffers after native open', 'reset DDR200 command system',
+    'verify DMA buffers after native open', 'reset DDR200 command system', 'wait for Horizon SD power',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 PERF_OFFSET = 0x350 + len(SNAPSHOTS) * 12
@@ -22,6 +22,20 @@ LEGACY_SWEEPS = struct.Struct('<8I')
 SWEEP_OFFSET = 0x240
 SWEEP_HISTORY = struct.Struct('<32Q')
 HANDOFF_REGISTERS = ('flags', 'CAR.source', 'host.ctrl2_and_clock', 'vendor.clock')
+POLICY_SWEEPS = {
+    0: 'initial', 1: 'handoff', 2: 'periodic', 3: 'read recovery', 4: 'full-rate retry',
+    16: 'noise floor', 17: 'clock gated between taps', 18: 'clock on between taps',
+    19: 'CMD6 settle target 0 ms', 20: 'CMD6 settle target 10 ms', 21: 'CMD6 settle target 100 ms',
+    22: 'stream', 23: 'after idle', 24: 'drive strength', 25: 'CMD6 switch complete',
+}
+RATES = ('unavailable', 'SDR104', '166.40 MHz DDR200', '199.68 MHz DDR200')
+MATRIX_PHASES = ('noise floor', 'clock gating', 'free-running clock', 'stream',
+                 'idle', 'driver strength', 'throughput')
+MATRIX_STATES = ('pending', 'running', 'complete', 'skipped', 'interrupted')
+MATRIX_FLAGS = ('DMA window or sector range unavailable', 'full-rate transfer failed',
+                'reduced-rate transfer failed', '30-second idle not reached',
+                'drive strength test failed', 'requested rate or power unavailable',
+                '64 MiB stream ended early')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',
                     'command response', 'DMA transfer', 'card busy')
 OPERATIONS = ('none', 'read', 'write', 'controller open', 'controller close')
@@ -58,8 +72,9 @@ def print_performance(data):
               f'{fs_elapsed / 1e6:.3f}s including lock wait and recovery')
 
 
-def print_sweeps(data, sweeps, full_khz):
+def print_sweeps(data, sweeps, full_khz, trace_version):
     history = SWEEP_HISTORY.unpack_from(data, SWEEP_OFFSET)
+    taps = data[LEGACY_SWEEP_OFFSET:LEGACY_SWEEP_OFFSET + len(history)] if trace_version >= 14 else None
     omitted = max(0, sweeps - len(history))
     if omitted:
         print(f'{omitted} early sweeps exceed the report history capacity')
@@ -69,6 +84,9 @@ def print_sweeps(data, sweeps, full_khz):
         width = (sample >> 8) & 0xFF
         start = tap - (width - 1) // 2
         interval = f', passing taps {start}–{start + width - 1}' if width else ''
+        if taps is not None:
+            applied = taps[i % len(history)]
+            interval += f', applied tap {applied}' if applied != 0xFF else ', no tap applied'
         env = (sample >> 32) & 0xFFFF
         khz = 166400 if env & 0x200 else full_khz
         volts = ('off', '1.8 V', '3.3 V', 'unknown')[(env >> 10) & 3]
@@ -80,6 +98,90 @@ def print_sweeps(data, sweeps, full_khz):
               f'CPU temperature {temperature}, SD I/O setting {volts}')
 
 
+def print_policy_trace(data, gprs):
+    if len(data) < 0x450:
+        raise ValueError('report is too short for the DDR200 policy trace')
+    matrix_capacity = gprs[4] & 0xFFFFFFFF
+    if matrix_capacity not in (0, 40):
+        raise ValueError('invalid DDR200 trace capacity')
+    state = gprs[30]
+    print(f'Policy {RATES[state & 3]}, ready {bool(state & 0x100)}, '
+          f'full rate unstable {bool(state & 0x200)}, upgrade attempts {(state >> 16) & 0xFF}')
+    print(f'Last verified SD clock {(gprs[6] & 0xFFFFFFFF) / 1000:.2f} MHz, '
+          f'last sampled data/scan clock {(gprs[28] >> 32) / 1000:.2f} MHz, '
+          f'HC2/clock {gprs[28] & 0xFFFFFFFF:08X}, CAR source {gprs[29] >> 32:08X}, '
+          f'vendor clock {gprs[29] & 0xFFFFFFFF:08X}')
+    print(f'CMD6 group 3 supported {gprs[5] >> 32:#06x}, selected {(gprs[5] >> 16) & 0xFF}, '
+          f'group 4 supported {gprs[5] & 0xFFFF:#06x}, selected {(gprs[5] >> 24) & 0xFF}')
+    errors = gprs[6] >> 32
+    print(f'Data command failures {errors}')
+    if errors:
+        for label, meta, status in (('First', gprs[9], gprs[10]), ('Last', gprs[7], gprs[8])):
+            print(f'{label} failed CMD{(meta >> 16) & 0xFFFF}, tap {(meta >> 40) & 0xFF}, '
+                  f'{(status >> 32) / 1000:.2f} MHz, error {(status >> 16) & 0xFFFF:04X}, '
+                  f'IRQ {status & 0xFFFF:04X}, Auto CMD12 {meta >> 48:04X}, blocks {meta & 0xFFFF}')
+    hygiene = gprs[11]
+    print(f'CMD12 / CMD13 / CMD-DAT reset passed {(hygiene >> 8) & 0xFFFFFF}/{hygiene >> 32}, '
+          f'last flags {hygiene & 7:03b}')
+    verify = gprs[12]
+    print(f'Two-tap data checks passed {(verify >> 16) & 0xFFFF}/{verify >> 32}, '
+          f'last pair {(verify >> 8) & 0xFF} and {verify & 0xFF}')
+    print(f'Early card power recoveries {gprs[13] & 0xFFFFFFFF}, waits for Horizon {gprs[13] >> 32}')
+    before, after, _ = struct.unpack_from('<III', data, 0x124)
+    for label, sample in (('Before handoff', before), ('After native open', after)):
+        print(f'{label} GPIO state {sample & 0xFFFF:04X}, power pinmux {sample >> 16:04X}')
+    for i, label in enumerate(('Read', 'Write')):
+        for base, name in ((14, 'SD command'), (18, 'SD filesystem')):
+            blocks, usec = gprs[base + i * 2:base + i * 2 + 2]
+            rate = f'{blocks * 512 / usec:.2f} MB/s' if usec else 'n/a'
+            print(f'{label} {name} {rate} across {blocks * 512 / 1048576:.2f} MiB since boot')
+    if matrix_capacity:
+        active = gprs[31]
+        phase = (active >> 8) & 0x7F
+        state_id = active & 0xFF
+        rate = '166.40' if active & (0x80 << 8) else '199.68'
+        matrix_state = MATRIX_STATES[state_id] if state_id < len(MATRIX_STATES) else str(state_id)
+        phase_name = MATRIX_PHASES[phase] if phase < len(MATRIX_PHASES) else str(phase)
+        print(f'Matrix {matrix_state}, {rate} MHz {phase_name}')
+        for bit, flag in enumerate(MATRIX_FLAGS):
+            if (active >> 32) & (1 << bit):
+                print(f'  {flag}')
+        for label, value in zip(('199.68', '166.40'), gprs[22:24]):
+            usec, blocks = value >> 32, value & 0xFFFFFFFF
+            result = f'{blocks * 512 / usec:.2f} MB/s' if usec else 'unavailable'
+            print(f'{label} MHz timed read {result}, {blocks * 512 / 1048576:.2f}/256 MiB '
+                  f'in {usec / 1e6:.3f}s of active commands')
+    runtime_capacity = 48 - matrix_capacity
+    for title, count, capacity, offset in (
+        ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
+        ('Matrix', gprs[4] >> 32, matrix_capacity, runtime_capacity),
+    ):
+        if not count or not capacity:
+            continue
+        print(f'{title} chronological trace')
+        if count > capacity:
+            print(f'  {count - capacity} earlier events exceeded capacity')
+        switched_at = None
+        for i in range(max(0, count - capacity), count):
+            usec, byte_count, clock, reasserts, kind, left, right, tap, drive = struct.unpack_from(
+                '<IIH6B', data, 0x150 + (offset + i % capacity) * 16)
+            if kind == 5:
+                print(f'  +{usec} us policy {RATES[left & 3]}, ready {bool(right)}, '
+                      f'unstable {bool(drive & 128)}, upgrade attempts {drive & 127}')
+                continue
+            if kind == 25:
+                switched_at = usec
+                print(f'  +{usec} us CMD6 switch complete at {clock / 100:.2f} MHz')
+                continue
+            eye = f'{left}–{right} ({right - left + 1})' if left <= right else 'unavailable'
+            applied = 'none' if tap == 255 else str(tap)
+            settle = f', began {(usec - switched_at) / 1000:.3f} ms after CMD6' if (
+                switched_at is not None and 19 <= kind <= 21) else ''
+            print(f'  +{usec} us {POLICY_SWEEPS.get(kind, kind)} at {clock / 100:.2f} MHz, '
+                  f'eye {eye}, applied tap {applied}, {byte_count} bytes since reassert {reasserts}, '
+                  f'card driver strength {drive}{settle}')
+
+
 def decode(path):
     data = path.read_bytes()
     if len(data) < 0x350:
@@ -87,18 +189,24 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 13:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 15:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
     if trace_version >= 10 and len(data) < LEGACY_SWEEP_OFFSET:
         raise ValueError(f'{path} is too short for a performance trace')
-    if 11 <= trace_version <= 12 and len(data) < LEGACY_SWEEP_OFFSET + LEGACY_SWEEPS.size:
+    if trace_version in (11, 12, 14) and len(data) < LEGACY_SWEEP_OFFSET + LEGACY_SWEEPS.size:
         raise ValueError(f'{path} is too short for a sweep history')
     has_rates = trace_version >= 7
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
+    if trace_version == 15:
+        if stage == STAGES.index('DMA polling') and ((gprs[1] >> 16) & 0xFFFF) == 6:
+            mode = 'SET' if gprs[1] & 0x8000 else 'CHECK'
+            print(f'  CMD6 {mode}, groups 3 to 1 function bits {gprs[1] & 0x0FFF:03x}')
+        print_policy_trace(data, gprs)
+        return
     if stage == STAGES.index('DMA polling'):
         print(f'  CMD{(gprs[1] >> 16) & 0xFFFF}, blocks {gprs[1] & 0xFFFF}')
     if stage == STAGES.index('native SD power recovery') and gprs[1] & 0xFFFFFFFF == 0x218:
@@ -156,7 +264,16 @@ def decode(path):
             print(f'Last recovered read passed at tap {gprs[31] >> 56}')
     if trace_version >= 13:
         first_khz, last_khz = gprs[7] >> 32, gprs[7] & 0xFFFFFFFF
-        print_sweeps(data, sweeps, max(first_khz, last_khz, gprs[16] & 0xFFFFFFFF))
+        print_sweeps(data, sweeps, max(first_khz, last_khz, gprs[16] & 0xFFFFFFFF), trace_version)
+        if trace_version >= 14:
+            commands = struct.unpack_from('<2Q', data, 0x340)
+            for label, entry in zip(('check', 'set'), commands):
+                if not entry >> 63:
+                    continue
+                phase = (entry >> 40) & 0xFF
+                result = (f'card status byte {(entry >> 32) & 0xFF:02X}' if entry & (1 << 48)
+                          else f'failed at {COMMAND_FAILURES[phase] if phase < len(COMMAND_FAILURES) else phase}')
+                print(f'Reset CMD6 {label}: {result}, error {(entry >> 16) & 0xFFFF:04X}, IRQ {entry & 0xFFFF:04X}')
     elif trace_version >= 11:
         history = LEGACY_SWEEPS.unpack_from(data, LEGACY_SWEEP_OFFSET)
         for i in range(max(0, sweeps - len(history)), sweeps):

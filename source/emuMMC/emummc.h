@@ -47,7 +47,6 @@ typedef void (*_lock_mutex)(void *mtx);
 typedef void (*_unlock_mutex)(void *mtx);
 
 bool sdmmc_initialize(void);
-void sdmmc_finalize(void);
 int sdmmc_nand_get_active_partition_index();
 sdmmc_accessor_t *sdmmc_accessor_get(int mmc_id);
 

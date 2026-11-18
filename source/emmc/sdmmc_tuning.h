@@ -2,6 +2,16 @@
 #pragma once
 #include "../utils/types.h"
 
+static inline u32 sdmmc_tuning_window_start(u32 center, u32 width)
+{
+    return center - (width - 1) / 2;
+}
+
+static inline u32 sdmmc_tuning_lower_quarter(u32 center, u32 width)
+{
+    return sdmmc_tuning_window_start(center, width) + width / 4;
+}
+
 static inline u32 sdmmc_tuning_select_window(const u32 *map, u32 count, u32 *size)
 {
 	u32 run = 0, best_size = 0, best_tap = 0;
