@@ -4,7 +4,10 @@ Do not use this unless you know what you are doing. This is wip and may do bad s
 *A SDMMC driver replacement for Nintendo's Filesystem Services, by **m4xw***  
 
 ### Supported Horizon Versions
-**1.0.0 - 22.5.0**
+**1.0.0 - 23.5.0**
+
+The DDR200 branch uses Hekate's direct Atmosphère launch. See
+[DDR200.md](DDR200.md) for the KIPM build and installation steps.
 
 ## Features
 * Arbitrary SDMMC backend selection  
