@@ -211,14 +211,28 @@ static void remember_functions(sdmmc_storage_t *storage, const u8 *status)
                         storage->ddr.drive, storage->ddr.power);
 }
 
+static bool check_ddr_switch(sdmmc_storage_t *storage, u8 status[64], u32 arg)
+{
+    return sdmmc_sd_switch(storage, status, arg) && status[16] == 0xe0 &&
+        ((unsigned)status[0] << 8 | status[1]) <= 800;
+}
+
 static bool enter_ddr(sdmmc_storage_t *storage, u8 status[64])
 {
     /* Check and set function 14 in command-system group 2. Access group 1
        stays at SDR12. The status block uses the preceding signaling. */
-    if (!sdmmc_sd_switch(storage, status, 0x00ffffef) || status[16] != 0xe0 ||
-        ((unsigned)status[0] << 8 | status[1]) > 800)
+    const u32 no_drive_change = 0x00ffffef;
+    u32 arg = no_drive_change;
+#ifdef EMUMMC_DDR200_PERF_TRIAL
+    /* Type A is group 3 function 1. Probe it while the bus is still SDR. */
+    const u32 type_a = 0x00fff1ef;
+    if ((storage->ddr.drive_support & SD_DRIVER_TYPE_A) &&
+        check_ddr_switch(storage, status, type_a) && (status[15] & 15) == 1)
+        arg = type_a;
+#endif
+    if (arg == no_drive_change && !check_ddr_switch(storage, status, arg))
         return false;
-    if (!sdmmc_sd_switch(storage, status, 0x80ffffef) || status[16] != 0xe0) {
+    if (!sdmmc_sd_switch(storage, status, arg | 0x80000000) || status[16] != 0xe0) {
         storage->ddr.rate = DdrRateUnknown;
         return false;
     }

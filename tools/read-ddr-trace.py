@@ -156,6 +156,14 @@ def print_policy_trace(data, gprs):
             result = f'{blocks * 512 / usec:.2f} MB/s' if usec else 'unavailable'
             print(f'{label} MHz timed read {result}, {blocks * 512 / 1048576:.2f}/256 MiB '
                   f'in {usec / 1e6:.3f}s of active commands')
+    if (gprs[0] & 0xFF) == 16:
+        blocks, usec = gprs[22] & 0xFFFFFFFF, gprs[22] >> 32
+        copied, dma_us = gprs[23] & 0xFFFFFFFF, gprs[23] >> 32
+        if blocks and usec and dma_us:
+            print(f'199.68 MHz reads of at least 256 KiB: {blocks * 512 / usec:.2f} MB/s '
+                  f'across {blocks / 2048:.2f} MiB')
+            print(f'DMA wait {dma_us / usec:.1%} of command time, DMA-window rate '
+                  f'{blocks * 512 / dma_us:.2f} MB/s, bounce-buffer data {copied / blocks:.1%}')
     runtime_capacity = 48 - matrix_capacity
     for title, count, capacity, offset in (
         ('Runtime', gprs[3] & 0xFFFFFFFF, runtime_capacity, 0),
@@ -199,7 +207,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 15:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 16:
         raise ValueError(f'{path} does not contain a Fusee DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')
@@ -211,7 +219,7 @@ def decode(path):
     stage = gprs[1] >> 32
     print(f'{path}\nFS title {title:016X}, reason {reason:08X}')
     print(f'Stage {STAGES[stage] if stage < len(STAGES) else stage}, detail {gprs[1] & 0xFFFFFFFF:#x}')
-    if trace_version == 15:
+    if trace_version >= 15:
         if stage == STAGES.index('DMA polling') and ((gprs[1] >> 16) & 0xFFFF) == 6:
             mode = 'SET' if gprs[1] & 0x8000 else 'CHECK'
             print(f'  CMD6 {mode}, groups 3 to 1 function bits {gprs[1] & 0x0FFF:03x}')

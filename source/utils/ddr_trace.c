@@ -35,6 +35,9 @@ static _Atomic u32 function_status;
 static _Atomic u64 checkpoint, functions, ladder, bytes_since_reassert;
 static _Atomic u64 first_failure[2], last_failure[2];
 static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+static _Atomic u64 large_read_blocks, large_read_us, large_read_dma_us, large_read_copied;
+#endif
 static _Atomic u64 matrix_status;
 static _Atomic u64 bus_registers, clock_registers;
 static _Atomic u64 native_before, native_after;
@@ -170,6 +173,16 @@ void ddr_trace_sd_perf(const sdmmc_t *host, bool write, bool succeeded, bool cop
     if (!succeeded)
         return;
     u64 total = atomic_fetch_add_explicit(&sd_stats[write][0], blocks, memory_order_relaxed);
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+    if (!write && host->divisor == 199680 && (host->regs->hostctl2 & 7) == UHS_DDR50_BUS_SPEED &&
+        blocks >= DdrVerifyBlocks) {
+        large_read_blocks += blocks;
+        large_read_us += elapsed;
+        large_read_dma_us += dma;
+        if (copied)
+            large_read_copied += blocks;
+    }
+#endif
     atomic_fetch_add_explicit(&bytes_since_reassert, (u64)blocks * 512, memory_order_relaxed);
     if (!previous_time || (total >> 12) != ((total + blocks) >> 12) || sampled_rate != host->divisor) {
         sampled_rate = host->divisor;
@@ -212,7 +225,11 @@ void ddr_trace_matrix_transfer(bool reduced, u32 blocks, u64 elapsed)
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 {
     ctx->report_identifier = get_tmr_us();
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+    ctx->gprs[0] = 0x4444523230300010ull;
+#else
     ctx->gprs[0] = 0x444452323030000full;
+#endif
     ctx->gprs[1] = checkpoint;
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)reasserts << 32) | runtime_events;
@@ -233,6 +250,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
         ctx->gprs[19 + i * 2] = fs_stats[i][1];
         ctx->gprs[22 + i] = ((u64)MIN(matrix_stats[i][1], 0xffffffffull) << 32) | matrix_stats[i][0];
     }
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+    ctx->gprs[22] = (MIN(large_read_us, 0xffffffffull) << 32) | MIN(large_read_blocks, 0xffffffffull);
+    ctx->gprs[23] = (MIN(large_read_dma_us, 0xffffffffull) << 32) | MIN(large_read_copied, 0xffffffffull);
+#endif
     ddr_watchdog_report(&ctx->gprs[24]);
     ctx->gprs[28] = bus_registers;
     ctx->gprs[29] = clock_registers;

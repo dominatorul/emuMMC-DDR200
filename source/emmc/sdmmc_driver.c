@@ -1018,9 +1018,6 @@ static void _sdmmc_mask_interrupts(sdmmc_t *sdmmc)
 static int _sdmmc_check_mask_interrupt(sdmmc_t *sdmmc, u16 *pout, u16 mask)
 {
 	u16 norintsts = sdmmc->regs->norintsts;
-	u16 errintsts = sdmmc->regs->errintsts;
-
-DPRINTF("norintsts %08X, errintsts %08X\n", norintsts, errintsts);
 
 	if (pout)
 		*pout = norintsts;
@@ -1028,6 +1025,7 @@ DPRINTF("norintsts %08X, errintsts %08X\n", norintsts, errintsts);
 	// Check for error interrupt.
 	if (norintsts & SDHCI_INT_ERROR)
 	{
+		u16 errintsts = sdmmc->regs->errintsts;
 		sdmmc->command_irq = ((u32)errintsts << 16) | norintsts;
 		if (errintsts & SDHCI_ERR_INT_AUTO_CMD_ERR)
 			sdmmc->command_auto_stop_error = sdmmc->regs->acmd12errsts;
@@ -1170,6 +1168,7 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 	u64 now = get_tmr_ms();
 	u64 deadline = _sdmmc_limit_ms(sdmmc, now + 5000);
 	u64 stalled = now + 1500;
+	unsigned polls = 0;
 	while (now < deadline && now < stalled) {
 		u16 intr;
 		int result = _sdmmc_check_mask_interrupt(sdmmc, &intr,
@@ -1188,11 +1187,15 @@ static int _sdmmc_update_dma(sdmmc_t *sdmmc)
 			sdmmc->regs->admaaddr_hi = (u32)(sdmmc->dma_addr_next >> 32);
 			sdmmc->dma_addr_next += 0x80000;
 		}
-		now = get_tmr_ms();
-		u16 next_remaining = sdmmc->regs->blkcnt;
-		if (next_remaining < remaining) {
-			remaining = next_remaining;
-			stalled = now + 1500;
+		/* Keep the boundary interrupt hot path to one status read.
+		   A short cadence is enough for timeout and progress checks. */
+		if ((++polls & 31u) == 0) {
+			now = get_tmr_ms();
+			u16 next_remaining = sdmmc->regs->blkcnt;
+			if (next_remaining < remaining) {
+				remaining = next_remaining;
+				stalled = now + 1500;
+			}
 		}
 	}
 

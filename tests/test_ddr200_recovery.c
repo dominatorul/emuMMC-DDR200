@@ -333,6 +333,9 @@ int main(void)
     full_eye = (ddr_eye_t){29, 44};
     assert(sdmmc_ddr200_handoff(&card) && tap_readback(&host) == 35 && verifies == 2);
     assert(strchr(flow, 'H'));
+#ifdef EMUMMC_DDR200_PERF_TRIAL
+    assert(card.ddr.drive == 1);
+#endif
 
     reset();
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 35});

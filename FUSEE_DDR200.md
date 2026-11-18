@@ -20,10 +20,13 @@ narrow windows every 32 MiB or 250 ms of busy time. Wider eyes and reduced
 DDR200 use a three-tap guard. Failed verification triggers normal fallback.
 
 The release clock uses PLLC4_OUT0 at 998.4 MHz, the SDMMC1 source divider
-of 2.5, and the SDHCI divider of 2, giving 199.68 MHz. The experimental
-**Fusee DDR200 (204 MHz PLLP trial)** entry uses an existing locked 408 MHz
-PLLP clock and SDHCI divide by 2. This changes the controller's mux and
-divider and lets a console test compare the two sources.
+of 2.5, and the SDHCI divider of 2, giving 199.68 MHz.
+The **Fusee DDR200 (199.68 MHz performance)** entry checks and selects
+the card's Type A driver strength as part of the SDR12-to-DDR200 switch
+when the card advertises it and accepts it in CMD6 CHECK. The report gives
+actual selected strength and separates DMA wait from total command time
+for successful reads of at least 256 KiB at 199.68 MHz. It also records
+what fraction of those reads needed a bounce buffer.
 
 The driver first repairs a failed data command with explicit CMD12, waits
 for CMD13 transfer state and READY_FOR_DATA, and resets CMD/DAT. Read recovery
