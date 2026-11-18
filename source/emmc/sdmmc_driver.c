@@ -1346,8 +1346,9 @@ static int _sdmmc_config_sdmmc1(bool t210b01)
 	usleep(10000);
 
 	// Enable SD card IO power.
-	max77620_regulator_set_voltage(REGULATOR_LDO2, 3300000);
-	max77620_regulator_enable(REGULATOR_LDO2, 1);
+	if (!max77620_regulator_set_voltage(REGULATOR_LDO2, 3300000) ||
+	    !max77620_regulator_enable(REGULATOR_LDO2, 1))
+		return 0;
 	usleep(1000);
 
 	// Set pad slew codes to get good quality clock.
@@ -1611,7 +1612,8 @@ int sdmmc_enable_low_voltage(sdmmc_t *sdmmc)
 	_sdmmc_commit_changes(sdmmc);
 
 	// Switch to 1.8V and wait for regulator to stabilize. Assume max possible wait needed.
-	max77620_regulator_set_voltage(REGULATOR_LDO2, 1800000);
+	if (!max77620_regulator_set_voltage(REGULATOR_LDO2, 1800000))
+		return 0;
 	usleep(150);
 
 	// Inform IO pads that we switched to 1.8V.

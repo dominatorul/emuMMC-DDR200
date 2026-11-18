@@ -39,6 +39,7 @@ extern bool custom_driver;
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 /* Keep the last stable DDR200 profile across native FS reopen and suspend. */
 static bool sd_ddr200_reduced;
+static int _sd_storage_train_DDR200(sdmmc_storage_t *storage);
 #endif
 
 static inline u32 unstuff_bits(u32 *resp, u32 start, u32 size)
@@ -335,16 +336,29 @@ reinit_try:
 		} while (retries);
 
 #ifdef EMUMMC_FORCE_DDR200
-		/* Do not downgrade or clobber a pending write via initialization DMA. */
-		if (!first_reinit || is_write)
+		/* PCV owns the PMIC after startup. Retry only reads, and retune an
+		   already powered DDR200 card without resetting voltage or power. */
+		sdmmc_t *host = storage->sdmmc;
+		if (!first_reinit || is_write || host->id != SDMMC_1 ||
+		    storage->csd.busspeed != 200 || host->command_failure < DdrCommandResponse ||
+		    !sdmmc_get_sd_power_enabled() || !clock_sdmmc_is_not_reset_and_enabled(SDMMC_1) ||
+		    (host->regs->hostctl2 & 7) != UHS_DDR50_BUS_SPEED ||
+		    sdmmc_get_io_power(host) != SDMMC_POWER_1_8 ||
+		    sdmmc_get_bus_width(host) != SDMMC_BUS_WIDTH_4)
 			return 0;
-		/* A setup failure will not be fixed by changing the card clock. */
-		if (storage->sdmmc->command_failure == DdrCommandDmaSetup)
+
+		sd_ddr200_reduced = true;
+		sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+		int tuned = _sd_storage_train_DDR200(storage);
+		sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+		if (!tuned)
 			return 0;
-		if (storage->sdmmc->id == SDMMC_1 && storage->csd.busspeed == 200 &&
-		    storage->sdmmc->command_failure >= DdrCommandResponse)
-			sd_ddr200_reduced = true;
-#endif
+
+		blkcnt = 0;
+		retries = 3;
+		first_reinit = false;
+		goto reinit_try;
+#else
 		// Disk IO failure! Reinit SD Card to a lower speed.
 		if (storage->sdmmc->id == SDMMC_1)
 		{
@@ -370,6 +384,7 @@ reinit_try:
 				goto reinit_try;
 			}
 		}
+#endif
 
 		// Failed.
 		return 0;

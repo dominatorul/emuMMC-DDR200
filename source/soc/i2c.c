@@ -91,6 +91,14 @@ static const u64 i2c_addrs[] = {
 	0x7000D100  // I2C_6.
 };
 
+/* The early boot path uses I2C5 before the native SD power service takes over. */
+static bool boot_bus_released;
+
+void i2c_release_boot_bus(void)
+{
+	boot_bus_released = true;
+}
+
 static void _i2c_load_cfg_wait(vu32 *base)
 {
 	base[I2C_CONFIG_LOAD] = (1 << 5) | TIMEOUT_CONFIG_LOAD | MSTR_CONFIG_LOAD;
@@ -104,7 +112,7 @@ static void _i2c_load_cfg_wait(vu32 *base)
 
 static int _i2c_send_single(u32 i2c_idx, u32 dev_addr, u8 *buf, u32 size)
 {
-	if (size > 4)
+	if (boot_bus_released || size > 4)
 		return 0;
 
 	u32 tmp = 0;
@@ -139,7 +147,7 @@ static int _i2c_send_single(u32 i2c_idx, u32 dev_addr, u8 *buf, u32 size)
 
 static int _i2c_recv_single(u32 i2c_idx, u8 *buf, u32 size, u32 dev_addr)
 {
-	if (size > 4)
+	if (boot_bus_released || size > 4)
 		return 0;
 
 	vu32 *base = (vu32 *)QueryIoMapping(i2c_addrs[I2C_5], 0x1000);

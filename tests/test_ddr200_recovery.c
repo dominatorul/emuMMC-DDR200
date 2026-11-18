@@ -2,10 +2,11 @@
 #include <assert.h>
 #include "../source/emmc/sdmmc.c"
 
-static sdmmc_t host = { .id = SDMMC_1, .divisor = 199680 };
+static t210_sdmmc_t regs;
+static sdmmc_t host = { .regs = &regs, .id = SDMMC_1, .divisor = 199680 };
 static sdmmc_storage_t card = { .sdmmc = &host, .initialized = 1 };
-static unsigned full_setups, reduced_setups, card_checks, reinitializations, io_errors;
-static bool full_tunes, reduced_tunes, full_status, read_after_reinit;
+static unsigned full_setups, reduced_setups, card_checks, io_errors;
+static bool full_tunes, reduced_tunes, full_status, read_after_retune, powered;
 static u32 io_failure;
 
 int sdmmc_setup_ddr200_clock(sdmmc_t *target, bool reduced)
@@ -37,7 +38,7 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *request, u
         ++card_checks;
         return host.divisor == 166400 || full_status;
     }
-    if (read_after_reinit && reinitializations && !request->is_write) {
+    if (read_after_retune && reduced_setups && !request->is_write) {
         *blocks = 1;
         return 1;
     }
@@ -60,14 +61,18 @@ int sdmmc_stop_transmission(sdmmc_t *target, u32 *response)
     return 1;
 }
 
-bool nx_sd_initialize(bool cycle)
-{
-    assert(cycle && sd_ddr200_reduced);
-    ++reinitializations;
-    return _sd_storage_train_DDR200(&card);
-}
+bool nx_sd_initialize(bool cycle) { (void)cycle; assert(false); return false; }
 
 int nx_sd_init_retry(bool cycle) { (void)cycle; assert(false); return 0; }
+int sdmmc_get_sd_power_enabled(void) { return powered; }
+int clock_sdmmc_is_not_reset_and_enabled(u32 id) { assert(id == SDMMC_1); return 1; }
+int sdmmc_get_io_power(sdmmc_t *target) { assert(target == &host); return SDMMC_POWER_1_8; }
+u32 sdmmc_get_bus_width(sdmmc_t *target) { assert(target == &host); return SDMMC_BUS_WIDTH_4; }
+void sdmmc_card_clock_powersave(sdmmc_t *target, int enable)
+{
+    assert(target == &host);
+    target->powersave_enabled = enable;
+}
 void msleep(u64 duration) { assert(duration == 50); }
 void ddr_trace_stage(enum DdrStage next, u32 detail) { (void)next; (void)detail; }
 void ddr_trace_io_error(const sdmmc_t *target, u32 cmd, u32 blocks)
@@ -80,11 +85,14 @@ void ddr_trace_io_error(const sdmmc_t *target, u32 cmd, u32 blocks)
 static void reset(void)
 {
     host.divisor = 199680;
+    regs.hostctl2 = UHS_DDR50_BUS_SPEED;
+    host.powersave_enabled = SDMMC_POWER_SAVE_ENABLE;
     card.csd.busspeed = 200;
     sd_ddr200_reduced = false;
-    full_setups = reduced_setups = card_checks = reinitializations = io_errors = 0;
+    full_setups = reduced_setups = card_checks = io_errors = 0;
     full_tunes = reduced_tunes = full_status = true;
-    read_after_reinit = false;
+    read_after_retune = false;
+    powered = true;
     io_failure = DdrCommandTransfer;
 }
 
@@ -113,22 +121,27 @@ int main(void)
 
     u8 buffer[512] = {0};
     reset();
-    read_after_reinit = true;
+    read_after_retune = true;
     assert(_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reinitializations == 1 && reduced_setups == 1 && io_errors == 5);
+    assert(reduced_setups == 1 && io_errors == 5 && host.powersave_enabled);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reinitializations == 1 && io_errors == 8);
+    assert(reduced_setups == 1 && io_errors == 8 && host.powersave_enabled);
 
     reset();
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 1));
-    assert(reinitializations == 0 && !sd_ddr200_reduced);
+    assert(reduced_setups == 0 && !sd_ddr200_reduced);
 
     reset();
     io_failure = DdrCommandDmaSetup;
     assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
-    assert(reinitializations == 0 && !sd_ddr200_reduced);
+    assert(reduced_setups == 0 && !sd_ddr200_reduced);
 
-    puts("DDR200 recovery: full rate, narrower-window recovery, status checks, bounded reads, and no write or DMA-setup reinit passed");
+    reset();
+    powered = false;
+    assert(!_sdmmc_storage_readwrite(&card, 10, 1, buffer, 0));
+    assert(reduced_setups == 0 && !sd_ddr200_reduced);
+
+    puts("DDR200 recovery: powered read retune, bounded retry, and no raw SD reinitialization passed");
 }

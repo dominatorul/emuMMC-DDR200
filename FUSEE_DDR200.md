@@ -21,15 +21,15 @@ Hekate and L4T use CMD6 vendor command-system function 14 with the Access Mode
 group at SDR12. Native FS can configure that group during SD open. The new build
 returns the host and card to low-clock SDR12 before reselecting DDR200 during
 in-place recovery. Actual SD power, controller clock, voltage or width loss
-forces a fresh DDR200 initialization. Recovery preserves the 512-byte DMA
+reopens the card through native FS before reselecting DDR200. Recovery preserves the 512-byte DMA
 scratch sector. The capture includes the original and latest sweeps, card CMD6
 status, registers before and after native open, and the reassert entry state.
 
 The driver tries 199.68 MHz first. If the sweep or card status check fails, it
 repeats tuning with the original fork's 166.4 MHz clock setting in the same
 vendor DDR200 mode. A read that repeatedly fails during command response or
-transfer recovery can also retry using this clock, after one full DDR200 card
-reinitialization. A successful reduced clock setting is retained through
+transfer can retry once after retraining the powered card in place. A successful
+reduced clock setting is retained through
 subsequent reopens and resume for that boot. Both clocks require eight passing
 taps and a valid card status response. The updated trace saves the measured
 clock and window at each rate plus the first and latest failed data commands
@@ -42,7 +42,16 @@ storage mutex. It also caps SDMA polling at 5 seconds overall and 1.5 seconds
 without block progress. Boundary interrupts can advance only through the
 programmed transfer length. The active DDR200 clock policy is the same.
 
-Use **More Configs → Fusee DDR200 stall trace (1.11.2)**. The entry chainloads the
+The stall-trace boot produced an Atmosphère fatal report from `pcv`, Program ID
+`010000000000001A`, with result `0x265` (`2101-0001`, I²C NoAck). The associated
+PTM and OMM crashes share that boot. The forced driver now releases its raw
+boot I²C5 interface as soon as it finishes initial SD setup. Native FS handles
+later power recovery so its regulator transactions go through Horizon's service.
+The read retry changes the SD sampling clock without cycling the PMIC. HOC clock
+and SysFanControl startup flags are saved under `ddr200-debug/previous-fusee-stall-trace`
+for this test to isolate the power and clock services.
+
+Use **More Configs → Fusee DDR200 PCV test (1.11.2)**. The entry chainloads the
 official Atmosphère 1.11.2 `fusee.bin`. Its matching `package3` supplies the
 kernel and secure monitor. Fusee loads the uncompressed `atmosphere/emummc.kip`.
 Reports are saved to `atmosphere/fatal_errors`. A failed operation requests a

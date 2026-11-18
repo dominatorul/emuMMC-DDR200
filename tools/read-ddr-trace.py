@@ -10,7 +10,7 @@ STAGES = (
     'boot', 'card initialization', 'ready', 'native SD open', 'host state check',
     'read CMD6 status', 'check DDR200 function', 'set DDR200 function', 'set clock',
     'tuning sweep', 'card status check', 'read', 'write', 'restore SDR12 access mode',
-    'DMA polling',
+    'DMA polling', 'native SD power recovery',
 )
 SNAPSHOTS = ('initial tune', 'latest tune', 'before native open', 'after native open', 'reassert entry')
 COMMAND_FAILURES = ('unknown', 'clock disabled', 'command inhibit', 'DMA setup',

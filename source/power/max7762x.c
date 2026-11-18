@@ -100,9 +100,12 @@ int max77620_regulator_set_voltage(u32 id, u32 mv)
 		return 0;
 
 	u32 mult = (mv + reg->mv_step - 1 - reg->mv_min) / reg->mv_step;
-	u8 val = i2c_recv_byte(I2C_5, MAX77620_I2C_ADDR, reg->volt_addr);
+	u8 val;
+	if (!i2c_recv_buf_small(&val, 1, I2C_5, MAX77620_I2C_ADDR, reg->volt_addr))
+		return 0;
 	val = (val & ~reg->volt_mask) | (mult & reg->volt_mask);
-	i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, reg->volt_addr, val);
+	if (!i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, reg->volt_addr, val))
+		return 0;
 	usleep(1000);
 
 	return 1;
@@ -116,12 +119,15 @@ int max77620_regulator_enable(u32 id, int enable)
 	const max77620_regulator_t *reg = &_pmic_regulators[id];
 
 	u32 addr = reg->type == REGULATOR_SD ? reg->cfg_addr : reg->volt_addr;
-	u8 val = i2c_recv_byte(I2C_5, MAX77620_I2C_ADDR, addr);
+	u8 val;
+	if (!i2c_recv_buf_small(&val, 1, I2C_5, MAX77620_I2C_ADDR, addr))
+		return 0;
 	if (enable)
 		val = (val & ~reg->enable_mask) | ((MAX77620_POWER_MODE_NORMAL << reg->enable_shift) & reg->enable_mask);
 	else
 		val &= ~reg->enable_mask;
-	i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, addr, val);
+	if (!i2c_send_byte(I2C_5, MAX77620_I2C_ADDR, addr, val))
+		return 0;
 	usleep(1000);
 
 	return 1;
