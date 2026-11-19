@@ -48,6 +48,7 @@ typedef struct {
 #ifdef EMUMMC_DDR200_HEKATE
     u8 sdr104_tap;
     bool sdr104_tap_valid;
+    bool wake_write_check;
 #endif
     u32 blocks;
     u32 busy_us;

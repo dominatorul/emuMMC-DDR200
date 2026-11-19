@@ -552,6 +552,22 @@ int main(void)
     assert(card.ddr.rate == DdrRateFull && verifies == 2 && !switched_to_stock);
     assert(full_data_calls == 2 && full_data_taps[0] == 36 && full_data_taps[1] == 32);
 
+    reset();
+    full_eye = (ddr_eye_t){30, 35};
+    card.ddr.wake_write_check = card.ddr.sdr104_tap_valid = true;
+    card.ddr.sdr104_tap = required_sdr104_tap = 21;
+    reject_sdr104_tuning = true;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, true));
+    assert(commands == 1 && !full_data_calls && card.ddr.rate == DdrRateSdr104);
+    assert(tap_readback(&host) == 21 && !card.ddr.wake_write_check);
+
+    reset();
+    full_eye = (ddr_eye_t){30, 35};
+    host.wake_commands = 8;
+    fail_reads = 1;
+    assert(!_sdmmc_storage_readwrite(&card, 1024, 16, data, true));
+    assert(commands == 1 && stops == 1 && card.ddr.ready && card.ddr.rate == DdrRateSdr104);
+
     puts("Hekate CMD6, widest midpoint, minimum width, wake, and direct SDR104 fallback passed");
 }
 #else

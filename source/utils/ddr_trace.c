@@ -104,7 +104,10 @@ static _Atomic u64 first_failure[2], last_failure[2];
 static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
 static _Atomic u64 large_read_blocks, large_read_us, large_read_dma_us, large_read_copied;
-static _Atomic u32 large_read_commands, large_read_restarts, largest_read, write_errors;
+static _Atomic u32 large_read_commands, large_read_restarts, largest_read;
+#endif
+#if defined(EMUMMC_DDR200_ADMA_PROBE) || (defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX))
+static _Atomic u32 write_errors;
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
 static _Atomic u32 largest_fs_read, read_ahead_blocks, map_attempts, map_result;
@@ -307,7 +310,7 @@ void ddr_trace_io_error(const sdmmc_t *host, u32 cmd, u32 blocks)
         ((u64)tap << 28) | ((u64)dma->mode << 36) | ((u64)dma->adma_error << 38) |
         ((u64)cmd << 46) | ((u64)dma->sampled << 54) | ((u64)dma->descriptors << 55);
 #endif
-#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
+#if defined(EMUMMC_DDR200_ADMA_PROBE) || (defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX))
     if (cmd == MMC_WRITE_MULTIPLE_BLOCK)
         ++write_errors;
 #endif
@@ -499,8 +502,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
 #endif
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
     ctx->gprs[2] = ((u64)large_read_commands << 32) | large_read_restarts;
-    ctx->gprs[30] |= (u64)MIN(write_errors, 0xffffu) << 48;
     ctx->gprs[31] = largest_read;
+#endif
+#if defined(EMUMMC_DDR200_ADMA_PROBE) || (defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX))
+    ctx->gprs[30] |= (u64)MIN(write_errors, 0xffffu) << 48;
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
     ctx->gprs[4] = ((u64)MIN(read_ahead_fills[0], 0xffffu) << 48) |

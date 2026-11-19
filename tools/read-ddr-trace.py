@@ -345,7 +345,7 @@ def print_policy_trace(data, gprs):
                   f'across {blocks / 2048:.2f} MiB')
             print(f'DMA wait {dma_us / usec:.1%} of command time, DMA-window rate '
                   f'{blocks * 512 / dma_us:.2f} MB/s, bounce-buffer data {copied / blocks:.1%}')
-        if perf_version >= 17 and gprs[2] >> 32:
+        if perf_version >= 17 and gprs[2] >> 32 and gprs[31] & 0xffffffff:
             commands, restarts = gprs[2] >> 32, gprs[2] & 0xFFFFFFFF
             print(f'{commands} large CMD18 reads, average {blocks / (2 * commands):.1f} KiB, '
                   f'maximum {(gprs[31] & 0xFFFFFFFF) / 2:.1f} KiB, {restarts} SDMA boundary restarts')

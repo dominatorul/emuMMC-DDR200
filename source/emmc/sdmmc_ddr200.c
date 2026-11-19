@@ -267,7 +267,8 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     /* A link that already qualified can recover with a three-tap guard
        on each edge and two data reads. Keep eight taps for a fresh link. */
     unsigned minimum = SDMMC_SAMPLE_WIN_SIZE_MIN;
-    if (policy->capable && (kind == DdrSweepRecovery || (kind == DdrSweepHandoff && local)))
+    if (policy->capable && (kind == DdrSweepRecovery || kind == DdrSweepTrack ||
+                           (kind == DdrSweepHandoff && local)))
         minimum = 2 * DdrTapMargin + 1;
     if (ddr_eye_width(eye) >= minimum) {
         unsigned tap = (eye.left + eye.right) / 2;
@@ -460,6 +461,10 @@ static bool train_sdr104(sdmmc_storage_t *storage)
     return ready;
 }
 
+#ifdef EMUMMC_DDR200_HEKATE
+static bool restore_sdr104_tap(sdmmc_storage_t *storage, u8 status[64]);
+#endif
+
 static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
 {
     /* Even an eye too narrow for production can carry the CMD6 status
@@ -480,6 +485,10 @@ static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
         return false;
     }
     storage->ddr.rate = DdrRateSdr104;
+#ifdef EMUMMC_DDR200_HEKATE
+    if (restore_sdr104_tap(storage, status))
+        return true;
+#endif
     return train_sdr104(storage);
 }
 
@@ -539,16 +548,20 @@ static bool probe_native_sdr104(sdmmc_storage_t *storage, u8 status[64])
     u64 old = begin_budget(host, 120000);
     bool read = sdmmc_sd_switch(storage, status, 0x00ffffff);
     host->deadline_us = old;
-    if (read)
-        return (status[16] >> 4) == 0;
-
-    /* Native wake can program the SDR104 mode with the tap it sampled
-       while the physical link was DDR200. Recheck at a tuned SDR104 tap. */
-    old = begin_budget(host, 200000);
-    read = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
-        sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
-        sdmmc_sd_switch(storage, status, 0x00ffffff);
-    host->deadline_us = old;
+    if (!read) {
+        /* The native tap can be stale when the card retained DDR200. */
+        old = begin_budget(host, 200000);
+        read = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
+            sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
+            sdmmc_sd_switch(storage, status, 0x00ffffff);
+        host->deadline_us = old;
+    }
+#ifdef EMUMMC_DDR200_HEKATE
+    if (read && status[16] == 3) {
+        storage->ddr.sdr104_tap = tap_readback(host);
+        storage->ddr.sdr104_tap_valid = true;
+    }
+#endif
     return read && (status[16] >> 4) == 0;
 }
 
@@ -685,6 +698,9 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     if (ok) {
         storage->csd.busspeed = policy->rate >= DdrRateReduced ? 200 : 104;
         policy->resume_rate = DdrRateUnknown;
+#ifdef EMUMMC_DDR200_HEKATE
+        policy->wake_write_check = policy->rate == DdrRateFull;
+#endif
     }
     ddr_trace_ladder(policy->rate, ok, policy->unstable, policy->upgrades);
     return ok;
@@ -792,7 +808,22 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 {
     ddr_policy_t *policy = &storage->ddr;
 #ifdef EMUMMC_DDR200_HEKATE
-    return policy->ready;
+    if (!policy->ready || !writing || !policy->wake_write_check || policy->rate != DdrRateFull)
+        return policy->ready;
+    u8 backup[512], status[64];
+    char *dma = borrow_dma(1, backup);
+    if (!dma)
+        return false;
+    sdmmc_t *host = storage->sdmmc;
+    u64 old = begin_budget(host, 1500000);
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
+    bool ok = train(storage, DdrRateFull, DdrSweepTrack, false, sector, -1) ||
+        fallback(storage, DdrRateFull, sector, status);
+    restore_dma(dma, backup, sizeof(backup));
+    sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
+    host->deadline_us = old;
+    policy->wake_write_check = !ok;
+    return ok;
 #else
     sdmmc_t *host = storage->sdmmc;
     if (!policy->capable || !policy->ready)
