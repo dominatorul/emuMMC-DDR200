@@ -258,8 +258,8 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
 #ifdef EMUMMC_DDR200_HEKATE
     /* Match Hekate's full sweep, TUNED_CLK pass map and midpoint. Horizon
        reuses a live link, so verify that midpoint before resuming FS I/O. */
-    sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
-    ddr_eye_t eye = ddr_hekate_eye(raw);
+    unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+    ddr_eye_t eye = kind == DdrSweepTrack ? ddr_widest_eye(passing, samples) : ddr_hekate_eye(raw);
     unsigned applied = SDMMC_INVALID_TAP;
     *history = (ddr_history_t){0};
     if (ddr_eye_width(eye))
@@ -808,8 +808,15 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 {
     ddr_policy_t *policy = &storage->ddr;
 #ifdef EMUMMC_DDR200_HEKATE
-    if (!policy->ready || !writing || !policy->wake_write_check || policy->rate != DdrRateFull)
+    if (!policy->ready || policy->rate != DdrRateFull)
         return policy->ready;
+    bool wake_write = writing && policy->wake_write_check;
+    bool narrow = ddr_eye_width(policy->history[0].eyes[0]) == 2 * DdrTapMargin + 1;
+    unsigned max_blocks = narrow ? DdrNarrowTrackBlocks : DdrTrackBlocks;
+    unsigned max_busy_us = narrow ? DdrNarrowTrackBusyUs : DdrTrackBusyUs;
+    if (!wake_write && policy->blocks < max_blocks && policy->busy_us < max_busy_us &&
+        !ddr_sweep_stale(policy, get_tmr_us()))
+        return true;
     u8 backup[512], status[64];
     char *dma = borrow_dma(1, backup);
     if (!dma)
@@ -822,7 +829,9 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     restore_dma(dma, backup, sizeof(backup));
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
     host->deadline_us = old;
-    policy->wake_write_check = !ok;
+    policy->blocks = policy->busy_us = 0;
+    if (wake_write && ok)
+        policy->wake_write_check = false;
     return ok;
 #else
     sdmmc_t *host = storage->sdmmc;

@@ -22,8 +22,7 @@ include $(DEVKITPRO)/libnx/switch_rules
 ARCH	:=	-march=armv8-a -mtune=cortex-a57 -mtp=soft -fPIE
 
 # Current max usage is 0x4600. (512 * 34 FatFS file objects + 1 fsync buffer).
-# READ_AHEAD also builds the shared ADMA2 mappings used for Horizon I/O.
-DDR200_PROFILE ?= -DEMUMMC_DDR200_HEKATE -DEMUMMC_DDR200_READ_AHEAD -DEMUMMC_DDR200_ADMA_PROBE
+DDR200_PROFILE ?= -DEMUMMC_DDR200_HEKATE -DEMUMMC_DDR200_READ_AHEAD -DEMUMMC_DDR200_ADMA_PROBE -DEMUMMC_DDR200_PERF_TRIAL
 DEFINES := -DINNER_HEAP_SIZE=0x8000 -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT $(DDR200_PROFILE) $(EXTRA_DEFINES)
 
 CFLAGS	:=	-Wall -O2 -ffunction-sections -fdata-sections -Wno-unused-function \
