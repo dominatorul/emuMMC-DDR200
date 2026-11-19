@@ -264,7 +264,12 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     *history = (ddr_history_t){0};
     if (ddr_eye_width(eye))
         ddr_remember_eye(history, eye);
-    if (ddr_eye_width(eye) >= SDMMC_SAMPLE_WIN_SIZE_MIN) {
+    /* A link that already qualified can recover with a three-tap guard
+       on each edge and two data reads. Keep eight taps for a fresh link. */
+    unsigned minimum = SDMMC_SAMPLE_WIN_SIZE_MIN;
+    if (policy->capable && (kind == DdrSweepRecovery || (kind == DdrSweepHandoff && local)))
+        minimum = 2 * DdrTapMargin + 1;
+    if (ddr_eye_width(eye) >= minimum) {
         unsigned tap = (eye.left + eye.right) / 2;
         u32 tried[4] = {0};
         if (failed)
@@ -285,7 +290,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     policy->tune_eye = eye;
     policy->tune_failure = !ddr_eye_width(eye) ? DdrDropNoEye :
-        ddr_eye_width(eye) < SDMMC_SAMPLE_WIN_SIZE_MIN ? DdrDropMargin : DdrDropProbeIo;
+        ddr_eye_width(eye) < minimum ? DdrDropMargin : DdrDropProbeIo;
 #endif
     ddr_trace_policy_sweep(host, eye, applied, kind, policy->drive, started);
     if (policy->ready)
@@ -440,6 +445,21 @@ static bool enter_from_sdr104(sdmmc_storage_t *storage, u8 status[64])
     return enter_ddr(storage, status);
 }
 
+static bool train_sdr104(sdmmc_storage_t *storage)
+{
+    sdmmc_t *host = storage->sdmmc;
+    bool ready = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
+        sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
+        sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
+#ifdef EMUMMC_DDR200_HEKATE
+    if (ready) {
+        storage->ddr.sdr104_tap = tap_readback(host);
+        storage->ddr.sdr104_tap_valid = true;
+    }
+#endif
+    return ready;
+}
+
 static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
 {
     /* Even an eye too narrow for production can carry the CMD6 status
@@ -460,9 +480,7 @@ static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
         return false;
     }
     storage->ddr.rate = DdrRateSdr104;
-    return sdmmc_setup_clock(storage->sdmmc, SDHCI_TIMING_UHS_SDR104) &&
-        sdmmc_tuning_execute(storage->sdmmc, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
-        sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
+    return train_sdr104(storage);
 }
 
 static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8 status[64])
@@ -533,6 +551,23 @@ static bool probe_native_sdr104(sdmmc_storage_t *storage, u8 status[64])
     host->deadline_us = old;
     return read && (status[16] >> 4) == 0;
 }
+
+#ifdef EMUMMC_DDR200_HEKATE
+static bool restore_sdr104_tap(sdmmc_storage_t *storage, u8 status[64])
+{
+    sdmmc_t *host = storage->sdmmc;
+    if (!storage->ddr.sdr104_tap_valid || !sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104))
+        return false;
+    sdmmc_set_ddr200_tap(host, storage->ddr.sdr104_tap);
+    host->regs->hostctl2 |= SDHCI_CTRL_TUNED_CLK;
+
+    u64 old = begin_budget(host, 120000);
+    bool ready = sdmmc_sd_switch(storage, status, 0x00ffffff) && status[16] == 3 &&
+        sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
+    host->deadline_us = old;
+    return ready;
+}
+#endif
 
 static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
 {
@@ -614,8 +649,12 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     bool want_ddr = policy->capable && requested >= DdrRateReduced;
     if (want_ddr)
         sdmmc_ddr200_restore_host_cfg(host);
-    bool standard = probe_native_sdr104(storage, status);
     bool ok = false;
+#ifdef EMUMMC_DDR200_HEKATE
+    if (!want_ddr && requested == DdrRateSdr104)
+        ok = restore_sdr104_tap(storage, status);
+#endif
+    bool standard = ok || probe_native_sdr104(storage, status);
     if (standard && want_ddr) {
         remember_functions(storage, status);
         sdmmc_sd_set_current_limit(storage, policy->power_support, status);
@@ -629,9 +668,7 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     } else if (standard) {
         /* Horizon has already completed its native SDR104 init. Reuse the
            standard timing while keeping our serialized emuMMC transport. */
-        ok = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
-             sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
-             sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
+        ok = ok || train_sdr104(storage);
         storage->csd.busspeed = 104;
     } else if (want_ddr) {
         ok = restore_retained_ddr(storage, requested, status);

@@ -54,6 +54,8 @@ static bool retained_full_clock_fails, retained_reduced_clock_fails;
 static unsigned retained_clock_changes, retained_failures;
 #ifdef EMUMMC_DDR200_HEKATE
 static unsigned group2_checks, group2_sets, group4_function;
+static bool reject_sdr104_tuning;
+static unsigned required_sdr104_tap;
 #endif
 static char flow[256];
 static unsigned cursor;
@@ -101,12 +103,20 @@ int sdmmc_setup_clock(sdmmc_t *target, u32 type)
     assert(type == SDHCI_TIMING_UHS_SDR104 || type == SDHCI_TIMING_UHS_SDR12);
     host.divisor = type == SDHCI_TIMING_UHS_SDR104 ? 199680 : 24728;
     regs.hostctl2 = type == SDHCI_TIMING_UHS_SDR104 ? UHS_SDR104_BUS_SPEED : UHS_SDR12_BUS_SPEED;
+#ifdef EMUMMC_DDR200_HEKATE
+    regs.venclkctl = 0;
+#endif
     return 1;
 }
 
 int sdmmc_tuning_execute(sdmmc_t *target, u32 type, u32 command)
 {
     assert(target == &host && type == SDHCI_TIMING_UHS_SDR104 && command == MMC_SEND_TUNING_BLOCK);
+#ifdef EMUMMC_DDR200_HEKATE
+    if (reject_sdr104_tuning)
+        return 0;
+    regs.venclkctl = 21 << 16;
+#endif
     return 1;
 }
 
@@ -178,6 +188,9 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
 #ifdef EMUMMC_DDR200_HEKATE
         if (cmd->arg == 0x80ffff03)
             card_retained_ddr = false;
+        if ((regs.hostctl2 & 7) == UHS_SDR104_BUS_SPEED && cmd->arg == 0x00ffffff &&
+            required_sdr104_tap && (regs.venclkctl >> 16) != required_sdr104_tap)
+            return 0;
         if ((cmd->arg & 0xf0) == 0xe0) {
             assert((cmd->arg & 0xffffff) == 0xffffef);
             if (cmd->arg >> 31)
@@ -409,6 +422,8 @@ static void reset(void)
 #ifdef EMUMMC_DDR200_HEKATE
     group2_checks = group2_sets = 0;
     group4_function = 15;
+    required_sdr104_tap = 0;
+    reject_sdr104_tuning = false;
 #endif
     flow[0] = 0;
 #ifdef EMUMMC_DDR200_MATRIX
@@ -506,6 +521,14 @@ int main(void)
     assert(sdmmc_ddr200_handoff(&card));
     assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && switched_to_stock == 1);
     assert(retained_failures == 1 && retained_clock_changes == 4 && verifies == 6);
+    assert(card.ddr.sdr104_tap_valid && card.ddr.sdr104_tap == 21);
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    regs.venclkctl = 0;
+    required_sdr104_tap = 21;
+    reject_sdr104_tuning = true;
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && tap_readback(&host) == 21);
+    assert(switched_to_stock == 1);
     assert(!host.handoff_sdma && !host.deadline_us);
     for (size_t i = 0; i < sizeof(window); ++i)
         assert(window[i] == 0x6f);
@@ -519,6 +542,15 @@ int main(void)
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, false));
     assert(!wake_remaps && switched_to_stock == 1 && card.ddr.rate == DdrRateSdr104);
     assert(stops == 1 && resets == 1 && full_data_calls == 1);
+
+    reset();
+    full_eye = (ddr_eye_t){29, 35};
+    regs.venclkctl = 36 << 16;
+    host.wake_commands = 8;
+    fail_reads = 1;
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, false));
+    assert(card.ddr.rate == DdrRateFull && verifies == 2 && !switched_to_stock);
+    assert(full_data_calls == 2 && full_data_taps[0] == 36 && full_data_taps[1] == 32);
 
     puts("Hekate CMD6, widest midpoint, minimum width, wake, and direct SDR104 fallback passed");
 }

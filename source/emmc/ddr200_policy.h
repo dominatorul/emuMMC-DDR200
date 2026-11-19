@@ -45,6 +45,10 @@ typedef struct {
     u16 power_support;
     u8 power;
     u8 narrow_verified_tap;
+#ifdef EMUMMC_DDR200_HEKATE
+    u8 sdr104_tap;
+    bool sdr104_tap_valid;
+#endif
     u32 blocks;
     u32 busy_us;
     u64 last_io;
