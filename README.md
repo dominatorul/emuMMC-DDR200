@@ -9,6 +9,13 @@ Do not use this unless you know what you are doing. This is wip and may do bad s
 The DDR200 branch uses Hekate's direct Atmosphère launch. See
 [DDR200.md](DDR200.md) for the KIPM build and installation steps.
 
+## DDR200 fork credits
+
+- **Dominatorul** develops and maintains this fork.
+- **CTCaer** wrote the original DDR200 implementation in Hekate. [Original implementation](https://github.com/CTCaer/hekate/blob/8e1392df4569ac501a115867056b13c361429e9e/bdk/storage/sdmmc.c#L1388)
+- **Lightos** wrote the first DDR200 implementation for Horizon OS. [Original fork](https://github.com/Lightos1/emuMMC_ddr200)
+- **HAZEL** helped with development and debugging.
+
 ## Features
 * Arbitrary SDMMC backend selection  
   **This allows loading eMMC from SD or even SD from eMMC**
