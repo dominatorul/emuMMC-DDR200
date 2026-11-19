@@ -126,6 +126,27 @@ static inline ddr_eye_t ddr_widest_eye(const u32 map[4], unsigned end)
     return ddr_select_eye(map, 0, end, 1, (ddr_eye_t){DdrTapCount, 0});
 }
 
+#ifdef EMUMMC_DDR200_HEKATE
+/* Hekate 8e1392d compares the run length before counting the final slot.
+   Keep its tie handling and terminal-window behavior for this profile. */
+static inline ddr_eye_t ddr_hekate_eye(const u32 map[4])
+{
+    ddr_eye_t best = {DdrTapCount, 0};
+    unsigned run = 0;
+    for (unsigned tap = 0; tap < DdrTapCount; ++tap) {
+        bool last = tap == DdrTapCount - 1;
+        if (!last && ddr_tap_passes(map, tap)) {
+            ++run;
+            continue;
+        }
+        if (run > ddr_eye_width(best))
+            best = (ddr_eye_t){tap - run, last ? tap : tap - 1};
+        run = 0;
+    }
+    return best;
+}
+#endif
+
 static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)
 {
     history->eyes[2] = history->eyes[1];
@@ -185,8 +206,12 @@ static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4],
 
 static inline enum DdrRate ddr_failure_next(enum DdrRate rate)
 {
+#ifdef EMUMMC_DDR200_HEKATE
+    return rate >= DdrRateReduced ? DdrRateSdr104 : DdrRateUnknown;
+#else
     return rate == DdrRateFull ? DdrRateReduced :
            rate == DdrRateReduced ? DdrRateSdr104 : DdrRateUnknown;
+#endif
 }
 
 static inline u64 ddr_retry_delay(unsigned failures)

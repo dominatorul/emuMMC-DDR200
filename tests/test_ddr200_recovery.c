@@ -52,6 +52,9 @@ static bool card_retained_ddr;
 static unsigned rejected_sdr_checks, retained_restorations;
 static bool retained_full_clock_fails, retained_reduced_clock_fails;
 static unsigned retained_clock_changes, retained_failures;
+#ifdef EMUMMC_DDR200_HEKATE
+static unsigned group2_checks, group2_sets, group4_function;
+#endif
 static char flow[256];
 static unsigned cursor;
 static u32 status_word;
@@ -172,6 +175,19 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
 #endif
     if (cmd->cmd == SD_SWITCH) {
         assert(!req->is_write && req->blksize == 64);
+#ifdef EMUMMC_DDR200_HEKATE
+        if (cmd->arg == 0x80ffff03)
+            card_retained_ddr = false;
+        if ((cmd->arg & 0xf0) == 0xe0) {
+            assert((cmd->arg & 0xffffff) == 0xffffef);
+            if (cmd->arg >> 31)
+                ++group2_sets;
+            else
+                ++group2_checks;
+        }
+        if ((cmd->arg & 0xffff0fff) == 0x80ff0fff)
+            group4_function = (cmd->arg >> 12) & 15;
+#endif
         if (card_retained_ddr) {
             assert(cmd->arg == 0x00ffffff && (regs.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
             ++rejected_sdr_checks;
@@ -202,7 +218,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
     ++commands;
     unsigned tap = regs.venclkctl >> 16;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (host.divisor == 199680 && req->num_sectors == 16 && full_data_calls < 8)
+    if (host.divisor == 199680 && (regs.hostctl2 & 7) == UHS_DDR50_BUS_SPEED &&
+        req->num_sectors == 16 && full_data_calls < 8)
         full_data_taps[full_data_calls++] = tap;
     bool injected = host.divisor == 199680 && full_probe_failures && req->num_sectors == DdrVerifyBlocks;
     if (injected)
@@ -389,6 +406,10 @@ static void reset(void)
     rejected_sdr_checks = retained_restorations = 0;
     retained_clock_changes = retained_failures = 0;
     retained_full_clock_fails = retained_reduced_clock_fails = false;
+#ifdef EMUMMC_DDR200_HEKATE
+    group2_checks = group2_sets = 0;
+    group4_function = 15;
+#endif
     flow[0] = 0;
 #ifdef EMUMMC_DDR200_MATRIX
     memset(&matrix, 0, sizeof(matrix));
@@ -449,6 +470,59 @@ static void test_eye_model(void)
     assert(ddr_pick_tap(&history, excluded, DdrTapMargin, true) == -1);
 }
 
+#ifdef EMUMMC_DDR200_HEKATE
+int main(void)
+{
+    u8 functions[64] = {[7] = 15, [9] = 7, [10] = 0x40};
+    reset();
+    full_eye = (ddr_eye_t){32, 48};
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    sdmmc_sd_set_current_limit(&card, functions[7], functions);
+    assert(group4_function == 1);
+    functions[10] = 0x40;
+    assert(sdmmc_ddr200_initial(&card, functions));
+    assert(group2_checks == 1 && group2_sets == 1 && tap_readback(&host) == 40);
+    assert(!hint_scans && !verifies);
+
+    reset();
+    host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;
+    full_eye = (ddr_eye_t){29, 35};
+    assert(!sdmmc_ddr200_initial(&card, functions));
+
+    reset();
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    card_retained_ddr = true;
+    full_eye = (ddr_eye_t){30, 44};
+    for (unsigned cycle = 1; cycle <= 3; ++cycle) {
+        regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+        assert(sdmmc_ddr200_handoff(&card));
+        assert(card.ddr.rate == DdrRateFull && tap_readback(&host) == 37);
+        assert(retained_restorations == cycle && verifies == cycle * 2);
+    }
+    assert(!hint_scans && !switched_to_stock && retained_clock_changes == 3);
+
+    regs.hostctl2 = UHS_SDR104_BUS_SPEED;
+    full_eye.right = 35;
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && switched_to_stock == 1);
+    assert(retained_failures == 1 && retained_clock_changes == 4 && verifies == 6);
+    assert(!host.handoff_sdma && !host.deadline_us);
+    for (size_t i = 0; i < sizeof(window); ++i)
+        assert(window[i] == 0x6f);
+
+    reset();
+    full_eye = (ddr_eye_t){28, 36};
+    regs.venclkctl = 32 << 16;
+    host.wake_commands = 8;
+    fail_reads = 1;
+    u8 data[16 * 512];
+    assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, false));
+    assert(!wake_remaps && switched_to_stock == 1 && card.ddr.rate == DdrRateSdr104);
+    assert(stops == 1 && resets == 1 && full_data_calls == 1);
+
+    puts("Hekate CMD6, widest midpoint, minimum width, wake, and direct SDR104 fallback passed");
+}
+#else
 int main(void)
 {
     test_eye_model();
@@ -755,3 +829,4 @@ int main(void)
 #endif
     puts("DDR200 eye drift, read verification, fallback, backoff and CMD12/CMD13 hygiene passed");
 }
+#endif

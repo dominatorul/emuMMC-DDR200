@@ -757,7 +757,7 @@ static uint64_t controller_read(void *buf, uint64_t bufSize, int mmc_id, unsigne
         if (mmc_id == FS_SDMMC_SD)
         {
             bool read_ahead = false;
-#ifdef EMUMMC_DDR200_READ_AHEAD
+#if defined(EMUMMC_DDR200_READ_AHEAD) && !defined(EMUMMC_DDR200_HEKATE)
             read_ahead = native_sd_opened && boot_power_window_closed &&
                 bufSize >= (u64)num_sectors * 512 &&
                 sdmmc_read_ahead(&sd_storage, *sdmmc_das_handle, sector, num_sectors, buf);

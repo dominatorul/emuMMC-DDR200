@@ -1165,6 +1165,11 @@ int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group,
 
 void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf)
 {
+#ifdef EMUMMC_DDR200_HEKATE
+	/* Hekate caps UHS-I CMD6 group 4 at 1.44 W (function 1). */
+	u32 power = (current_limit & SD_MAX_CURRENT_400) ? SD_SET_CURRENT_LIMIT_400 : SD_SET_CURRENT_LIMIT_200;
+	_sd_storage_switch(storage, buf, SD_SWITCH_SET, 3, power);
+#else
 	u32 pwr = SD_SET_CURRENT_LIMIT_200;
 
 	if (current_limit & SD_MAX_CURRENT_800)
@@ -1198,6 +1203,7 @@ DPRINTF("[SD] power limit defaulted to 200mA\n");
 			break;
 		}
 	}
+#endif
 }
 
 int _sd_storage_enable_highspeed(sdmmc_storage_t *storage, u32 hs_type, u8 *buf)

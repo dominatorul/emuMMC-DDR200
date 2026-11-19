@@ -253,8 +253,46 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
         }
         local = false;
     }
-    u32 raw[4] = {0}, passing[4] = {0}, samples;
+    u32 raw[4] = {0}, passing[4] = {0};
     u64 started = get_tmr_us();
+#ifdef EMUMMC_DDR200_HEKATE
+    /* Match Hekate's full sweep, TUNED_CLK pass map and midpoint. Horizon
+       reuses a live link, so verify that midpoint before resuming FS I/O. */
+    sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+    ddr_eye_t eye = ddr_hekate_eye(raw);
+    unsigned applied = SDMMC_INVALID_TAP;
+    *history = (ddr_history_t){0};
+    if (ddr_eye_width(eye))
+        ddr_remember_eye(history, eye);
+    if (ddr_eye_width(eye) >= SDMMC_SAMPLE_WIN_SIZE_MIN) {
+        unsigned tap = (eye.left + eye.right) / 2;
+        u32 tried[4] = {0};
+        if (failed)
+            memcpy(tried, failed, sizeof(tried));
+        if (failed_tap >= 0)
+            exclude_tap(tried, failed_tap);
+        if (kind == DdrSweepInitial) {
+            sdmmc_set_ddr200_tap(host, tap);
+            if (sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000))
+                applied = tap;
+        } else if (!ddr_tap_passes(tried, tap) &&
+                   verify_tap(storage, eye, sector, tap, DdrTapMargin, tried)) {
+            applied = tap;
+        }
+    }
+    policy->last_sweep_us = get_tmr_us();
+    policy->ready = applied != SDMMC_INVALID_TAP;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    policy->tune_eye = eye;
+    policy->tune_failure = !ddr_eye_width(eye) ? DdrDropNoEye :
+        ddr_eye_width(eye) < SDMMC_SAMPLE_WIN_SIZE_MIN ? DdrDropMargin : DdrDropProbeIo;
+#endif
+    ddr_trace_policy_sweep(host, eye, applied, kind, policy->drive, started);
+    if (policy->ready)
+        ddr_trace_stage(DdrReady, host->divisor);
+    return policy->ready;
+#else
+    u32 samples;
     ddr_eye_t eye;
     if (kind == DdrSweepInitial) {
         *history = (ddr_history_t){0};
@@ -330,6 +368,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     if (policy->ready)
         ddr_trace_stage(DdrReady, host->divisor);
     return policy->ready;
+#endif
 }
 
 static bool train(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool local,
@@ -350,7 +389,7 @@ static void remember_functions(sdmmc_storage_t *storage, const u8 *status)
 
 static bool check_ddr_switch(sdmmc_storage_t *storage, u8 status[64], u32 arg)
 {
-    return sdmmc_sd_switch(storage, status, arg) && status[16] == 0xe0 &&
+    return sdmmc_sd_switch(storage, status, arg) && (status[16] >> 4) == 14 &&
         ((unsigned)status[0] << 8 | status[1]) <= 800;
 }
 
@@ -360,7 +399,7 @@ static bool enter_ddr(sdmmc_storage_t *storage, u8 status[64])
        stays at SDR12. The status block uses the preceding signaling. */
     const u32 no_drive_change = 0x00ffffef;
     u32 arg = no_drive_change;
-#ifdef EMUMMC_DDR200_PERF_TRIAL
+#if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_HEKATE)
     /* Try the advertised card drive settings while the bus is still SDR. */
     const u8 drives[] = {
 #ifdef EMUMMC_DDR200_DRIVE_C
@@ -380,14 +419,15 @@ static bool enter_ddr(sdmmc_storage_t *storage, u8 status[64])
 #endif
     if (arg == no_drive_change && !check_ddr_switch(storage, status, arg))
         return false;
-    if (!sdmmc_sd_switch(storage, status, arg | 0x80000000) || status[16] != 0xe0) {
+    if (!sdmmc_sd_switch(storage, status, arg | 0x80000000) || (status[16] >> 4) != 14) {
         storage->ddr.rate = DdrRateUnknown;
         return false;
     }
     ddr_trace_card(status, true);
     remember_functions(storage, status);
-    storage->ddr.rate = DdrRateFull;
-    return sdmmc_setup_ddr200_clock(storage->sdmmc, false) != 0;
+    bool clock = sdmmc_setup_ddr200_clock(storage->sdmmc, false);
+    storage->ddr.rate = clock ? DdrRateFull : DdrRateUnknown;
+    return clock;
 }
 
 static bool enter_from_sdr104(sdmmc_storage_t *storage, u8 status[64])
@@ -502,7 +542,11 @@ static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     bool clock = sdmmc_setup_ddr200_clock(host, rate == DdrRateReduced);
     bool ready = clock && sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
+#ifdef EMUMMC_DDR200_HEKATE
+    storage->ddr.rate = ready ? rate : DdrRateUnknown;
+#else
     storage->ddr.rate = rate;
+#endif
     bool verified = ready && train(storage, rate, DdrSweepHandoff, true, 0, -1);
     host->deadline_us = old;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
@@ -511,12 +555,18 @@ static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
     return verified;
 }
 
-static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested)
+static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested, u8 status[64])
 {
+#ifndef EMUMMC_DDR200_HEKATE
     ddr_policy_t *policy = &storage->ddr;
+#endif
     /* Horizon may have restored only the controller. Restore the running
        card's last rate before trying the existing reduced-rate recovery. */
     bool ok = train_retained_ddr(storage, requested);
+#ifdef EMUMMC_DDR200_HEKATE
+    ddr_trace_power(DdrPowerRetained, ok);
+    return ok || fallback(storage, requested, 0, status);
+#else
     if (!ok && requested == DdrRateFull) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE
         ddr_trace_clock_drop(requested, DdrRateReduced, DdrDropWakeCheck, 0, (ddr_eye_t){DdrTapCount, 0});
@@ -531,6 +581,7 @@ static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requeste
         policy->rate = DdrRateUnknown;
     ddr_trace_power(DdrPowerRetained, ok);
     return ok;
+#endif
 }
 
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
@@ -583,7 +634,7 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
              sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
         storage->csd.busspeed = 104;
     } else if (want_ddr) {
-        ok = restore_retained_ddr(storage, requested);
+        ok = restore_retained_ddr(storage, requested, status);
     }
     if (!ok && standard && policy->rate == DdrRateSdr104)
         ok = set_sdr104(storage, status);
@@ -703,6 +754,9 @@ bool sdmmc_ddr200_retry_io(sdmmc_storage_t *storage, u32 sector, u32 failed[4], 
 bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
 {
     ddr_policy_t *policy = &storage->ddr;
+#ifdef EMUMMC_DDR200_HEKATE
+    return policy->ready;
+#else
     sdmmc_t *host = storage->sdmmc;
     if (!policy->capable || !policy->ready)
         return policy->ready;
@@ -771,6 +825,7 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
     host->deadline_us = old;
     return policy->ready;
+#endif
 }
 
 void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed)
