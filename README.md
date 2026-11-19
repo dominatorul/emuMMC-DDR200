@@ -1,4 +1,4 @@
-Do not use this unless you know what you are doing. This is wip and may do bad stuff to your sd card if misused.
+First proper DDR200 implementation for HOS. L4t driver ported to HOS
 
 # emuMMC
 *A SDMMC driver replacement for Nintendo's Filesystem Services, by **m4xw***  
