@@ -264,7 +264,7 @@ FRESULT f_close (FIL* fp);											/* Close an open file object */
 FRESULT f_read (FIL* fp, void* buff, UINT btr, UINT* br);			/* Read data from the file */
 FRESULT f_write (FIL* fp, const void* buff, UINT btw, UINT* bw);	/* Write data to the file */
 #ifdef FF_FASTFS
-FRESULT f_read_fast (FIL* fp, const void* buff, UINT btr);			/* Fast read data from the file */
+FRESULT f_read_fast (FIL* fp, void* buff, UINT btr);			/* Fast read data from the file */
 FRESULT f_write_fast (FIL* fp, const void* buff, UINT btw);         /* Fast write data to the file */
 #endif
 FRESULT f_lseek (FIL* fp, FSIZE_t ofs);								/* Move file pointer of the file object */

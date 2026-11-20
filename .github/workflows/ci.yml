@@ -1,0 +1,43 @@
+name: DDR200 CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run host tests with ASan and UBSan
+        env:
+          CC: clang
+        run: sh tests/run.sh
+
+  build:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    strategy:
+      matrix:
+        profile: [adaptive, hekate]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and verify KIPM
+        env:
+          DEVKITPRO: /opt/devkitpro
+          DEVKITA64: /opt/devkitpro/devkitA64
+          DDR200_PROFILE: ${{ matrix.profile }}
+          EXTRA_CFLAGS: -Werror
+        run: |
+          if ! command -v python3 >/dev/null; then
+            apt-get update
+            apt-get install -y --no-install-recommends python3
+          fi
+          make clean && make -j4
+          python3 tools/package-build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: emummc-${{ matrix.profile }}-kipm
+          path: emummc.kipm
+          if-no-files-found: error

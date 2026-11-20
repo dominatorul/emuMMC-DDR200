@@ -42,7 +42,7 @@ DEFINES := -DINNER_HEAP_SIZE=0x8000 -DEMUMMC_SDMMC_UHS_DDR200_SUPPORT $(DDR200_P
 CFLAGS	:=	-Wall -O2 -ffunction-sections -fdata-sections -Wno-unused-function \
 			$(ARCH) $(DEFINES)
 
-CFLAGS	+=	$(INCLUDE) -D__SWITCH__
+CFLAGS	+=	$(INCLUDE) -D__SWITCH__ $(EXTRA_CFLAGS)
 
 CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++17
 

@@ -3901,7 +3901,7 @@ FRESULT f_read (
 #if FF_USE_FASTSEEK
 FRESULT f_read_fast (
 	FIL* fp,			/* Pointer to the file object */
-	const void* buff,	/* Pointer to the data to be written */
+	void* buff,			/* Destination for data read from the file */
 	UINT btr			/* Number of bytes to read */
 )
 {
@@ -3913,7 +3913,7 @@ FRESULT f_read_fast (
 	UINT count;
 	FSIZE_t work_sector = 0;
 	FSIZE_t sector_base = 0;
-	BYTE *wbuff = (BYTE*)buff;
+	BYTE *wbuff = buff;
 
 	res = validate(&fp->obj, &fs);			/* Check validity of the file object */
 	if (res != FR_OK || (res = (FRESULT)fp->err) != FR_OK) {

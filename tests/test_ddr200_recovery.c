@@ -616,6 +616,7 @@ int main(void)
         assert(retained_restorations == cycle && verifies == cycle * 2);
     }
     assert(!hint_scans && !switched_to_stock && retained_clock_changes == 3);
+    assert(rejected_sdr_checks == 6 && handoff_data >= 12);
 
     regs.hostctl2 = UHS_SDR104_BUS_SPEED;
     full_eye.right = 34;
@@ -623,6 +624,7 @@ int main(void)
     assert(sdmmc_ddr200_handoff(&card));
     assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && switched_to_stock == 1);
     assert(retained_failures == 1 && retained_clock_changes == 5 && verifies == 6);
+    assert(drop_reason == DdrDropMargin);
     assert(card.ddr.sdr104_tap_valid && card.ddr.sdr104_tap == 21);
     regs.hostctl2 = UHS_SDR104_BUS_SPEED;
     regs.venclkctl = 0;
