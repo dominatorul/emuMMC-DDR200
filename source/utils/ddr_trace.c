@@ -409,6 +409,13 @@ void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool comp
     if (completed)
         ++counted_reads;
 }
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static _Atomic u32 short_counted_flags;
+void ddr_trace_short_counted_read(bool succeeded)
+{
+    short_counted_flags |= 0x08 | (succeeded ? 0x20 : 0x10);
+}
+#endif
 #endif
 
 #ifdef EMUMMC_DDR200_READ_AHEAD
@@ -496,6 +503,9 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[9] = first_failure[1];
     ctx->gprs[10] = first_failure[0];
     ctx->gprs[11] = ((u64)hygiene_attempts << 32) | ((u64)MIN(hygiene_passed, 0xffffffu) << 8) | hygiene_last;
+#if defined(EMUMMC_DDR200_COUNTED_READS) && defined(EMUMMC_DDR200_ADMA_PROBE)
+    ctx->gprs[11] |= short_counted_flags;
+#endif
     ctx->gprs[12] = ((u64)verify_attempts << 32) | ((u64)MIN(verify_passed, 0xffffu) << 16) | verify_pair;
     ctx->gprs[13] = ((u64)waiting_native << 32) | boot_power_recoveries;
     for (unsigned i = 0; i < 2; ++i) {

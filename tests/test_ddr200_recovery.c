@@ -316,6 +316,9 @@ void ddr_trace_io_error(const sdmmc_t *target, u32 opcode, u32 count)
 void ddr_trace_hygiene(bool stopped, bool ready, bool reset) { assert(reset == ready && (!ready || stopped)); }
 void ddr_trace_read_recovery(const sdmmc_t *target, bool ok) { assert(target == &host); (void)ok; }
 #ifdef EMUMMC_DDR200_COUNTED_READS
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+void ddr_trace_short_counted_read(bool succeeded) { (void)succeeded; }
+#endif
 void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool completed)
 {
     assert(!completed || (supported && version >= 2 && !disabled));
@@ -531,11 +534,25 @@ int main(void)
     assert(last_auto_command == SdmmcAutoStop);
     assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
     assert(last_auto_command == SdmmcAutoBlockCount && counted_reads == 1);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    regs.capareg = SDHCI_CAN_ADMA2;
+    regs.hcver = 3;
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 32, window, 0));
+    assert(last_auto_command == SdmmcAutoBlockCount && counted_reads == 1);
+    fail_reads = 1;
+    assert(!sdmmc_storage_transfer(&card, &transferred, 1024, 32, window, 0));
+    assert(card.ddr.short_counted_reads_failed && !card.ddr.counted_reads_failed && stops == 1 && resets == 1);
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 32, window, 0));
+    assert(last_auto_command == SdmmcAutoStop);
+    assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
+    assert(last_auto_command == SdmmcAutoBlockCount);
+#endif
+    unsigned prior_counted_reads = counted_reads, prior_stops = stops;
     fail_reads = 1;
     assert(!sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
-    assert(stops == 1 && resets == 1 && counted_reads_disabled && card.ddr.counted_reads_failed);
+    assert(stops == prior_stops + 1 && resets == stops && counted_reads_disabled && card.ddr.counted_reads_failed);
     assert(sdmmc_storage_transfer(&card, &transferred, 1024, 1024, window, 0));
-    assert(last_auto_command == SdmmcAutoStop && counted_reads == 1);
+    assert(last_auto_command == SdmmcAutoStop && counted_reads == prior_counted_reads);
 #endif
     reset();
     host.powersave_enabled = SDMMC_POWER_SAVE_DISABLE;

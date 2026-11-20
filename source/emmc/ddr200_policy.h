@@ -39,6 +39,9 @@ typedef struct {
     bool unstable;
     bool matrix_active;
     bool counted_reads_failed;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    bool short_counted_reads_failed;
+#endif
     u8 upgrades;
     u8 drive;
     u16 drive_support;

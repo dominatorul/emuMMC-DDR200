@@ -286,11 +286,13 @@ def print_policy_trace(data, gprs):
     if matrix_capacity not in (0, 40):
         raise ValueError('invalid DDR200 trace capacity')
     calibration = gprs[4] >> 32
+    has_pad_calibration = False
     if version == 26 and not matrix_capacity and calibration & 0x80 and \
             (calibration & 0x7F) <= ((calibration >> 8) & 0x7F):
         left, right = calibration & 0x7F, (calibration >> 8) & 0x7F
         # A calibration entry starts from a five- to seven-tap runtime eye.
         if 5 <= right - left + 1 <= 7 and not (gprs[31] >> 32):
+            has_pad_calibration = True
             after_left, after_right = (calibration >> 16) & 0xFF, calibration >> 24
             after = (f'{after_left}–{after_right} ({after_right - after_left + 1})'
                      if after_left <= after_right else 'unavailable')
@@ -319,6 +321,9 @@ def print_policy_trace(data, gprs):
     hygiene = gprs[11]
     print(f'CMD12 / CMD13 / CMD-DAT reset passed {(hygiene >> 8) & 0xFFFFFF}/{hygiene >> 32}, '
           f'last flags {hygiene & 7:03b}')
+    if version == 26 and hygiene & 0x08:
+        print(f'16 KiB Auto CMD23 completed {bool(hygiene & 0x20)}, '
+              f'disabled after failure {bool(hygiene & 0x10)}')
     verify = gprs[12]
     print(f'Two-tap data checks passed {(verify >> 16) & 0xFFFF}/{verify >> 32}, '
           f'last pair {(verify >> 8) & 0xFF} and {verify & 0xFF}')
@@ -366,7 +371,7 @@ def print_policy_trace(data, gprs):
             print(f'Largest Horizon read at the SD hook {(gprs[31] >> 32) / 2:.1f} KiB')
             print(f'Read-ahead served {served / 2048:.2f} MiB, DMA map attempts {maps}, '
                   f'last result {result:#010x}')
-        if perf_version >= 20:
+        if perf_version >= 20 and not has_pad_calibration:
             print(f'Read-ahead fills {(gprs[4] >> 32) & 0xFFFF} completed, {gprs[4] >> 48} failed')
         if perf_version >= 21:
             flags = (state >> 24) & 0xFF

@@ -289,7 +289,14 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 	}
 #endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
-	bool test_counted = host->id == SDMMC_1 && !is_write && num_sectors >= DdrVerifyBlocks &&
+	bool short_counted = false;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+	/* The trace isolated recurring CRC/Auto CMD12 errors to 16 KiB
+	   reads. Try a predefined count there with its own failure latch. */
+	short_counted = num_sectors == 32 && !host->handoff_sdma && !host->wake_sdma &&
+		!host->wake_commands && sdmmc_adma2_supported(host) && !storage->ddr.short_counted_reads_failed;
+#endif
+	bool test_counted = host->id == SDMMC_1 && !is_write && (num_sectors >= DdrVerifyBlocks || short_counted) &&
 		host->divisor == 199680 && storage->ddr.rate == DdrRateFull &&
 		storage->ddr.ready && !host->deadline_us;
 	u16 control = host->regs->hostctl2;
@@ -297,7 +304,7 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 	u8 version = host->regs->hcver & 0xff;
 	bool supported = (storage->scr.cmds & SD_SCR_CMD23_SUPPORT) != 0;
 	if (test_counted && supported && version >= 2 && (control & mode) == mode &&
-	    !storage->ddr.counted_reads_failed)
+	    (short_counted || !storage->ddr.counted_reads_failed))
 		req.auto_command = SdmmcAutoBlockCount;
 #endif
 	bool ok = sdmmc_execute_cmd(host, &cmd, &req, blkcnt_out);
@@ -307,10 +314,20 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 #endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
 	if (test_counted) {
-		if (req.auto_command == SdmmcAutoBlockCount && !ok)
-			storage->ddr.counted_reads_failed = true;
+		if (req.auto_command == SdmmcAutoBlockCount && !ok) {
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+			if (short_counted)
+				storage->ddr.short_counted_reads_failed = true;
+			else
+#endif
+				storage->ddr.counted_reads_failed = true;
+		}
 		ddr_trace_counted_read(version, supported, storage->ddr.counted_reads_failed,
-			ok && req.auto_command == SdmmcAutoBlockCount);
+			ok && req.auto_command == SdmmcAutoBlockCount && !short_counted);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+		if (short_counted && req.auto_command == SdmmcAutoBlockCount)
+			ddr_trace_short_counted_read(ok);
+#endif
 	}
 #endif
 	if (ok)
