@@ -6,6 +6,13 @@
 #include "../source/emmc/sdmmc_ddr200.c"
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+static unsigned wake_io_errors, wake_io_cmd;
+void ddr_trace_wake_io(const sdmmc_t *host, u32 cmd, ddr_eye_t eye)
+{
+    assert(host->id == SDMMC_1 && ddr_eye_width(eye) <= DdrTapCount);
+    ++wake_io_errors;
+    wake_io_cmd = cmd;
+}
 void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
 { (void)step; (void)detail; (void)result; }
 void ddr_trace_wake_host(const sdmmc_t *host) { (void)host; }
@@ -432,7 +439,7 @@ static void reset(void)
     card.ddr.last_sweep_us = now;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     full_probe_failures = full_data_calls = drop_probes = 0;
-    handoff_data = wake_remaps = wake_attempts = 0;
+    handoff_data = wake_remaps = wake_attempts = wake_io_errors = wake_io_cmd = 0;
     inject_adma_error = false;
     reject_handback = false;
     drop_reason = DdrDropUnknown;
@@ -481,6 +488,7 @@ static void test_failed_writes(void)
         stop_ok = recover;
         assert(!sdmmc_storage_write(&card, 1024, 16, data));
         assert(write_commands == 1 && discarded_windows == 1 && !cached_window);
+        assert(wake_io_errors == 1 && wake_io_cmd == MMC_WRITE_MULTIPLE_BLOCK);
         assert(!card.ddr.blocks && card.ddr.ready == (bool)recover);
         unsigned before = commands;
         if (recover) {
@@ -496,6 +504,19 @@ static void test_failed_writes(void)
             assert(commands == before);
         }
     }
+}
+
+static void test_first_wake_read(void)
+{
+    reset();
+    u8 data[16 * 512];
+    full_eye = (ddr_eye_t){29, 44};
+    host.wake_commands = 8;
+    fail_reads = 1;
+    assert(sdmmc_storage_read(&card, 4096, 16, data));
+    assert(wake_io_errors == 1 && wake_io_cmd == MMC_READ_MULTIPLE_BLOCK);
+    assert(stops == 1 && resets == 1 && host.wake_commands == 7);
+    assert(full_data_calls == 2 && full_data_taps[0] != full_data_taps[1]);
 }
 #endif
 
@@ -566,6 +587,7 @@ int main(void)
     test_power_limit();
 #ifdef EMUMMC_DDR200_READ_AHEAD
     test_failed_writes();
+    test_first_wake_read();
 #endif
     u8 functions[64] = {[7] = 15, [9] = 7, [10] = 0x40};
     reset();
@@ -698,6 +720,7 @@ int main(void)
     test_power_limit();
 #ifdef EMUMMC_DDR200_READ_AHEAD
     test_failed_writes();
+    test_first_wake_read();
 #endif
     test_eye_model();
     u8 functions[64] = {[9] = 7, [10] = 0x40};

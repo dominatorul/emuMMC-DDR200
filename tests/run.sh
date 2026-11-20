@@ -48,3 +48,4 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_trac
 python3 tools/read-ddr-trace.py "$out/trace.bin" > "$out/trace.txt"
 grep -F 'Read-ahead cache maintenance per 2 MiB DMA: 19 us before, 21 us after' "$out/trace.txt"
 grep -F 'Read-ahead cooldown: 2/3 strikes, 1 re-enables' "$out/trace.txt"
+grep -F 'wake SD command failure, CMD18, tap 32, eye 29–35, ADMA2, 1 whole descriptors, 128 blocks remaining' "$out/trace.txt"

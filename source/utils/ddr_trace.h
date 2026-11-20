@@ -60,8 +60,9 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *host, ddr_eye
 void ddr_trace_sdma_restart(bool handoff);
 void ddr_trace_handoff_sdma(void);
 enum DdrWakeStep { WakeSuspend, WakeCmd6, WakeRetire, WakeClose, WakeOpen, WakeHost, WakePower,
-    WakeReassert, WakeMap, WakeCommand, WakeRetry, WakeFailed, WakeFirstFailure, WakePll, WakeRetained };
+    WakeReassert, WakeMap, WakeCommand, WakeRetry, WakeFailed, WakeFirstFailure, WakePll, WakeRetained, WakeIoFailure };
 void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result);
+void ddr_trace_wake_io(const sdmmc_t *host, u32 cmd, ddr_eye_t eye);
 void ddr_trace_wake_host(const sdmmc_t *host);
 #ifdef EMUMMC_DDR200_DLL_DIAG
 void ddr_trace_dll_sweep(const sdmmc_t *host, ddr_eye_t eye, u8 kind);

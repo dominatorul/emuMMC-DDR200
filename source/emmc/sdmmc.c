@@ -270,7 +270,18 @@ static bool stop_failed_transfer(sdmmc_storage_t *storage)
 	return reset;
 }
 
-static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors, void *buf, u32 is_write)
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static void trace_wake_io(sdmmc_storage_t *storage, u32 cmd)
+{
+    enum DdrRate rate = storage->ddr.rate;
+    const ddr_history_t *history = &storage->ddr.history[rate == DdrRateReduced];
+    ddr_eye_t eye = rate >= DdrRateReduced && history->count ? history->eyes[0] : (ddr_eye_t){DdrTapCount, 0};
+    ddr_trace_wake_io(storage->sdmmc, cmd, eye);
+}
+#endif
+
+static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 sector, u32 num_sectors,
+                                void *buf, u32 is_write, bool wake)
 {
 	sdmmc_t *host = storage->sdmmc;
 	sdmmc_cmd_t cmd;
@@ -320,6 +331,8 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 	u32 irq = host->command_irq;
 	u16 auto_stop_error = host->command_auto_stop_error;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+	if (wake && host->id == SDMMC_1)
+		trace_wake_io(storage, cmd.cmd);
 	sdmmc_dma_progress_t progress = host->dma_progress;
 	u32 resumes = host->dma_resumes;
 #else
@@ -342,7 +355,12 @@ static int storage_transfer_once(sdmmc_storage_t *storage, u32 *blkcnt_out, u32 
 
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write)
 {
-    return storage_transfer_once(storage, done, sector, count, buf, write);
+    bool wake = false;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    sdmmc_t *host = storage->sdmmc;
+    wake = host->wake_pending || host->wake_commands || host->handoff_sdma;
+#endif
+    return storage_transfer_once(storage, done, sector, count, buf, write, wake);
 }
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
@@ -351,7 +369,7 @@ static int wake_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 co
     sdmmc_t *host = storage->sdmmc;
     bool first = host->wake_commands-- == 8;
     *done = 0;
-    bool ok = storage_transfer_once(storage, done, sector, count, buf, write);
+    bool ok = storage_transfer_once(storage, done, sector, count, buf, write, true);
     if (first || !ok)
         ddr_trace_wake(WakeCommand, host->dma_progress.mode | (write << 8), ok ? 0 : (host->command_irq ? host->command_irq : host->command_failure));
     if (ok)
@@ -374,7 +392,7 @@ static int wake_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 co
 #endif
         *done = 0;
         host->wake_sdma = sdma;
-        ok = storage_transfer_once(storage, done, sector, count, buf, write);
+        ok = storage_transfer_once(storage, done, sector, count, buf, write, true);
         host->wake_sdma = false;
         ddr_trace_wake(WakeRetry, host->dma_progress.mode, ok ? 0 : host->command_failure);
         if (ok)
@@ -426,7 +444,7 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 #ifdef EMUMMC_DDR200_ADMA_PROBE
             bool ok = wake && !attempt ?
                 wake_transfer(storage, &blocks, sector, count, bytes, is_write) :
-                sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
+                storage_transfer_once(storage, &blocks, sector, count, bytes, is_write, wake);
 #else
             bool ok = sdmmc_storage_transfer(storage, &blocks, sector, count, bytes, is_write);
 #endif
@@ -1164,6 +1182,8 @@ int sdmmc_sd_switch(sdmmc_storage_t *storage, u8 *status, u32 argument)
 	if (storage->sdmmc->handoff_sdma)
 		ddr_trace_wake(WakeCmd6, argument, ((u32)storage->sdmmc->dma_progress.mode << 30) |
 			(ok ? 0 : (storage->sdmmc->command_irq & 0x3fffffffu) | 1));
+	if (!ok && storage->sdmmc->handoff_sdma)
+		trace_wake_io(storage, SD_SWITCH);
 #endif
 	return ok;
 }

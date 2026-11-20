@@ -62,6 +62,20 @@ void ddr_trace_wake_host(const sdmmc_t *host)
         PINMUX_AUX(PINMUX_AUX_DMIC3_CLK));
     ddr_trace_wake(WakePll, CLOCK(CLK_RST_CONTROLLER_PLLC4_BASE), CLOCK(CLK_RST_CONTROLLER_PLLC4_MISC));
 }
+
+void ddr_trace_wake_io(const sdmmc_t *host, u32 cmd, ddr_eye_t eye)
+{
+    const sdmmc_dma_progress_t *dma = &host->dma_progress;
+    unsigned progress = host->dma_resumes;
+    if (dma->mode == SdmmcDmaAdma2 && dma->sampled && dma->remaining <= dma->blocks) {
+        unsigned bytes = (dma->blocks - dma->remaining) * dma->block_bytes;
+        progress = dma->remaining ? bytes / SdmmcAdmaChunk : dma->descriptors;
+    }
+    unsigned tap = (host->regs->venclkctl >> 16) & 0xff;
+    ddr_trace_wake(WakeIoFailure, cmd | (tap << 8) | ((u32)eye.left << 16) | ((u32)eye.right << 24),
+        dma->mode | (MIN(progress, 0x1ffu) << 2) | ((u32)dma->remaining << 11) |
+        ((u32)dma->sampled << 27) | ((host->command_failure & 15) << 28));
+}
 #endif
 #ifdef EMUMMC_DDR200_DLL_DIAG
 enum { DllRows = 26, OtherRows = 6 };

@@ -5,6 +5,7 @@
 #include "../source/emuMMC/emummc.h"
 #define armGetTls() ((void *)0)
 #include "../source/emuMMC/emummc.c"
+#include "../source/emmc/sdmmc_read_ahead.c"
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 void ddr_trace_wake(enum DdrWakeStep step, u32 detail, u32 result)
@@ -16,8 +17,10 @@ static bool powered;
 static t210_sdmmc_t registers;
 static sdmmc_accessor_t sd_accessor, nand_accessor;
 static unsigned locks, closed, opened, reasserted, handbacks;
-static unsigned unmapped, wake_started;
-static bool private_mapping, fail_handback, expect_snapshot;
+static unsigned desc_maps, window_maps, desc_unmaps, window_unmaps, wake_started;
+static Handle das = 1;
+static u32 pllc4_base = 0x58006804;
+static bool fail_handback, expect_snapshot;
 static jmp_buf snapshot;
 static char sd_lock, nand_lock;
 volatile emuMMC_ctx_t emuMMC_ctx = {.EMMC_Type = emuMMC_SD_Raw};
@@ -49,15 +52,68 @@ void fatal_abort(enum FatalReason reason)
     assert(expect_snapshot && reason == Fatal_DdrWake);
     longjmp(snapshot, 1);
 }
-void sdmmc_read_ahead_reset(void)
+static bool private_mapping(void)
 {
-    if (private_mapping) {
-        assert(locks == 2 && powered && native_sd_transitions);
-        assert((registers.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
-        private_mapping = false;
-        ++unmapped;
-    }
+    return descriptor_mapping.dma || read_ahead.mapping.dma;
 }
+
+Result svcMapDeviceAddressSpaceAligned(Handle handle, Handle process, u64 address, u64 size,
+    u64 device_address, u32 permission)
+{
+    assert(handle == das && process == current_process);
+    assert(((address ^ device_address) & (DeviceAlignment - 1)) == 0);
+    if (address == (uintptr_t)&descriptor_table) {
+        assert(size == sizeof(descriptor_table) && permission == Perm_R);
+        ++desc_maps;
+    } else {
+        assert(address == (uintptr_t)&read_window && size == sizeof(read_window) && permission == Perm_W);
+        ++window_maps;
+    }
+    return 0;
+}
+
+Result svcUnmapDeviceAddressSpace(Handle handle, Handle process, u64 address, u64 size, u64 device_address)
+{
+    assert(handle == das && process == current_process && locks == 2 && powered);
+    assert((registers.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
+    if (address == (uintptr_t)&descriptor_table) {
+        assert(size == sizeof(descriptor_table) && device_address == descriptor_mapping.dma);
+        ++desc_unmaps;
+    } else {
+        assert(address == (uintptr_t)&read_window && size == sizeof(read_window));
+        assert(device_address == read_ahead.mapping.dma);
+        ++window_unmaps;
+    }
+    return 0;
+}
+
+void armDCacheClean(void *buf, size_t bytes)
+{
+    assert(buf == descriptor_table.entries && bytes == sizeof(descriptor_table.entries[0]));
+}
+
+void ddr_trace_read_ahead_map(Result result) { assert(!result); }
+void ddr_trace_descriptor_mapping(bool unmap, u32 handle, Result result)
+{
+    (void)unmap;
+    assert(handle == das && !result);
+}
+
+static void map_first_commands(void)
+{
+    /* The first write maps only descriptors. A subsequent qualified read
+       maps the window, reusing the descriptor page for its transfer. */
+    unsigned previous_descriptors = desc_maps, previous_windows = window_maps;
+    assert(!private_mapping() && !read_ahead.blocks && !read_ahead.adma_verified);
+    assert(sdmmc_adma_table(0x8000, 512) && desc_maps == previous_descriptors + 1);
+    assert(window_maps == previous_windows && descriptor_mapping.das == das);
+    assert(map_window(&read_ahead.mapping, das, &read_window, sizeof(read_window), Perm_W));
+    assert(sdmmc_adma_table(0x8000, 512) && desc_maps == previous_descriptors + 1);
+    assert(window_maps == previous_windows + 1 && read_ahead.mapping.das == das);
+    read_ahead.blocks = ReadAheadBlocks;
+    read_ahead.adma_verified = true;
+}
+
 FRESULT f_close(FIL *file) { (void)file; assert(false); return FR_INT_ERR; }
 FRESULT f_mount(FATFS *fs, const TCHAR *path, BYTE option)
 {
@@ -84,10 +140,12 @@ static sdmmc_accessor_t *get_nand(void) { return &nand_accessor; }
 static u64 native_open(void *accessor)
 {
     assert(accessor == &sd_accessor && !locks && native_sd_transitions);
-    assert(!private_mapping);
+    assert(!private_mapping());
     assert(!_ddr200_reassert(FS_SDMMC_EMMC));
     powered = true;
     registers.hostctl2 = UHS_SDR104_BUS_SPEED;
+    ++das;
+    pllc4_base = opened & 1 ? 0x58006804 : 0x58003402;
     ++opened;
     return 0;
 }
@@ -98,7 +156,7 @@ static u64 native_close(void *accessor)
     if (accessor == &sd_accessor) {
         assert(native_sd_transitions && wait_for_native);
         assert((registers.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
-        assert(!private_mapping);
+        assert(!private_mapping());
         ++closed;
         powered = false;
     } else {
@@ -113,7 +171,7 @@ bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *card)
 {
     assert(locks == 2 && _current_accessor == &sd_accessor && powered);
     assert(card->ddr.rate == DdrRateFull);
-    assert(private_mapping);
+    assert(private_mapping());
     card->ddr.resume_rate = card->ddr.rate;
     card->ddr.rate = DdrRateSdr104;
     registers.hostctl2 = UHS_SDR104_BUS_SPEED;
@@ -124,7 +182,8 @@ bool sdmmc_ddr200_prepare_suspend(sdmmc_storage_t *card)
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *card)
 {
     assert(powered && (registers.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
-    assert(!private_mapping);
+    assert(!private_mapping());
+    assert(clock_pllc4_ddr200_compatible(pllc4_base));
     ++reasserted;
     card->ddr.rate = DdrRateFull;
     card->ddr.resume_rate = DdrRateUnknown;
@@ -154,26 +213,37 @@ int main(void)
     sd_storage.initialized = sd_storage.ddr.capable = sd_storage.ddr.ready = true;
     sd_storage.ddr.rate = DdrRateFull;
     sd_sdmmc.regs = &registers;
+    sdmmc_das_handle = &das;
     registers.hostctl2 = UHS_DDR50_BUS_SPEED;
     native_sd_opened = boot_power_window_closed = powered = true;
 
+    map_first_commands();
     for (unsigned cycle = 1; cycle <= 3; ++cycle) {
-        private_mapping = true; /* Ordinary I/O before sleep. */
         assert(!controller_close(FS_SDMMC_SD) && closed == cycle - 1);
-        assert(!controller_close(FS_SDMMC_EMMC) && closed == cycle && handbacks == cycle && unmapped == cycle);
+        assert(!controller_close(FS_SDMMC_EMMC) && closed == cycle && handbacks == cycle);
+        assert(desc_unmaps == cycle && window_unmaps == cycle && !private_mapping());
         assert(!_ddr200_reassert(FS_SDMMC_EMMC) && !powered);
         assert(!controller_open(FS_SDMMC_SD) && opened == cycle);
         assert(_ddr200_reassert(FS_SDMMC_EMMC) && reasserted == cycle && wake_started == cycle);
         assert(_ddr200_reassert(FS_SDMMC_EMMC) && reasserted == cycle);
+        assert(sd_sdmmc.wake_commands == 8 && !read_ahead.blocks);
+        map_first_commands();
+        assert(desc_maps == cycle + 1 && window_maps == cycle + 1);
     }
 
     registers.hostctl2 = UHS_SDR104_BUS_SPEED;
+    acquire(&sd_lock);
+    acquire(&nand_lock);
     assert(_ddr200_reassert(FS_SDMMC_EMMC) && reasserted == 4 && opened == 3);
-    private_mapping = fail_handback = expect_snapshot = true;
+    release(&nand_lock);
+    release(&sd_lock);
+    assert(desc_unmaps == 4 && window_unmaps == 4);
+    map_first_commands();
+    fail_handback = expect_snapshot = true;
     if (!setjmp(snapshot)) {
         controller_close(FS_SDMMC_EMMC);
         assert(false);
     }
-    assert(!private_mapping && closed == 3 && unmapped == 4);
-    puts("Three paired suspend/wake cycles and a host-only wake passed in the lifecycle model");
+    assert(!private_mapping() && closed == 3 && desc_unmaps == 5 && window_unmaps == 5);
+    puts("Three suspend/wake cycles and one host-only wake retired and remapped both ADMA windows exactly once");
 }

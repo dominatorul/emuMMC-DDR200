@@ -208,7 +208,7 @@ def print_lifecycle(data, offset):
 WAKE_STEPS = ('suspend begin', 'handoff CMD6', 'mapping retired', 'native close',
               'native open', 'wake host registers', 'wake power registers', 'wake reassertion',
               'descriptor map', 'ordinary command', 'DMA retry', 'wake failure', 'first failure',
-              'wake PLLC4 registers', 'retained DDR link check')
+              'wake PLLC4 registers', 'retained DDR link check', 'wake SD command failure')
 DLL_REGISTERS = ('venclkctl', 'vencapover', 'veniotrimctl', 'vendllcalcfg', 'vendllcalcfgsts')
 
 
@@ -236,6 +236,16 @@ def print_wake(data, gprs, offset):
         elif step == 14:
             fields = (f'{RATES[detail & 3]}, clock configured {bool(result & 1)}, '
                       f'CMD13 ready {bool(result & 2)}, verified eye and data {bool(result & 4)}')
+        elif step == 15:
+            cmd, tap = detail & 255, (detail >> 8) & 255
+            left, right = (detail >> 16) & 255, detail >> 24
+            eye = f'{left}–{right}' if left <= right else 'unavailable'
+            mode, progress, remaining = result & 3, (result >> 2) & 0x1FF, (result >> 11) & 0xFFFF
+            units = 'whole descriptors' if mode == 3 else 'restarts'
+            progress_text = f'{progress} {units}' if mode != 3 or result & (1 << 27) else 'DMA progress unavailable'
+            if result & (1 << 27):
+                progress_text += f', {remaining} blocks remaining'
+            fields = f'CMD{cmd}, tap {tap}, eye {eye}, {DMA_MODES[mode]}, {progress_text}, phase {result >> 28}'
         else:
             fields = f'detail {detail:#x}, result {result:#010x}'
         print(f'  {timing & 0x00FFFFFFFFFFFFFF} us {label}, {fields}')
