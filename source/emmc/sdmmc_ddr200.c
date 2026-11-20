@@ -259,8 +259,11 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     /* Match Hekate's full sweep, TUNED_CLK pass map and midpoint. Horizon
        reuses a live link, so verify that midpoint before resuming FS I/O. */
     unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
-    ddr_eye_t eye = kind == DdrSweepTrack ? ddr_widest_eye(passing, samples) : ddr_hekate_eye(raw);
+    bool runtime = kind == DdrSweepTrack || kind == DdrSweepRecovery;
+    ddr_eye_t eye = runtime ? ddr_widest_eye(passing, samples) : ddr_hekate_eye(raw);
     unsigned applied = SDMMC_INVALID_TAP;
+    ddr_eye_t previous = history->eyes[0];
+    bool had_eye = history->count != 0;
     *history = (ddr_history_t){0};
     if (ddr_eye_width(eye))
         ddr_remember_eye(history, eye);
@@ -281,9 +284,27 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
             sdmmc_set_ddr200_tap(host, tap);
             if (sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000))
                 applied = tap;
-        } else if (!ddr_tap_passes(tried, tap) &&
-                   verify_tap(storage, eye, sector, tap, DdrTapMargin, tried)) {
-            applied = tap;
+        } else {
+            unsigned guard = DdrTapMargin;
+            if (runtime) {
+                /* A CRC can disqualify the midpoint even when both edges
+                   still pass CMD19. Verify a nearby tap with real data. */
+                unsigned prior = tap_readback(host);
+                if (kind == DdrSweepTrack && had_eye && previous.left == eye.left &&
+                    previous.right == eye.right && prior >= eye.left + DdrNarrowMargin &&
+                    prior + DdrNarrowMargin <= eye.right) {
+                    tap = prior;
+                    guard = DdrNarrowMargin;
+                }
+            }
+            if (!ddr_tap_passes(tried, tap) && verify_tap(storage, eye, sector, tap, guard, tried))
+                applied = tap;
+            if (applied == SDMMC_INVALID_TAP && runtime && policy->rate == rate) {
+                int alternate = ddr_pick_tap_in_range(eye.left + DdrNarrowMargin,
+                    eye.right - DdrNarrowMargin, tried, false);
+                if (alternate >= 0 && verify_tap(storage, eye, sector, alternate, DdrNarrowMargin, tried))
+                    applied = alternate;
+            }
         }
     }
     policy->last_sweep_us = get_tmr_us();
@@ -446,19 +467,41 @@ static bool enter_from_sdr104(sdmmc_storage_t *storage, u8 status[64])
     return enter_ddr(storage, status);
 }
 
-static bool train_sdr104(sdmmc_storage_t *storage)
+#ifdef EMUMMC_DDR200_HEKATE
+static bool verify_sdr104(sdmmc_storage_t *storage, u8 status[64])
+{
+    return sdmmc_sd_switch(storage, status, 0x00ffffff) && status[16] == 3 &&
+        sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
+}
+#endif
+
+static bool train_sdr104(sdmmc_storage_t *storage, u8 status[64])
 {
     sdmmc_t *host = storage->sdmmc;
-    bool ready = sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104) &&
-        sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
-        sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
+    if (!sdmmc_setup_clock(host, SDHCI_TIMING_UHS_SDR104))
+        return false;
+    bool tuned = sdmmc_tuning_execute(host, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK);
 #ifdef EMUMMC_DDR200_HEKATE
+    bool ready = tuned && verify_sdr104(storage, status);
+    if (!ready) {
+        u32 raw[4] = {0}, passing[4] = {0};
+        host->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
+        unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+        ddr_eye_t eye = ddr_widest_eye(passing, samples);
+        if (ddr_eye_width(eye) >= 2 * DdrNarrowMargin + 1) {
+            sdmmc_set_ddr200_tap(host, (eye.left + eye.right) / 2);
+            host->regs->hostctl2 |= SDHCI_CTRL_TUNED_CLK;
+            ready = verify_sdr104(storage, status);
+        }
+    }
     if (ready) {
         storage->ddr.sdr104_tap = tap_readback(host);
         storage->ddr.sdr104_tap_valid = true;
     }
-#endif
     return ready;
+#else
+    return tuned && sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
+#endif
 }
 
 #ifdef EMUMMC_DDR200_HEKATE
@@ -489,7 +532,7 @@ static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
     if (restore_sdr104_tap(storage, status))
         return true;
 #endif
-    return train_sdr104(storage);
+    return train_sdr104(storage, status);
 }
 
 static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8 status[64])
@@ -575,8 +618,7 @@ static bool restore_sdr104_tap(sdmmc_storage_t *storage, u8 status[64])
     host->regs->hostctl2 |= SDHCI_CTRL_TUNED_CLK;
 
     u64 old = begin_budget(host, 120000);
-    bool ready = sdmmc_sd_switch(storage, status, 0x00ffffff) && status[16] == 3 &&
-        sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
+    bool ready = verify_sdr104(storage, status);
     host->deadline_us = old;
     return ready;
 }
@@ -681,10 +723,14 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     } else if (standard) {
         /* Horizon has already completed its native SDR104 init. Reuse the
            standard timing while keeping our serialized emuMMC transport. */
-        ok = ok || train_sdr104(storage);
+        ok = ok || train_sdr104(storage, status);
         storage->csd.busspeed = 104;
     } else if (want_ddr) {
         ok = restore_retained_ddr(storage, requested, status);
+#ifdef EMUMMC_DDR200_HEKATE
+    } else if (requested == DdrRateSdr104) {
+        ok = train_sdr104(storage, status);
+#endif
     }
     if (!ok && standard && policy->rate == DdrRateSdr104)
         ok = set_sdr104(storage, status);

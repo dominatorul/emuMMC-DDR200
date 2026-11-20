@@ -134,6 +134,13 @@ u32 sdmmc_scan_ddr200(sdmmc_t *target, u32 first, u32 end, u32 raw[4], u32 passi
     if (end - first < DdrTapCount)
         ++hint_scans;
     bool reduced = host.divisor == 166400;
+#ifdef EMUMMC_DDR200_HEKATE
+    if ((regs.hostctl2 & 7) == UHS_SDR104_BUS_SPEED) {
+        produce_eye(passing, (ddr_eye_t){19, 27}, 46, first, end);
+        memcpy(raw, passing, 4 * sizeof(u32));
+        return end - first;
+    }
+#endif
     produce_eye(passing, reduced ? reduced_eye : full_eye, reduced ? 55 : 46, first, end);
     memcpy(raw, passing, 4 * sizeof(u32));
     return end - first;
@@ -352,6 +359,10 @@ void ddr_trace_policy_sweep(const sdmmc_t *target, ddr_eye_t eye, unsigned tap, 
     if (tap < DdrTapCount && kind < DdrSweepNoise) {
         unsigned guard = target->divisor == 199680 && kind != DdrSweepInitial &&
                          ddr_eye_width(eye) < 2 * DdrTapMargin + 1 ? DdrNarrowMargin : DdrTapMargin;
+#ifdef EMUMMC_DDR200_HEKATE
+        if (kind == DdrSweepRecovery || kind == DdrSweepTrack)
+            guard = DdrNarrowMargin;
+#endif
         assert(tap >= eye.left + guard && tap + guard <= eye.right);
     }
 #ifdef EMUMMC_DDR200_MATRIX
@@ -534,14 +545,18 @@ int main(void)
         assert(window[i] == 0x6f);
 
     reset();
-    full_eye = (ddr_eye_t){28, 36};
+    full_eye = (ddr_eye_t){29, 35};
     regs.venclkctl = 32 << 16;
     host.wake_commands = 8;
     fail_reads = 1;
     u8 data[16 * 512];
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, false));
-    assert(!wake_remaps && switched_to_stock == 1 && card.ddr.rate == DdrRateSdr104);
-    assert(stops == 1 && resets == 1 && full_data_calls == 1);
+    assert(!wake_remaps && !switched_to_stock && card.ddr.rate == DdrRateFull);
+    assert(stops == 1 && resets == 1 && full_data_calls == 2);
+    assert(full_data_taps[0] == 32 && full_data_taps[1] == 31 && verifies == 2);
+    card.ddr.busy_us = DdrNarrowTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false));
+    assert(tap_readback(&host) == 31 && verifies == 4);
 
     reset();
     full_eye = (ddr_eye_t){29, 35};
@@ -560,6 +575,16 @@ int main(void)
     assert(_sdmmc_storage_readwrite(&card, 1024, 16, data, true));
     assert(commands == 1 && !full_data_calls && card.ddr.rate == DdrRateSdr104);
     assert(tap_readback(&host) == 21 && !card.ddr.wake_write_check);
+
+    reset();
+    card.ddr.rate = card.ddr.resume_rate = DdrRateSdr104;
+    card.ddr.sdr104_tap_valid = true;
+    card.ddr.sdr104_tap = 72;
+    required_sdr104_tap = 23;
+    reject_sdr104_tuning = true;
+    assert(sdmmc_ddr200_handoff(&card));
+    assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && tap_readback(&host) == 23);
+    assert(card.ddr.sdr104_tap == 23 && !switched_to_stock);
 
     reset();
     full_eye = (ddr_eye_t){30, 35};
