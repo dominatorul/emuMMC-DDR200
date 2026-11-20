@@ -111,9 +111,26 @@ static _Atomic u32 largest_fs_read, read_ahead_blocks, map_attempts, map_result;
 static _Atomic u32 read_ahead_fills[2];
 #endif
 static _Atomic u64 matrix_status;
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && !defined(EMUMMC_DDR200_READ_AHEAD) && !defined(EMUMMC_DDR200_MATRIX)
+static _Atomic u32 pad_recalibration;
+#endif
 static _Atomic u64 bus_registers, clock_registers;
 static _Atomic u64 native_before, native_after;
 static _Atomic u32 sampled_rate;
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+void ddr_trace_pad_recalibration(ddr_eye_t before, ddr_eye_t after, bool used_fallback)
+{
+#if !defined(EMUMMC_DDR200_READ_AHEAD) && !defined(EMUMMC_DDR200_MATRIX)
+    pad_recalibration = before.left | 0x80u | ((u32)before.right << 8) |
+        ((u32)used_fallback << 15) | ((u32)after.left << 16) | ((u32)after.right << 24);
+#else
+    (void)before;
+    (void)after;
+    (void)used_fallback;
+#endif
+}
+#endif
 
 void ddr_trace_stage(enum DdrStage stage, u32 detail)
 {
@@ -468,6 +485,10 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[2] = ((u64)reads << 32) | writes;
     ctx->gprs[3] = ((u64)reasserts << 32) | runtime_events;
     ctx->gprs[4] = ((u64)matrix_events << 32) | MatrixCount;
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && !defined(EMUMMC_DDR200_READ_AHEAD) && !defined(EMUMMC_DDR200_MATRIX)
+    /* In ADMA2 reports without a matrix or read-ahead, the upper half is spare. */
+    ctx->gprs[4] |= (u64)pad_recalibration << 32;
+#endif
     ctx->gprs[5] = functions;
     ctx->gprs[6] = ((u64)io_errors << 32) | ready_khz;
     ctx->gprs[7] = last_failure[1];

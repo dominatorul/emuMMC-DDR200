@@ -227,6 +227,26 @@ static ddr_eye_t scan_eye(sdmmc_storage_t *storage, const ddr_history_t *history
     return eye;
 }
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+static ddr_eye_t scan_after_pad_calibration(sdmmc_storage_t *storage, ddr_eye_t before)
+{
+    ddr_history_t hint = {.eyes = {before}, .count = 1};
+    u32 raw[4] = {0}, passing[4] = {0}, samples;
+    ddr_eye_t eye = scan_eye(storage, &hint, true, raw, passing, &samples);
+    if (ddr_eye_width(eye) >= SDMMC_SAMPLE_WIN_SIZE_MIN) {
+        /* Accept a wider eye only where consecutive scans agree. */
+        hint.eyes[0] = eye;
+        memset(raw, 0, sizeof(raw));
+        memset(passing, 0, sizeof(passing));
+        ddr_eye_t confirmed = scan_eye(storage, &hint, true, raw, passing, &samples);
+        eye.left = MAX(eye.left, confirmed.left);
+        eye.right = MIN(eye.right, confirmed.right);
+    }
+    ddr_trace_pad_recalibration(before, eye, storage->sdmmc->autocal_fallback);
+    return eye;
+}
+#endif
+
 static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, bool local,
                   u32 sector, int failed_tap, const u32 failed[4])
 {
@@ -263,6 +283,17 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     } else {
         eye = scan_eye(storage, history, local, raw, passing, &samples);
     }
+    bool recalibrated = false;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    unsigned baseline_width = ddr_eye_width(eye);
+    if (rate == DdrRateFull && (kind == DdrSweepTrack || kind == DdrSweepRecovery) &&
+        !policy->narrow_recalibrated && !host->handoff_sdma && !host->wake_pending && !host->wake_commands &&
+        baseline_width >= 2 * DdrNarrowMargin + 1 && baseline_width < SDMMC_SAMPLE_WIN_SIZE_MIN &&
+        sdmmc_recalibrate_ddr200_pads(host)) {
+        policy->narrow_recalibrated = recalibrated = true;
+        eye = scan_after_pad_calibration(storage, eye);
+    }
+#endif
     ddr_eye_t previous = history->eyes[0];
     bool had_eye = history->count != 0;
     if (ddr_eye_width(eye))
@@ -285,7 +316,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
         previous.left == eye.left && previous.right == eye.right &&
         prior_tap == policy->narrow_verified_tap &&
         started - policy->narrow_verified_at < DdrNarrowVerifyUs;
-    bool reuse = tracking && (!narrow || verified_narrow) && width >= 2 * guard + 1 &&
+    bool reuse = tracking && !recalibrated && (!narrow || verified_narrow) && width >= 2 * guard + 1 &&
         prior_tap >= eye.left + guard && prior_tap <= eye.right - guard &&
         (!had_eye || previous.right < eye.right + 3u);
     if (reuse) {

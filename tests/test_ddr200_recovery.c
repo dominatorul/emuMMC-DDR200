@@ -26,6 +26,9 @@ static unsigned full_probe_failures, full_data_taps[8], full_data_calls, drop_pr
 static unsigned handoff_data, wake_remaps, wake_attempts;
 static bool wake_modes[4];
 static bool inject_adma_error;
+static bool can_recalibrate;
+static unsigned calibrations, scans_after_calibration;
+static ddr_eye_t calibrated_eye, confirmed_eye, reported_baseline, reported_calibrated;
 bool sdmmc_adma_remap(void) { ++wake_remaps; return true; }
 void fatal_abort(enum FatalReason reason) { (void)reason; __builtin_trap(); }
 static bool reject_handback;
@@ -93,6 +96,24 @@ void sdmmc_ddr200_restore_host_cfg(sdmmc_t *target)
     event('H');
 }
 
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_recalibrate_ddr200_pads(sdmmc_t *target)
+{
+    assert(target == &host && !target->powersave_enabled && !target->handoff_sdma);
+    if (!can_recalibrate)
+        return false;
+    ++calibrations;
+    return true;
+}
+
+void ddr_trace_pad_recalibration(ddr_eye_t before, ddr_eye_t after, bool used_fallback)
+{
+    assert(calibrations == 1 && !used_fallback);
+    reported_baseline = before;
+    reported_calibrated = after;
+}
+#endif
+
 int sdmmc_setup_clock(sdmmc_t *target, u32 type)
 {
     assert(target == &host);
@@ -122,7 +143,12 @@ u32 sdmmc_scan_ddr200(sdmmc_t *target, u32 first, u32 end, u32 raw[4], u32 passi
     if (end - first < DdrTapCount)
         ++hint_scans;
     bool reduced = host.divisor == 166400;
-    produce_eye(passing, reduced ? reduced_eye : full_eye, reduced ? 55 : 46, first, end);
+    ddr_eye_t eye = reduced ? reduced_eye : full_eye;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (!reduced && calibrations)
+        eye = scans_after_calibration++ ? confirmed_eye : calibrated_eye;
+#endif
+    produce_eye(passing, eye, reduced ? 55 : 46, first, end);
     memcpy(raw, passing, 4 * sizeof(u32));
     return end - first;
 }
@@ -378,6 +404,9 @@ static void reset(void)
     inject_adma_error = false;
     reject_handback = false;
     drop_reason = DdrDropUnknown;
+    can_recalibrate = false;
+    calibrations = scans_after_calibration = 0;
+    calibrated_eye = confirmed_eye = reported_baseline = reported_calibrated = (ddr_eye_t){DdrTapCount, 0};
 #endif
     card.csd.busspeed = 200;
     _current_accessor = &accessor;
@@ -665,6 +694,34 @@ int main(void)
     full_eye = (ddr_eye_t){29, 44};
     assert(sdmmc_ddr200_before_io(&card, 1024, false) && card.ddr.rate == DdrRateFull);
     assert(card.ddr.upgrades == 1 && card.ddr.unstable);
+
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    /* Recalibrate after CRC cleanup, exclude the failed tap, and verify the
+       overlap of the fresh scans. A transient eight-tap scan must not pass. */
+    for (unsigned stable = 0; stable <= 1; ++stable) {
+        reset();
+        can_recalibrate = true;
+        full_eye = (ddr_eye_t){30, 35};
+        calibrated_eye = (ddr_eye_t){29, 36};
+        confirmed_eye = stable ? calibrated_eye : full_eye;
+        fail_reads = 1;
+        sdmmc_set_ddr200_tap(&host, 32);
+        assert(_sdmmc_storage_readwrite(&card, 1024, 16, buf, 0));
+        assert(stops == 1 && resets == 1 && calibrations == 1 && scans_after_calibration == 2);
+        assert(ddr_eye_width(reported_baseline) == 6 && ddr_eye_width(reported_calibrated) == (stable ? 8 : 6));
+        assert(card.ddr.narrow_recalibrated && card.ddr.rate == DdrRateFull && !switched_to_stock);
+        assert(verifies >= 2 && tap_readback(&host) != 32);
+        card.ddr.busy_us = DdrTrackBusyUs;
+        assert(sdmmc_ddr200_before_io(&card, 1024, false) && calibrations == 1);
+    }
+
+    reset();
+    can_recalibrate = true;
+    host.wake_commands = 8;
+    full_eye = (ddr_eye_t){30, 35};
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false) && !calibrations);
+#endif
 
     reset();
     card.ddr.narrow = true;

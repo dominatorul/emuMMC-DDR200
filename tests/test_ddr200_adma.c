@@ -35,6 +35,14 @@ static u16 fault_irq;
 static bool stale_data, mapping_ok = true;
 
 u64 get_tmr_us(void) { return ++time_us; }
+void usleep(u64 delay) { time_us += delay; }
+intptr_t QueryIoMapping(u64 address, u64 size)
+{
+    (void)address;
+    (void)size;
+    assert(false);
+    return 0;
+}
 u64 get_tmr_ms(void)
 {
     if (regs.swrst) {
@@ -299,8 +307,25 @@ static void test_dma(void)
     assert(descriptor_mapping.das == das && maps == 3);
 }
 
+static void test_calibration(void)
+{
+    reset((ddr_eye_t){30, 35}, 32);
+    assert(!sdmmc_recalibrate_ddr200_pads(&host));
+    regs.pwrcon = SDHCI_POWER_180 | SDHCI_POWER_ON;
+    regs.prnsts = SDHCI_DATA_INHIBIT;
+    assert(!sdmmc_recalibrate_ddr200_pads(&host) && !regs.autocalcfg);
+    regs.prnsts = 0;
+    host.deadline_us = time_us + 100;
+    assert(!sdmmc_recalibrate_ddr200_pads(&host) && !regs.autocalcfg);
+    host.deadline_us = 0;
+    regs.clkcon = SDHCI_CLOCK_CARD_EN;
+    assert(sdmmc_recalibrate_ddr200_pads(&host) && !host.autocal_fallback);
+    assert((regs.clkcon & SDHCI_CLOCK_CARD_EN) && (regs.hostctl2 & 7) == UHS_DDR50_BUS_SPEED);
+}
+
 int main(void)
 {
+    test_calibration();
     test_dma();
 
 #ifdef EMUMMC_DDR200_READ_AHEAD

@@ -53,7 +53,7 @@ typedef struct {
     u64 narrow_verified_at;
     u64 last_sweep_us;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    bool narrow_pair;
+    bool narrow_pair, narrow_recalibrated;
     u8 tune_failure, tune_probes;
     ddr_eye_t tune_eye;
 #endif

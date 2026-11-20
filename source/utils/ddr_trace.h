@@ -68,6 +68,7 @@ void ddr_trace_batch_refused(enum DdrBatchRefusal reason);
 void ddr_trace_batch_seq(u32 blocks, bool served);
 void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
     u8 probes, ddr_eye_t eye);
+void ddr_trace_pad_recalibration(ddr_eye_t before, ddr_eye_t after, bool used_fallback);
 #endif
 
 enum DdrSweepKind {

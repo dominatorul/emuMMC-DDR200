@@ -285,6 +285,17 @@ def print_policy_trace(data, gprs):
     matrix_capacity = gprs[4] & 0xFFFFFFFF
     if matrix_capacity not in (0, 40):
         raise ValueError('invalid DDR200 trace capacity')
+    calibration = gprs[4] >> 32
+    if version == 26 and not matrix_capacity and calibration & 0x80 and \
+            (calibration & 0x7F) <= ((calibration >> 8) & 0x7F):
+        left, right = calibration & 0x7F, (calibration >> 8) & 0x7F
+        # A calibration entry starts from a five- to seven-tap runtime eye.
+        if 5 <= right - left + 1 <= 7 and not (gprs[31] >> 32):
+            after_left, after_right = (calibration >> 16) & 0xFF, calibration >> 24
+            after = (f'{after_left}–{after_right} ({after_right - after_left + 1})'
+                     if after_left <= after_right else 'unavailable')
+            outcome = 'used default pad drive' if calibration & 0x8000 else 'completed'
+            print(f'DDR200 pad recalibration {outcome}, eye {left}–{right} ({right - left + 1}) -> {after}')
     state = gprs[30]
     ready_khz = gprs[6] & 0xFFFFFFFF
     rate = f'{ready_khz / 1000:.2f} MHz DDR200' if (state & 0x103) == 0x103 else RATES[state & 3]

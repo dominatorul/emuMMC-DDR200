@@ -1702,6 +1702,23 @@ int sdmmc_init(sdmmc_t *sdmmc, u32 id, u32 power, u32 bus_width, u32 type, int p
 }
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_recalibrate_ddr200_pads(sdmmc_t *host)
+{
+	if (host->id != SDMMC_1 || host->powersave_enabled || host->clock_stopped ||
+	    sdmmc_get_io_power(host) != SDMMC_POWER_1_8 ||
+	    (host->regs->prnsts & (SDHCI_CMD_INHIBIT | SDHCI_DATA_INHIBIT)) ||
+	    (host->deadline_us && get_tmr_us() + 12000 >= host->deadline_us))
+		return false;
+
+	/* Use the same calibrated offsets and fallback as the native handoff. */
+	if (!_sdmmc_autocal_config_offset(host, SDMMC_POWER_1_8))
+		return false;
+	_sdmmc_autocal_execute(host, SDMMC_POWER_1_8);
+	return true;
+}
+#endif
+
 void sdmmc_ddr200_restore_host_cfg(sdmmc_t *sdmmc)
 {
 	if (sdmmc->id != SDMMC_1 || sdmmc->clock_stopped)

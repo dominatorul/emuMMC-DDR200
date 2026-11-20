@@ -325,6 +325,9 @@ void sdmmc_set_bus_width(sdmmc_t *sdmmc, u32 bus_width);
 void sdmmc_save_tap_value(sdmmc_t *sdmmc);
 int  sdmmc_setup_clock(sdmmc_t *sdmmc, u32 type);
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+bool sdmmc_recalibrate_ddr200_pads(sdmmc_t *sdmmc);
+#endif
 #ifdef EMUMMC_DDR200_DLL_DIAG
 int sdmmc_ddr200_dll_probe(sdmmc_t *host);
 #endif
