@@ -35,3 +35,12 @@ ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_read
     -DEMUMMC_DDR200_READ_AHEAD -DEMUMMC_DDR200_ADMA_PROBE tests/test_ddr200_adma.c \
     -Wl,--gc-sections -o "$out/test_ddr200_adma"
 ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_adma"
+
+"${CC:-clang}" -std=gnu2x -O1 -g -ffunction-sections -fdata-sections \
+    -fsanitize=address,undefined -DEMUMMC_DDR200_READ_AHEAD -DEMUMMC_DDR200_ADMA_PROBE \
+    -DEMUMMC_DDR200_PERF_TRIAL tests/test_ddr200_trace.c \
+    -Wl,--gc-sections -o "$out/test_ddr200_trace"
+ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 "$out/test_ddr200_trace" > "$out/trace.bin"
+python3 tools/read-ddr-trace.py "$out/trace.bin" > "$out/trace.txt"
+grep -F 'Read-ahead cache maintenance per 2 MiB DMA: 19 us before, 21 us after' "$out/trace.txt"
+grep -F 'Read-ahead cooldown: 2/3 strikes, 1 re-enables' "$out/trace.txt"

@@ -282,7 +282,13 @@ def print_policy_trace(data, gprs):
     if version == 27:
         print_dll(data, gprs)
         return
-    matrix_capacity = gprs[4] & 0xFFFFFFFF
+    matrix_capacity = 0 if version == 28 else gprs[4] & 0xFFFFFFFF
+    if version == 28:
+        before_us, after_us = gprs[4] & 0xFFFF, (gprs[4] >> 16) & 0xFFFF
+        if before_us == after_us == 0xFFFF:
+            print('Read-ahead cache maintenance per 2 MiB DMA: no samples')
+        else:
+            print(f'Read-ahead cache maintenance per 2 MiB DMA: {before_us} us before, {after_us} us after')
     if matrix_capacity not in (0, 40):
         raise ValueError('invalid DDR200 trace capacity')
     state = gprs[30]
@@ -373,7 +379,7 @@ def print_policy_trace(data, gprs):
     if perf_version >= 25:
         print_lifecycle(data, 0x150 + (48 - dma_capacity) * 16)
     runtime_capacity = 48 - matrix_capacity - dma_capacity
-    if perf_version == 26:
+    if perf_version in (26, 28):
         runtime_capacity -= 22
         print_wake(data, gprs, 0x150 + runtime_capacity * 16)
     for title, count, capacity, offset in (
@@ -422,7 +428,7 @@ def decode(path):
     magic, reason, title = struct.unpack_from('<IIQ', data)
     gprs = struct.unpack_from('<32Q', data, 0x10)
     trace_version = gprs[0] & 0xFF
-    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 27:
+    if magic != 0x32454641 or gprs[0] >> 8 != 0x44445232303000 or not 6 <= trace_version <= 28:
         raise ValueError(f'{path} does not contain an emuMMC DDR200 trace')
     if trace_version >= 9 and len(data) < PERF_OFFSET:
         raise ValueError(f'{path} is too short for a GPIO trace')

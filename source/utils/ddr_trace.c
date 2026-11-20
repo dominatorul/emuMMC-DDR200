@@ -102,6 +102,16 @@ static _Atomic u32 counted_reads, counted_read_flags;
 static _Atomic u64 checkpoint, functions, ladder, bytes_since_reassert;
 static _Atomic u64 first_failure[2], last_failure[2];
 static _Atomic u64 sd_stats[2][2], fs_stats[2][2], matrix_stats[2][2];
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+static _Atomic u64 read_ahead_cache_total[2], read_ahead_cache_samples;
+
+void ddr_trace_read_ahead_cache(u64 before_us, u64 after_us)
+{
+    read_ahead_cache_total[0] += before_us;
+    read_ahead_cache_total[1] += after_us;
+    ++read_ahead_cache_samples;
+}
+#endif
 #if defined(EMUMMC_DDR200_PERF_TRIAL) && !defined(EMUMMC_DDR200_MATRIX)
 static _Atomic u64 large_read_blocks, large_read_us, large_read_dma_us, large_read_copied;
 static _Atomic u32 large_read_commands, large_read_restarts, largest_read, write_errors;
@@ -458,6 +468,8 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->report_identifier = get_tmr_us();
 #if defined(EMUMMC_DDR200_DLL_DIAG)
     ctx->gprs[0] = ctx->error_desc == 0xdd200066u ? 0x444452323030001aull : 0x444452323030001bull;
+#elif defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+    ctx->gprs[0] = 0x444452323030001cull;
 #elif defined(EMUMMC_DDR200_ADMA_PROBE)
     ctx->gprs[0] = 0x444452323030001aull;
 #elif defined(EMUMMC_DDR200_COUNTED_READS)
@@ -515,6 +527,16 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[31] |= (u64)largest_fs_read << 32;
     ctx->pstate = map_attempts;
     ctx->far = ((u64)map_result << 32) | read_ahead_blocks;
+#endif
+    /* v28 uses the low word of gprs[4], reserved in the ADMA2 layout. */
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+    u64 cache_samples = read_ahead_cache_samples;
+    if ((ctx->gprs[0] & 0xff) == 28 && cache_samples) {
+        ctx->gprs[4] |= MIN(read_ahead_cache_total[0] / cache_samples, 0xfffeu) |
+            (MIN(read_ahead_cache_total[1] / cache_samples, 0xfffeu) << 16);
+    } else if ((ctx->gprs[0] & 0xff) == 28) {
+        ctx->gprs[4] |= 0xffffffffu;
+    }
 #endif
     ctx->afsr0 = native_before >> 16;
     ctx->afsr1 = native_after >> 16;

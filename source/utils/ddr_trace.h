@@ -31,6 +31,9 @@ void ddr_trace_read_ahead(u32 blocks);
 void ddr_trace_read_ahead_fill(bool succeeded);
 void ddr_trace_read_ahead_retry(unsigned strikes, unsigned reenables);
 #endif
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+void ddr_trace_read_ahead_cache(u64 before_us, u64 after_us);
+#endif
 void ddr_trace_reassert(void);
 void ddr_trace_boot_power(void);
 void ddr_trace_report(atmosphere_fatal_error_ctx *ctx);

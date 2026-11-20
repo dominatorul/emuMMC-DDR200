@@ -1359,6 +1359,10 @@ static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_
 
 	u32 blkcnt = 0;
 	bool is_data_present = false;
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+	bool measure_cache = false;
+	u64 before_us = 0;
+#endif
 	if (req)
 	{
 		sdmmc->command_failure = DdrCommandDmaSetup;
@@ -1367,8 +1371,17 @@ static int _sdmmc_execute_cmd_inner(sdmmc_t *sdmmc, sdmmc_cmd_t *cmd, sdmmc_req_
 
 		if(!sdmmc_memcpy_buf)
 		{
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+			measure_cache = sdmmc->prefetch && !req->is_write &&
+				req->blksize == 512 && blkcnt == SdmmcAdmaBytes / 512;
+			u64 start = measure_cache ? get_tmr_us() : 0;
+#endif
 			// Flush from/to phys
 			armDCacheFlush(req->buf, req->blksize * blkcnt);
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+			if (measure_cache)
+				before_us = get_tmr_us() - start;
+#endif
 		}
 		else
 		{
@@ -1428,8 +1441,15 @@ DPRINTF("rsp(%d): %08X, %08X, %08X, %08X\n", result,
 			{
 				if(!sdmmc_memcpy_buf)
 				{
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+					u64 start = measure_cache ? get_tmr_us() : 0;
+#endif
 					// Flush from phys
 					armDCacheFlush(req->buf, req->blksize * blkcnt);
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_PERF_TRIAL)
+					if (measure_cache)
+						ddr_trace_read_ahead_cache(before_us, get_tmr_us() - start);
+#endif
 				}
 				else
 				{
