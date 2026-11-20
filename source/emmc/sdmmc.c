@@ -1163,13 +1163,19 @@ int _sd_storage_switch(sdmmc_storage_t *storage, void *buf, int mode, int group,
 	return sdmmc_sd_switch(storage, buf, argument);
 }
 
-void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf)
+void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *buf, bool ddr200)
 {
 	u32 pwr = SD_SET_CURRENT_LIMIT_200;
 
 	// SD Physical Layer table 4-12: a VDD1-only host selects function 0 or 1.
 	if (current_limit & SD_MAX_CURRENT_400)
 		pwr = SD_SET_CURRENT_LIMIT_400;
+#ifdef EMUMMC_DDR200_SAMSUNG_800MA_TRIAL
+	if (ddr200 && storage->cid.manfid == 0x1b && (current_limit & SD_MAX_CURRENT_800))
+		pwr = SD_SET_CURRENT_LIMIT_800;
+#else
+	(void)ddr200;
+#endif
 
 	_sd_storage_switch(storage, buf, SD_SWITCH_SET, 3, pwr);
 
@@ -1177,6 +1183,9 @@ void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 
 	{
 		switch (pwr)
 		{
+		case SD_SET_CURRENT_LIMIT_800:
+DPRINTF("[SD] power limit requested at 800mA\n");
+			break;
 		case SD_SET_CURRENT_LIMIT_400:
 DPRINTF("[SD] power limit raised to 400mA\n");
 			break;
@@ -1239,7 +1248,12 @@ DPRINTF("[SD] access: %02X, current: %02X\n", access_mode, current_limit);
 #endif
 
 	// Try to raise the current limit to let the card perform better.
-	sdmmc_sd_set_current_limit(storage, current_limit, buf);
+#ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
+	sdmmc_sd_set_current_limit(storage, current_limit, buf,
+		type == SDHCI_TIMING_UHS_DDR200 && (cmd_system & SD_MODE_UHS_DDR200));
+#else
+	sdmmc_sd_set_current_limit(storage, current_limit, buf, false);
+#endif
 
 #ifdef EMUMMC_SDMMC_UHS_DDR200_SUPPORT
 	if (type == SDHCI_TIMING_UHS_DDR200)
@@ -1332,7 +1346,7 @@ int _sd_storage_enable_hs_high_volt(sdmmc_storage_t *storage, u8 *buf)
 	u16 current_limit = buf[7] | buf[6] << 8;
 
 	// Try to raise the current limit to let the card perform better.
-	sdmmc_sd_set_current_limit(storage, current_limit, buf);
+	sdmmc_sd_set_current_limit(storage, current_limit, buf, false);
 
 	if (!(access_mode & SD_MODE_HIGH_SPEED))
 		return 1;
