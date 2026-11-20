@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #include <assert.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include "../source/emmc/sdmmc.c"
 #include "../source/emmc/sdmmc_ddr200.c"
@@ -19,6 +20,15 @@ static sdmmc_accessor_t accessor = {.parent = &dma};
 static ddr_eye_t full_eye, reduced_eye;
 static u64 now;
 static unsigned fail_reads, commands, verifies, failed_verifies, stops, resets;
+#ifdef EMUMMC_DDR200_READ_AHEAD
+static unsigned write_commands, discarded_windows;
+static bool cached_window;
+bool custom_driver = true;
+_sdmmc_accessor_sd sdmmc_accessor_sd;
+_sdmmc_accessor_nand sdmmc_accessor_nand;
+void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks) { (void)sector; (void)blocks; }
+void sdmmc_read_ahead_discard(void) { cached_window = false; ++discarded_windows; }
+#endif
 static bool reject_type_c;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 enum { RelaxedProbes = 3 };
@@ -27,7 +37,13 @@ static unsigned handoff_data, wake_remaps, wake_attempts;
 static bool wake_modes[4];
 static bool inject_adma_error;
 bool sdmmc_adma_remap(void) { ++wake_remaps; return true; }
-void fatal_abort(enum FatalReason reason) { (void)reason; __builtin_trap(); }
+static jmp_buf wake_fatal;
+static bool expect_wake_fatal;
+void fatal_abort(enum FatalReason reason)
+{
+    assert(expect_wake_fatal && reason == Fatal_DdrWake);
+    longjmp(wake_fatal, 1);
+}
 static bool reject_handback;
 static enum DdrDropReason drop_reason;
 void ddr_trace_clock_drop(enum DdrRate from, enum DdrRate to, enum DdrDropReason reason,
@@ -236,6 +252,9 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
         return 1;
     }
     assert(req->blksize == 512);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    write_commands += req->is_write != 0;
+#endif
 #ifdef EMUMMC_DDR200_COUNTED_READS
     last_auto_command = req->auto_command;
 #endif
@@ -448,6 +467,38 @@ static void reset(void)
 #endif
 }
 
+#ifdef EMUMMC_DDR200_READ_AHEAD
+static void test_failed_writes(void)
+{
+    u8 data[16 * 512] = {0};
+    for (unsigned recover = 0; recover < 2; ++recover) {
+        reset();
+        write_commands = discarded_windows = 0;
+        cached_window = true;
+        full_eye = (ddr_eye_t){29, 44};
+        host.wake_commands = 8;
+        fail_reads = 1;
+        stop_ok = recover;
+        assert(!sdmmc_storage_write(&card, 1024, 16, data));
+        assert(write_commands == 1 && discarded_windows == 1 && !cached_window);
+        assert(!card.ddr.blocks && card.ddr.ready == (bool)recover);
+        unsigned before = commands;
+        if (recover) {
+            assert(sdmmc_storage_read(&card, 4096, 16, data));
+            assert(commands == before + 1);
+        } else {
+            expect_wake_fatal = true;
+            if (!setjmp(wake_fatal)) {
+                sdmmc_storage_read(&card, 4096, 16, data);
+                assert(false);
+            }
+            expect_wake_fatal = false;
+            assert(commands == before);
+        }
+    }
+}
+#endif
+
 static void test_power_limit(void)
 {
     reset();
@@ -513,6 +564,9 @@ static void test_eye_model(void)
 int main(void)
 {
     test_power_limit();
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    test_failed_writes();
+#endif
     u8 functions[64] = {[7] = 15, [9] = 7, [10] = 0x40};
     reset();
     full_eye = (ddr_eye_t){32, 48};
@@ -642,6 +696,9 @@ int main(void)
 int main(void)
 {
     test_power_limit();
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    test_failed_writes();
+#endif
     test_eye_model();
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];

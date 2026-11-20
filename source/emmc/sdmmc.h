@@ -121,6 +121,7 @@ u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks);
 u64 sdmmc_adma_table(u64 dma, u32 bytes);
 #endif
 void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks);
+void sdmmc_read_ahead_discard(void);
 void sdmmc_read_ahead_reset(void);
 #endif
 int sdmmc_storage_init_mmc(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type);

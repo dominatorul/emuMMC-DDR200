@@ -163,12 +163,19 @@ void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks)
     }
 }
 
-void sdmmc_read_ahead_reset(void)
+void sdmmc_read_ahead_discard(void)
 {
     read_ahead.blocks = 0;
     memset(read_ahead.streams, 0, sizeof(read_ahead.streams));
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     read_ahead.adma_verified = false;
+#endif
+}
+
+void sdmmc_read_ahead_reset(void)
+{
+    sdmmc_read_ahead_discard();
+#ifdef EMUMMC_DDR200_ADMA_PROBE
     unmap_window(&descriptor_mapping, &descriptor_table, sizeof(descriptor_table));
     if (!descriptor_mapping.das)
         descriptor_mapping.failed = false;

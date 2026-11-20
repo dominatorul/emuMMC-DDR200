@@ -92,6 +92,10 @@ int main(void)
     assert(read_sectors(1, 3072) && output[0] == 6);
     assert(transfers == 1 && served == 2048 && mapped_sectors == ReadAheadBlocks);
 
+    sdmmc_read_ahead_discard();
+    assert(!read_ahead.blocks && !read_sectors(1, 3072));
+    assert(transfers == 1 && maps == 1 && !unmaps);
+
     sdmmc_read_ahead_invalidate(4097, 1);
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 36});
     assert(!read_sectors(1, 4096));

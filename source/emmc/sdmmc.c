@@ -442,7 +442,7 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 			    (host->command_irq >> 16) == SDHCI_ERR_INT_ADMA_ERROR ||
                 attempt >= 5 || !sd || !sdmmc_ddr200_retry_io(storage, sector, failed,
 			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0))) {
-                if (wake)
+                if (wake && !is_write)
                     fatal_abort(Fatal_DdrWake);
                 return 0;
             }
@@ -520,12 +520,8 @@ int sdmmc_storage_read(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, vo
 	}
 }
 
-int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf)
+static int sdmmc_storage_write_inner(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf)
 {
-#ifdef EMUMMC_DDR200_READ_AHEAD
-	if (storage->sdmmc->id == SDMMC_1)
-		sdmmc_read_ahead_invalidate(sector, num_sectors);
-#endif
 	if (!custom_driver)
 	{
 		sdmmc_accessor_t *accessor_sd = sdmmc_accessor_sd();
@@ -575,6 +571,21 @@ int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, v
 	{
 		return _sdmmc_storage_readwrite(storage, sector, num_sectors, buf, 1);
 	}
+}
+
+int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, void *buf)
+{
+#ifdef EMUMMC_DDR200_READ_AHEAD
+	bool sd = storage->sdmmc->id == SDMMC_1;
+	if (sd)
+		sdmmc_read_ahead_invalidate(sector, num_sectors);
+#endif
+	int ok = sdmmc_storage_write_inner(storage, sector, num_sectors, buf);
+#ifdef EMUMMC_DDR200_READ_AHEAD
+	if (!ok && sd)
+		sdmmc_read_ahead_discard();
+#endif
+	return ok;
 }
 
 /*
