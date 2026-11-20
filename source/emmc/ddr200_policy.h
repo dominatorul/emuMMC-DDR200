@@ -45,6 +45,11 @@ typedef struct {
     u16 power_support;
     u8 power;
     u8 narrow_verified_tap;
+#ifdef EMUMMC_DDR200_HEKATE
+    u8 sdr104_tap;
+    bool sdr104_tap_valid;
+    bool wake_write_check;
+#endif
     u32 blocks;
     u32 busy_us;
     u64 last_io;
@@ -125,6 +130,27 @@ static inline ddr_eye_t ddr_widest_eye(const u32 map[4], unsigned end)
 {
     return ddr_select_eye(map, 0, end, 1, (ddr_eye_t){DdrTapCount, 0});
 }
+
+#ifdef EMUMMC_DDR200_HEKATE
+/* Hekate 8e1392d compares the run length before counting the final slot.
+   Keep its tie handling and terminal-window behavior for this profile. */
+static inline ddr_eye_t ddr_hekate_eye(const u32 map[4])
+{
+    ddr_eye_t best = {DdrTapCount, 0};
+    unsigned run = 0;
+    for (unsigned tap = 0; tap < DdrTapCount; ++tap) {
+        bool last = tap == DdrTapCount - 1;
+        if (!last && ddr_tap_passes(map, tap)) {
+            ++run;
+            continue;
+        }
+        if (run > ddr_eye_width(best))
+            best = (ddr_eye_t){tap - run, last ? tap : tap - 1};
+        run = 0;
+    }
+    return best;
+}
+#endif
 
 static inline void ddr_remember_eye(ddr_history_t *history, ddr_eye_t eye)
 {

@@ -866,13 +866,17 @@ u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 comple
 		return 0;
 
 	u32 saved_tap = (sdmmc->regs->venclkctl >> 16) & 0xFF;
+#ifndef EMUMMC_DDR200_HEKATE
 	u16 saved_tuned = sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK;
+#endif
 	u16 saved_clock = sdmmc->regs->clkcon & SDHCI_CLOCK_CARD_EN;
 	sdmmc->regs->ventunctl1 = 0;
 	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFF1FFF) | (2 << 13);
 	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFFE03F) | (1 << 6);
 	sdmmc->regs->ventunctl0 |= TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
+#ifndef EMUMMC_DDR200_HEKATE
 	sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
+#endif
 	sdmmc->regs->hostctl2 |= SDHCI_CTRL_EXEC_TUNING;
 
 	u32 tap = first;
@@ -895,8 +899,12 @@ u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 comple
 			usleep(1);
 		}
 	}
+#ifdef EMUMMC_DDR200_HEKATE
+	sdmmc->regs->hostctl2 &= ~SDHCI_CTRL_EXEC_TUNING;
+#else
 	sdmmc->regs->hostctl2 = (sdmmc->regs->hostctl2 &
 		~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK)) | saved_tuned;
+#endif
 	sdmmc_set_ddr200_tap(sdmmc, saved_tap);
 	sdmmc->regs->clkcon = (sdmmc->regs->clkcon & ~SDHCI_CLOCK_CARD_EN) | saved_clock;
 	return tap - first;

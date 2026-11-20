@@ -1,12 +1,12 @@
-Do not use this unless you know what you are doing. This is wip and may do bad stuff to your sd card if misused.
+**Work in progress.** DDR200 can cause I/O errors or SD card corruption. Back up the card before testing.
 
 # emuMMC
-*A SDMMC driver replacement for Nintendo's Filesystem Services, by **m4xw***  
+*An SDMMC driver replacement for Nintendo's Filesystem Services, by **m4xw***
 
 ### Supported Horizon Versions
 **1.0.0 - 23.5.0**
 
-The DDR200 branch uses Hekate's direct Atmosphère launch. See
+The default build uses the adaptive DDR200 profile. A Hekate-style profile is also available. Both use Hekate's direct Atmosphère launch. See
 [DDR200.md](DDR200.md) for the KIPM build and installation steps.
 
 ## DDR200 fork credits

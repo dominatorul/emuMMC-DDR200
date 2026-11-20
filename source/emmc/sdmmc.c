@@ -441,11 +441,13 @@ static int _sdmmc_storage_readwrite(sdmmc_storage_t *storage, u32 sector, u32 nu
 			if (host->command_failure == DdrCommandDmaSetup ||
 			    (host->command_irq >> 16) == SDHCI_ERR_INT_ADMA_ERROR ||
                 attempt >= 5 || !sd || !sdmmc_ddr200_retry_io(storage, sector, failed,
-			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0)) || is_write) {
+			    attempt >= 3 || (storage->ddr.rate == DdrRateReduced && attempt != 0))) {
                 if (wake)
                     fatal_abort(Fatal_DdrWake);
                 return 0;
             }
+			if (is_write)
+				return 0;
 #else
 			if (attempt == 3 || !sd || !sdmmc_ddr200_recover(storage, sector, attempt != 0) || is_write)
 				return 0;
