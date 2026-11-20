@@ -420,14 +420,9 @@ static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
         return false;
     }
     storage->ddr.rate = DdrRateSdr104;
-    bool ready = sdmmc_setup_clock(storage->sdmmc, SDHCI_TIMING_UHS_SDR104) &&
+    return sdmmc_setup_clock(storage->sdmmc, SDHCI_TIMING_UHS_SDR104) &&
         sdmmc_tuning_execute(storage->sdmmc, SDHCI_TIMING_UHS_SDR104, MMC_SEND_TUNING_BLOCK) &&
         sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
-#ifdef EMUMMC_DDR200_SAMSUNG_800MA_TRIAL
-    if (ready && storage->cid.manfid == 0x1b && storage->ddr.power == SD_SET_CURRENT_LIMIT_800)
-        sdmmc_sd_set_current_limit(storage, storage->ddr.power_support, status, false);
-#endif
-    return ready;
 }
 
 static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8 status[64])
@@ -572,7 +567,7 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
     bool ok = false;
     if (standard && want_ddr) {
         remember_functions(storage, status);
-        sdmmc_sd_set_current_limit(storage, policy->power_support, status, requested == DdrRateFull);
+        sdmmc_sd_set_current_limit(storage, policy->power_support, status);
         if (enter_from_sdr104(storage, status)) {
             /* A fresh CMD6 switch starts a new link. The pre-handoff
                samples can force the tap too far right as the eye contracts. */

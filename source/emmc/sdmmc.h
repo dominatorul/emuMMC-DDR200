@@ -143,7 +143,7 @@ void sdmmc_ddr200_count_io(sdmmc_storage_t *storage, u32 blocks, u64 elapsed);
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 count, void *buf, u32 write);
 bool sdmmc_storage_wait_ready(sdmmc_storage_t *storage, u64 deadline);
 int sdmmc_sd_switch(sdmmc_storage_t *storage, u8 *status, u32 argument);
-void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *status, bool ddr200);
+void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 *status);
 
 #ifdef EMUMMC_DDR200_MATRIX
 bool sdmmc_ddr200_matrix_step(sdmmc_storage_t *storage);

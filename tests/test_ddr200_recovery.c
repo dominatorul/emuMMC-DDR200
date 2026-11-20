@@ -456,19 +456,10 @@ int main(void)
 {
     test_eye_model();
     reset();
-    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800 | SD_MAX_CURRENT_400, (u8 *)window, true);
+    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800 | SD_MAX_CURRENT_400, (u8 *)window);
     assert(group4_request == SD_SET_CURRENT_LIMIT_400);
-    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800, (u8 *)window, true);
+    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800, (u8 *)window);
     assert(group4_request == SD_SET_CURRENT_LIMIT_200);
-#ifdef EMUMMC_DDR200_SAMSUNG_800MA_TRIAL
-    card.cid.manfid = 0x1b;
-    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800 | SD_MAX_CURRENT_400, (u8 *)window, true);
-    assert(group4_request == SD_SET_CURRENT_LIMIT_800);
-    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800 | SD_MAX_CURRENT_400, (u8 *)window, false);
-    assert(group4_request == SD_SET_CURRENT_LIMIT_400);
-    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_400, (u8 *)window, true);
-    assert(group4_request == SD_SET_CURRENT_LIMIT_400);
-#endif
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
 #ifdef EMUMMC_DDR200_ADMA_PROBE
