@@ -528,10 +528,11 @@ int main(void)
     assert(!hint_scans && !switched_to_stock && retained_clock_changes == 3);
 
     regs.hostctl2 = UHS_SDR104_BUS_SPEED;
-    full_eye.right = 35;
+    full_eye.right = 34;
+    reduced_eye = (ddr_eye_t){34, 38};
     assert(sdmmc_ddr200_handoff(&card));
     assert(card.ddr.ready && card.ddr.rate == DdrRateSdr104 && switched_to_stock == 1);
-    assert(retained_failures == 1 && retained_clock_changes == 4 && verifies == 6);
+    assert(retained_failures == 1 && retained_clock_changes == 5 && verifies == 6);
     assert(card.ddr.sdr104_tap_valid && card.ddr.sdr104_tap == 21);
     regs.hostctl2 = UHS_SDR104_BUS_SPEED;
     regs.venclkctl = 0;
@@ -568,7 +569,8 @@ int main(void)
     assert(full_data_calls == 2 && full_data_taps[0] == 36 && full_data_taps[1] == 32);
 
     reset();
-    full_eye = (ddr_eye_t){30, 35};
+    full_eye = (ddr_eye_t){30, 34};
+    reduced_eye = (ddr_eye_t){34, 38};
     card.ddr.wake_write_check = card.ddr.sdr104_tap_valid = true;
     card.ddr.sdr104_tap = required_sdr104_tap = 21;
     reject_sdr104_tuning = true;
@@ -587,11 +589,26 @@ int main(void)
     assert(card.ddr.sdr104_tap == 23 && !switched_to_stock);
 
     reset();
-    full_eye = (ddr_eye_t){30, 35};
+    full_eye = (ddr_eye_t){30, 34};
+    reduced_eye = (ddr_eye_t){34, 38};
     host.wake_commands = 8;
     fail_reads = 1;
     assert(!_sdmmc_storage_readwrite(&card, 1024, 16, data, true));
     assert(commands == 1 && stops == 1 && card.ddr.ready && card.ddr.rate == DdrRateSdr104);
+
+    reset();
+    full_eye = (ddr_eye_t){30, 35};
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false));
+    assert(card.ddr.rate == DdrRateFull && verifies == 2);
+    assert(verify_taps[0] == 32 && verify_taps[1] == 33);
+
+    reset();
+    full_eye = (ddr_eye_t){30, 34};
+    card.ddr.busy_us = DdrTrackBusyUs;
+    assert(sdmmc_ddr200_before_io(&card, 1024, false));
+    assert(card.ddr.rate == DdrRateReduced && tap_readback(&host) == 39 && verifies == 2);
+    assert(!switched_to_stock);
 
     reset();
     full_eye = (ddr_eye_t){28, 36};

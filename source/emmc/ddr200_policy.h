@@ -211,12 +211,8 @@ static inline int ddr_pick_tap(const ddr_history_t *history, const u32 tried[4],
 
 static inline enum DdrRate ddr_failure_next(enum DdrRate rate)
 {
-#ifdef EMUMMC_DDR200_HEKATE
-    return rate >= DdrRateReduced ? DdrRateSdr104 : DdrRateUnknown;
-#else
     return rate == DdrRateFull ? DdrRateReduced :
            rate == DdrRateReduced ? DdrRateSdr104 : DdrRateUnknown;
-#endif
 }
 
 static inline u64 ddr_retry_delay(unsigned failures)

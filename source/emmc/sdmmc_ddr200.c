@@ -85,7 +85,11 @@ static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsi
     int neighbor = verification_neighbor(eye, tap, guard, used);
     /* A seven-tap eye has only one tap with a three-tap guard. The
        secondary data probe can use the next margin, leaving the primary guarded. */
-    if (neighbor < 0)
+    bool relax_neighbor = true;
+#ifdef EMUMMC_DDR200_HEKATE
+    relax_neighbor = ddr_eye_width(eye) != 2 * DdrNarrowMargin + 2;
+#endif
+    if (neighbor < 0 && relax_neighbor)
         neighbor = verification_neighbor(eye, tap, guard - 1, used);
     if (neighbor < 0)
         return false;
@@ -267,13 +271,13 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     *history = (ddr_history_t){0};
     if (ddr_eye_width(eye))
         ddr_remember_eye(history, eye);
-    /* A link that already qualified can recover with a three-tap guard
-       on each edge and two data reads. Keep eight taps for a fresh link. */
+    /* An established link can recover with two guarded taps that both
+       verify against real data. Keep eight taps for a fresh link. */
     unsigned minimum = SDMMC_SAMPLE_WIN_SIZE_MIN;
-    if (policy->capable && (kind == DdrSweepRecovery || kind == DdrSweepTrack ||
-                           (kind == DdrSweepHandoff && local)))
-        minimum = 2 * DdrTapMargin + 1;
-    if (ddr_eye_width(eye) >= minimum) {
+    if (policy->capable && (runtime || (kind == DdrSweepHandoff && local)))
+        minimum = 2 * DdrNarrowMargin + 2;
+    unsigned width = ddr_eye_width(eye);
+    if (width >= minimum) {
         unsigned tap = (eye.left + eye.right) / 2;
         u32 tried[4] = {0};
         if (failed)
@@ -285,7 +289,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
             if (sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000))
                 applied = tap;
         } else {
-            unsigned guard = DdrTapMargin;
+            unsigned guard = width == 2 * DdrNarrowMargin + 2 ? DdrNarrowMargin : DdrTapMargin;
             if (runtime) {
                 /* A CRC can disqualify the midpoint even when both edges
                    still pass CMD19. Verify a nearby tap with real data. */
@@ -311,8 +315,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     policy->ready = applied != SDMMC_INVALID_TAP;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     policy->tune_eye = eye;
-    policy->tune_failure = !ddr_eye_width(eye) ? DdrDropNoEye :
-        ddr_eye_width(eye) < minimum ? DdrDropMargin : DdrDropProbeIo;
+    policy->tune_failure = !width ? DdrDropNoEye : width < minimum ? DdrDropMargin : DdrDropProbeIo;
 #endif
     ddr_trace_policy_sweep(host, eye, applied, kind, policy->drive, started);
     if (policy->ready)
@@ -857,7 +860,8 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     if (!policy->ready || policy->rate != DdrRateFull)
         return policy->ready;
     bool wake_write = writing && policy->wake_write_check;
-    bool narrow = ddr_eye_width(policy->history[0].eyes[0]) == 2 * DdrTapMargin + 1;
+    unsigned width = ddr_eye_width(policy->history[0].eyes[0]);
+    bool narrow = width >= 2 * DdrNarrowMargin + 2 && width < SDMMC_SAMPLE_WIN_SIZE_MIN;
     unsigned max_blocks = narrow ? DdrNarrowTrackBlocks : DdrTrackBlocks;
     unsigned max_busy_us = narrow ? DdrNarrowTrackBusyUs : DdrTrackBusyUs;
     if (!wake_write && policy->blocks < max_blocks && policy->busy_us < max_busy_us &&
