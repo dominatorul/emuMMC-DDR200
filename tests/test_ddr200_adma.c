@@ -62,6 +62,7 @@ void ddr_trace_batch_seq(u32 blocks, bool hit)
     if (hit)
         served += blocks;
 }
+#ifdef EMUMMC_DDR200_READ_AHEAD
 void ddr_trace_dma_begin(void)
 {
     ++compares;
@@ -75,6 +76,7 @@ void ddr_trace_dma_sample(enum DdrDmaSample sample, const sdmmc_t *target, ddr_e
     samples[sample] = result;
     sample_taps[sample] = active_tap(target);
 }
+#endif
 
 Result svcMapDeviceAddressSpaceAligned(Handle handle, Handle process, u64 address,
     u64 size, u64 dma, u32 permission)
@@ -83,8 +85,13 @@ Result svcMapDeviceAddressSpaceAligned(Handle handle, Handle process, u64 addres
     assert(((address ^ dma) & (DeviceAlignment - 1)) == 0);
     if (address == (uintptr_t)&descriptor_table)
         assert(size == 0x1000 && permission == Perm_R);
+#ifdef EMUMMC_DDR200_READ_AHEAD
     else
         assert(address == (uintptr_t)&read_window && size == ReadAheadBytes && permission == Perm_W);
+#else
+    else
+        assert(false);
+#endif
     ++maps;
     return mapping_ok ? 0 : 1;
 }
@@ -94,8 +101,13 @@ Result svcUnmapDeviceAddressSpace(Handle handle, Handle process, u64 address, u6
     assert(handle && process == current_process);
     if (address == (uintptr_t)&descriptor_table)
         assert(size == 0x1000 && dma == descriptor_mapping.dma);
+#ifdef EMUMMC_DDR200_READ_AHEAD
     else
         assert(address == (uintptr_t)&read_window && size == ReadAheadBytes && dma == read_ahead.mapping.dma);
+#else
+    else
+        assert(false);
+#endif
     ++unmaps;
     return 0;
 }
@@ -130,6 +142,7 @@ static void assert_chain(u64 dma, unsigned bytes)
     assert(bytes == 0);
 }
 
+#ifdef EMUMMC_DDR200_READ_AHEAD
 int sdmmc_storage_transfer(sdmmc_storage_t *storage, u32 *done, u32 sector, u32 blocks, void *buf, u32 write)
 {
     assert(storage == &card && !write && host.prefetch && blocks == ReadAheadBlocks);
@@ -181,11 +194,14 @@ bool sdmmc_ddr200_recover(sdmmc_storage_t *storage, u32 sector, bool degrade)
     ++recoveries;
     return true;
 }
+#endif
 
 static void reset(ddr_eye_t eye, unsigned tap)
 {
-    sdmmc_read_ahead_reset();
+    sdmmc_reset_private_dma();
+#ifdef EMUMMC_DDR200_READ_AHEAD
     read_ahead = (typeof(read_ahead)){0};
+#endif
     descriptor_mapping = (dma_window_t){0};
     das = 1;
     card.ddr = (ddr_policy_t){.rate = DdrRateFull, .ready = true, .last_sweep_us = time_us};
@@ -203,10 +219,12 @@ static void reset(ddr_eye_t eye, unsigned tap)
     mapping_ok = true;
 }
 
+#ifdef EMUMMC_DDR200_READ_AHEAD
 static bool read_next(u32 sector)
 {
     return sdmmc_read_ahead(&card, das, sector, sizeof(output) / 512, output);
 }
+#endif
 
 static void test_dma(void)
 {
@@ -272,12 +290,20 @@ static void test_dma(void)
     ++das;
     assert(sdmmc_adma_remap() && descriptor_mapping.das == das);
     assert(maps == 2 && unmaps == 1);
+
+    sdmmc_reset_private_dma();
+    sdmmc_reset_private_dma();
+    assert(unmaps == 2 && !descriptor_mapping.dma);
+    ++das;
+    assert(_sdmmc_config_dma(&host, &blocks, &request));
+    assert(descriptor_mapping.das == das && maps == 3);
 }
 
 int main(void)
 {
     test_dma();
 
+#ifdef EMUMMC_DDR200_READ_AHEAD
     reset((ddr_eye_t){29, 36}, 32);
     assert(!read_next(0) && read_next(1024));
     assert(samples[DdrDmaBaseline] == DdrDmaOk && sample_taps[DdrDmaBaseline] == 32);
@@ -291,7 +317,7 @@ int main(void)
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){30, 36});
     assert(read_next(6144) && read_next(7168) && read_next(8192) && read_next(9216));
     assert(compares == 2 && commands == 5);
-    sdmmc_read_ahead_reset();
+    sdmmc_reset_private_dma();
     assert(unmaps == 2 && !read_ahead.adma_verified && !descriptor_mapping.dma);
     ++das;
     assert(!read_next(0) && read_next(1024) && compares == 3 && maps == 4);
@@ -338,4 +364,7 @@ int main(void)
     assert(!sdmmc_read_ahead(&card, das, ReadAheadRunIn + 2 * small + 1, small, output));
     assert(commands == 2);
     puts("ADMA2 chains, resets, guarded batching, stream interleaving and refusal counters passed");
+#else
+    puts("ADMA2 chains, resets and wake remapping passed with read-ahead disabled");
+#endif
 }

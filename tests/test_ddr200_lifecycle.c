@@ -49,7 +49,7 @@ void fatal_abort(enum FatalReason reason)
     assert(expect_snapshot && reason == Fatal_DdrWake);
     longjmp(snapshot, 1);
 }
-void sdmmc_read_ahead_reset(void)
+void sdmmc_reset_private_dma(void)
 {
     if (private_mapping) {
         assert(locks == 2 && powered && native_sd_transitions);

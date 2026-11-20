@@ -93,7 +93,7 @@ int main(void)
     assert(!read_sectors(1, 4096));
     assert(!read_sectors(1, 5120) && transfers == 1);
 
-    sdmmc_read_ahead_reset();
+    sdmmc_reset_private_dma();
     assert(unmaps == 1 && !sdmmc_read_ahead_dma(read_window.data, ReadAheadBlocks));
     ddr_remember_eye(&card.ddr.history[0], (ddr_eye_t){29, 43});
     assert(!read_sectors(2, 0));
@@ -102,7 +102,7 @@ int main(void)
     assert(!read_sectors(2, 2048) && unmaps == 2);
     inserted = true;
 
-    sdmmc_read_ahead_reset();
+    sdmmc_reset_private_dma();
     assert(!read_sectors(3, 14336) && !read_sectors(3, 15360) && maps == 2);
     transfer_ok = false;
     assert(!read_sectors(3, 0));
@@ -111,7 +111,7 @@ int main(void)
     transfer_ok = true;
     assert(!read_sectors(3, 2048) && !read_sectors(3, 3072) && transfers == 3);
 
-    sdmmc_read_ahead_reset();
+    sdmmc_reset_private_dma();
     assert(!read_sectors(4, 0) && !read_sectors(4, 1024) && maps == 3);
     read_ahead.fill_failed = false; // Start a new boot for the mapping failure case.
     map_ok = false;

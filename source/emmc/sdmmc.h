@@ -117,11 +117,10 @@ int sdmmc_storage_write(sdmmc_storage_t *storage, u32 sector, u32 num_sectors, v
 #ifdef EMUMMC_DDR200_READ_AHEAD
 bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out);
 u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks);
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-u64 sdmmc_adma_table(u64 dma, u32 bytes);
-#endif
 void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks);
-void sdmmc_read_ahead_reset(void);
+#endif
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
+void sdmmc_reset_private_dma(void);
 #endif
 int sdmmc_storage_init_mmc(sdmmc_storage_t *storage, sdmmc_t *sdmmc, u32 bus_width, u32 type);
 int sdmmc_storage_set_mmc_partition(sdmmc_storage_t *storage, u32 partition);
@@ -153,6 +152,7 @@ void sdmmc_ddr200_matrix_skip(sdmmc_storage_t *storage);
 #endif
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
+u64 sdmmc_adma_table(u64 dma, u32 bytes);
 bool sdmmc_adma_remap(void);
 #endif
 #ifdef EMUMMC_DDR200_DLL_DIAG

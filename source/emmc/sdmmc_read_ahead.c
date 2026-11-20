@@ -1,5 +1,5 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
-#ifdef EMUMMC_DDR200_READ_AHEAD
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
 #include <string.h>
 #include "sdmmc.h"
 #include "../nx/cache.h"
@@ -8,6 +8,8 @@
 #include "../utils/util.h"
 
 enum {
+    DeviceAlignment = 4 * 1024 * 1024,
+#ifdef EMUMMC_DDR200_READ_AHEAD
     ReadAheadBytes = 2 * 1024 * 1024,
     ReadAheadBlocks = ReadAheadBytes / 512,
     ReadAheadRunIn = 512 * 1024 / 512,
@@ -17,14 +19,12 @@ enum {
     ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadMinEye = 9,
 #endif
-    DeviceAlignment = 4 * 1024 * 1024,
     ReadStreams = 4,
     ReadStreamIdleUs = 1000000,
+#endif
 };
 
-static struct { _Alignas(0x1000) u8 data[ReadAheadBytes]; } read_window;
 typedef struct { Handle das; u64 dma; bool failed; } dma_window_t;
-typedef struct { u64 next, seen; u32 blocks; } read_stream_t;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 static union {
     _Alignas(0x1000) u8 page[0x1000];
@@ -35,6 +35,10 @@ static dma_window_t descriptor_mapping;
 extern volatile Handle *sdmmc_das_handle;
 #endif
 static const Handle current_process = 0xFFFF8001u;
+
+#ifdef EMUMMC_DDR200_READ_AHEAD
+static struct { _Alignas(0x1000) u8 data[ReadAheadBytes]; } read_window;
+typedef struct { u64 next, seen; u32 blocks; } read_stream_t;
 
 /* Both FS storage mutexes protect the cache and its device mapping. */
 static struct {
@@ -49,6 +53,7 @@ static struct {
     u8 verified_upgrade;
 #endif
 } read_ahead;
+#endif
 
 static bool map_window(dma_window_t *mapping, Handle das, void *buffer, size_t bytes, u32 permission)
 {
@@ -65,7 +70,9 @@ static bool map_window(dma_window_t *mapping, Handle das, void *buffer, size_t b
         u64 dma = bases[i] | (address & (DeviceAlignment - 1));
         Result rc = svcMapDeviceAddressSpaceAligned(das, current_process, address, bytes,
             dma, permission);
+#ifdef EMUMMC_DDR200_READ_AHEAD
         ddr_trace_read_ahead_map(rc);
+#endif
 #ifdef EMUMMC_DDR200_ADMA_PROBE
         if (mapping == &descriptor_mapping) {
             ddr_trace_descriptor_mapping(false, das, rc);
@@ -89,11 +96,14 @@ static void unmap_window(dma_window_t *mapping, void *buffer, size_t bytes)
     Result rc = svcUnmapDeviceAddressSpace(mapping->das, current_process, (uintptr_t)buffer,
         bytes, mapping->dma);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-    if (mapping == &descriptor_mapping)
+    if (mapping == &descriptor_mapping) {
         ddr_trace_descriptor_mapping(true, mapping->das, rc);
+        ddr_trace_wake(WakeRetire, 1, rc);
+    }
 #endif
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-    ddr_trace_wake(WakeRetire, mapping == &read_ahead.mapping ? 0 : 1, rc);
+#if defined(EMUMMC_DDR200_ADMA_PROBE) && defined(EMUMMC_DDR200_READ_AHEAD)
+    else
+        ddr_trace_wake(WakeRetire, 0, rc);
 #endif
     mapping->dma = 0;
     mapping->failed = rc != 0;
@@ -101,6 +111,7 @@ static void unmap_window(dma_window_t *mapping, void *buffer, size_t bytes)
         mapping->das = 0;
 }
 
+#ifdef EMUMMC_DDR200_READ_AHEAD
 u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks)
 {
     uintptr_t offset = (uintptr_t)buf - (uintptr_t)read_window.data;
@@ -109,6 +120,7 @@ u64 sdmmc_read_ahead_dma(const void *buf, u32 blocks)
         return 0;
     return read_ahead.mapping.dma + offset;
 }
+#endif
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
 bool sdmmc_adma_remap(void)
@@ -148,6 +160,26 @@ u64 sdmmc_adma_table(u64 dma, u32 bytes)
 }
 #endif
 
+void sdmmc_reset_private_dma(void)
+{
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    read_ahead.blocks = 0;
+    memset(read_ahead.streams, 0, sizeof(read_ahead.streams));
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    read_ahead.adma_verified = false;
+#endif
+#endif
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    unmap_window(&descriptor_mapping, &descriptor_table, sizeof(descriptor_table));
+    if (!descriptor_mapping.das)
+        descriptor_mapping.failed = false;
+#endif
+#ifdef EMUMMC_DDR200_READ_AHEAD
+    unmap_window(&read_ahead.mapping, &read_window, sizeof(read_window));
+#endif
+}
+
+#ifdef EMUMMC_DDR200_READ_AHEAD
 void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks)
 {
     if (read_ahead.blocks && blocks &&
@@ -156,19 +188,6 @@ void sdmmc_read_ahead_invalidate(u32 sector, u32 blocks)
         read_ahead.blocks = 0;
         memset(read_ahead.streams, 0, sizeof(read_ahead.streams));
     }
-}
-
-void sdmmc_read_ahead_reset(void)
-{
-    read_ahead.blocks = 0;
-    memset(read_ahead.streams, 0, sizeof(read_ahead.streams));
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-    read_ahead.adma_verified = false;
-    unmap_window(&descriptor_mapping, &descriptor_table, sizeof(descriptor_table));
-    if (!descriptor_mapping.das)
-        descriptor_mapping.failed = false;
-#endif
-    unmap_window(&read_ahead.mapping, &read_window, sizeof(read_window));
 }
 
 #ifdef EMUMMC_DDR200_ADMA_PROBE
@@ -405,7 +424,7 @@ bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bloc
         (u64)sector + blocks > storage->sec_cnt)
         return false;
     if (!sdmmc_get_sd_inserted()) {
-        sdmmc_read_ahead_reset();
+        sdmmc_reset_private_dma();
         return false;
     }
 
@@ -417,4 +436,5 @@ bool sdmmc_read_ahead(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bloc
 #endif
     return served;
 }
+#endif
 #endif

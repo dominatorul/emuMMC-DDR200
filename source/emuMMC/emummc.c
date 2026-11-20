@@ -118,8 +118,8 @@ static bool _ddr200_reassert(int mmc_id)
     if (!sd_storage.ddr.capable)
         return sdmmc_ddr200_profile_ready(&sd_storage) && !wait_for_native;
     if (!_ddr200_power_ready()) {
-#ifdef EMUMMC_DDR200_READ_AHEAD
-        sdmmc_read_ahead_reset();
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
+        sdmmc_reset_private_dma();
 #endif
         if (!boot_power_window_closed && !sdmmc_get_sd_power_enabled())
             return _ddr200_recover_boot_power();
@@ -146,8 +146,8 @@ static bool _ddr200_reassert(int mmc_id)
         return true;
 
     ddr_trace_host(DdrReassert, &sd_sdmmc);
-#ifdef EMUMMC_DDR200_READ_AHEAD
-    sdmmc_read_ahead_reset();
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
+    sdmmc_reset_private_dma();
 #endif
     clock_sdmmc_invalidate_clock_source(SDMMC_1);
     bool resuming = sd_storage.ddr.resume_rate != DdrRateUnknown;
@@ -560,8 +560,8 @@ static uint64_t controller_open(int mmc_id)
 
         mutex_lock_handler(FS_SDMMC_EMMC);
         ++native_sd_transitions;
-#ifdef EMUMMC_DDR200_READ_AHEAD
-        sdmmc_read_ahead_reset();
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
+        sdmmc_reset_private_dma();
 #endif
         _ddr200_close_boot_power_window();
         bool trace_open = sd_storage.initialized;
@@ -637,10 +637,10 @@ static uint64_t controller_close(int mmc_id)
                 bool standard = !sd_storage.ddr.capable ||
                     (_ddr200_power_ready() && sdmmc_ddr200_prepare_suspend(&sd_storage));
                 ddr_trace_power(DdrPowerHandback, standard);
-#ifdef EMUMMC_DDR200_READ_AHEAD
-                /* Retire both private mappings after the final FS-owned
+#if defined(EMUMMC_DDR200_READ_AHEAD) || defined(EMUMMC_DDR200_ADMA_PROBE)
+                /* Retire private DMA mappings after the final FS-owned
                    command, before Horizon can close the address space. */
-                sdmmc_read_ahead_reset();
+                sdmmc_reset_private_dma();
 #endif
 #ifdef EMUMMC_DDR200_ADMA_PROBE
                 if (!standard) {

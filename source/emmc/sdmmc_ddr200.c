@@ -386,8 +386,9 @@ static bool enter_ddr(sdmmc_storage_t *storage, u8 status[64])
     }
     ddr_trace_card(status, true);
     remember_functions(storage, status);
-    storage->ddr.rate = DdrRateFull;
-    return sdmmc_setup_ddr200_clock(storage->sdmmc, false) != 0;
+    bool clock = sdmmc_setup_ddr200_clock(storage->sdmmc, false);
+    storage->ddr.rate = clock ? DdrRateFull : DdrRateUnknown;
+    return clock;
 }
 
 static bool enter_from_sdr104(sdmmc_storage_t *storage, u8 status[64])
@@ -425,7 +426,7 @@ static bool set_sdr104(sdmmc_storage_t *storage, u8 status[64])
         sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
 }
 
-static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8 status[64])
+static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u8 status[64])
 {
     ddr_policy_t *policy = &storage->ddr;
     policy->ready = false;
@@ -434,26 +435,21 @@ static bool fallback(sdmmc_storage_t *storage, enum DdrRate from, u32 sector, u8
         policy->unstable = true;
         policy->retry_at = get_tmr_us() + ddr_retry_delay(policy->upgrades);
     }
-    for (enum DdrRate next = ddr_failure_next(from);
-         next != DdrRateUnknown && policy->rate != DdrRateUnknown;
-         next = ddr_failure_next(next)) {
+    enum DdrRate next = ddr_failure_next(from);
+    if (next == DdrRateSdr104 && policy->rate != DdrRateUnknown) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE
-        ddr_trace_clock_drop(policy->rate, next, policy->tune_failure, policy->tune_probes, policy->tune_eye);
+        if (policy->rate >= DdrRateReduced)
+            ddr_trace_clock_drop(policy->rate, next, policy->tune_failure, policy->tune_probes, policy->tune_eye);
 #endif
         ddr_trace_ladder(next, false, policy->unstable, policy->upgrades);
-        if (next == DdrRateReduced) {
-            if (!train(storage, next, DdrSweepRecovery, false, sector, -1))
-                continue;
-        } else {
-            if (!set_sdr104(storage, status))
-                break;
+        if (set_sdr104(storage, status)) {
             policy->ready = true;
             storage->csd.busspeed = 104;
             ddr_trace_stage(DdrReady, storage->sdmmc->divisor);
+            policy->blocks = policy->busy_us = 0;
+            ddr_trace_ladder(next, true, policy->unstable, policy->upgrades);
+            return true;
         }
-        policy->blocks = policy->busy_us = 0;
-        ddr_trace_ladder(next, true, policy->unstable, policy->upgrades);
-        return true;
     }
 #endif
     ddr_trace_ladder(policy->rate, false, policy->unstable, policy->upgrades);
@@ -465,10 +461,14 @@ bool sdmmc_ddr200_initial(sdmmc_storage_t *storage, const u8 *functions)
     u8 status[64];
     if (!(((u16)functions[10] << 8 | functions[11]) & SD_MODE_UHS_DDR200))
         return false;
+    bool supports_sdr104 = functions[13] & SD_MODE_UHS_SDR104;
     remember_functions(storage, functions);
+    /* Boot starts in standard SD signaling. A rejected CHECK leaves it
+       there. An ambiguous DDR200 SET invalidates this state in enter_ddr. */
+    storage->ddr.rate = DdrRateSdr104;
     if (!enter_ddr(storage, status) ||
         !train(storage, DdrRateFull, DdrSweepInitial, false, 0, -1))
-        return false;
+        return supports_sdr104 && fallback(storage, DdrRateFull, status);
     storage->ddr.capable = true;
     storage->csd.busspeed = 200;
     ddr_trace_ladder(DdrRateFull, true, false, 0);
@@ -502,7 +502,7 @@ static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_DISABLE);
     bool clock = sdmmc_setup_ddr200_clock(host, rate == DdrRateReduced);
     bool ready = clock && sdmmc_storage_wait_ready(storage, get_tmr_us() + 50000);
-    storage->ddr.rate = rate;
+    storage->ddr.rate = ready ? rate : DdrRateUnknown;
     bool verified = ready && train(storage, rate, DdrSweepHandoff, true, 0, -1);
     host->deadline_us = old;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
@@ -511,26 +511,17 @@ static bool train_retained_ddr(sdmmc_storage_t *storage, enum DdrRate rate)
     return verified;
 }
 
-static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested)
+static bool restore_retained_ddr(sdmmc_storage_t *storage, enum DdrRate requested, u8 status[64])
 {
-    ddr_policy_t *policy = &storage->ddr;
-    /* Horizon may have restored only the controller. Restore the running
-       card's last rate before trying the existing reduced-rate recovery. */
+    /* Horizon may have restored only the controller. Confirm the retained
+       DDR200 link before relying on it to carry the SDR104 switch. */
     bool ok = train_retained_ddr(storage, requested);
-    if (!ok && requested == DdrRateFull) {
-#ifdef EMUMMC_DDR200_ADMA_PROBE
-        ddr_trace_clock_drop(requested, DdrRateReduced, DdrDropWakeCheck, 0, (ddr_eye_t){DdrTapCount, 0});
-#endif
-        ok = train_retained_ddr(storage, DdrRateReduced);
-        if (ok) {
-            policy->unstable = true;
-            policy->retry_at = get_tmr_us() + ddr_retry_delay(policy->upgrades);
-        }
-    }
-    if (!ok)
-        policy->rate = DdrRateUnknown;
     ddr_trace_power(DdrPowerRetained, ok);
-    return ok;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    if (!ok)
+        storage->ddr.tune_failure = DdrDropWakeCheck;
+#endif
+    return ok || fallback(storage, requested, status);
 }
 
 bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
@@ -572,9 +563,10 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
             /* A fresh CMD6 switch starts a new link. The pre-handoff
                samples can force the tap too far right as the eye contracts. */
             memset(policy->history, 0, sizeof(policy->history));
-            ok = train(storage, requested, DdrSweepHandoff, false, 0, -1) ||
-                fallback(storage, requested, 0, status);
+            ok = train(storage, requested, DdrSweepHandoff, false, 0, -1);
         }
+        if (!ok)
+            ok = fallback(storage, requested, status);
     } else if (standard) {
         /* Horizon has already completed its native SDR104 init. Reuse the
            standard timing while keeping our serialized emuMMC transport. */
@@ -583,9 +575,9 @@ bool sdmmc_ddr200_handoff(sdmmc_storage_t *storage)
              sdmmc_storage_wait_ready(storage, get_tmr_us() + 100000);
         storage->csd.busspeed = 104;
     } else if (want_ddr) {
-        ok = restore_retained_ddr(storage, requested);
+        ok = restore_retained_ddr(storage, requested, status);
     }
-    if (!ok && standard && policy->rate == DdrRateSdr104)
+    if (!ok && standard && !want_ddr && policy->rate == DdrRateSdr104)
         ok = set_sdr104(storage, status);
     restore_dma(dma, backup, sizeof(backup));
     sdmmc_card_clock_powersave(host, SDMMC_POWER_SAVE_ENABLE);
@@ -677,7 +669,7 @@ static bool recover_io(sdmmc_storage_t *storage, u32 sector, bool degrade, const
     }
 #endif
     bool ok = (!degrade && train_link(storage, rate, DdrSweepRecovery, true, sector, failed_tap, failed)) ||
-        fallback(storage, rate, sector, status);
+        fallback(storage, rate, status);
     if (ok)
         ddr_trace_read_recovery(host, true);
     policy->blocks = policy->busy_us = 0;
@@ -741,15 +733,15 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
     if (track || lower_for_write) {
 #ifdef EMUMMC_DDR200_ADMA_PROBE
         if (!train(storage, DdrRateFull, lower_for_write ? DdrSweepRecovery : DdrSweepTrack, true, sector, -1)) {
-            fallback(storage, DdrRateFull, sector, status);
+            fallback(storage, DdrRateFull, status);
         } else if (guard_write && policy->narrow && !policy->narrow_pair) {
             policy->tune_failure = DdrDropWriteMargin;
-            fallback(storage, DdrRateFull, sector, status);
+            fallback(storage, DdrRateFull, status);
         }
 #else
         if (lower_for_write || !train(storage, DdrRateFull, DdrSweepTrack, true, sector, -1) ||
             (guard_write && policy->narrow))
-            fallback(storage, DdrRateFull, sector, status);
+            fallback(storage, DdrRateFull, status);
 #endif
     } else {
         enum DdrRate was = policy->rate;
@@ -758,7 +750,7 @@ bool sdmmc_ddr200_before_io(sdmmc_storage_t *storage, u32 sector, bool writing)
         ddr_trace_ladder(DdrRateFull, false, policy->unstable, policy->upgrades);
         if (was != DdrRateSdr104 || enter_from_sdr104(storage, status)) {
             if (!train(storage, DdrRateFull, DdrSweepUpgrade, false, sector, -1))
-                fallback(storage, DdrRateFull, sector, status);
+                fallback(storage, DdrRateFull, status);
             else
                 storage->csd.busspeed = 200;
         } else {
@@ -867,7 +859,7 @@ static bool matrix_probe_cmd6(sdmmc_storage_t *storage)
         else
             policy->ready = policy->rate == DdrRateSdr104 && set_sdr104(storage, status);
         if (!policy->ready && policy->rate >= DdrRateReduced)
-            fallback(storage, policy->rate, 0, status);
+            fallback(storage, policy->rate, status);
     } else {
         matrix.details |= MatrixSettleUnavailable;
     }
@@ -973,7 +965,7 @@ static bool finish_matrix(sdmmc_storage_t *storage, enum DdrMatrixStage state)
             u8 backup[512], status[64];
             char *dma = borrow_dma(1, backup);
             if (dma) {
-                fallback(storage, DdrRateFull, 0, status);
+                fallback(storage, DdrRateFull, status);
                 restore_dma(dma, backup, sizeof(backup));
             }
         }
