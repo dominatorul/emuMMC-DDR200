@@ -308,6 +308,10 @@ def print_policy_trace(data, gprs):
     hygiene = gprs[11]
     print(f'CMD12 / CMD13 / CMD-DAT reset passed {(hygiene >> 8) & 0xFFFFFF}/{hygiene >> 32}, '
           f'last flags {hygiene & 7:03b}')
+    if hygiene & 0x80:
+        strikes, reenables = (hygiene >> 3) & 3, (hygiene >> 5) & 3
+        print(f'Read-ahead cooldown: {strikes}/3 strikes, {reenables} re-enables'
+              + (', disabled until reboot' if strikes == 3 else ''))
     verify = gprs[12]
     print(f'Two-tap data checks passed {(verify >> 16) & 0xFFFF}/{verify >> 32}, '
           f'last pair {(verify >> 8) & 0xFF} and {verify & 0xFF}')

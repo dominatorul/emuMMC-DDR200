@@ -108,7 +108,12 @@ static _Atomic u32 large_read_commands, large_read_restarts, largest_read, write
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
 static _Atomic u32 largest_fs_read, read_ahead_blocks, map_attempts, map_result;
-static _Atomic u32 read_ahead_fills[2];
+static _Atomic u32 read_ahead_fills[2], read_ahead_retry;
+
+void ddr_trace_read_ahead_retry(unsigned strikes, unsigned reenables)
+{
+    read_ahead_retry = (strikes << 3) | (reenables << 5);
+}
 #endif
 static _Atomic u64 matrix_status;
 static _Atomic u64 bus_registers, clock_registers;
@@ -503,6 +508,8 @@ void ddr_trace_report(atmosphere_fatal_error_ctx *ctx)
     ctx->gprs[31] = largest_read;
 #endif
 #ifdef EMUMMC_DDR200_READ_AHEAD
+    /* gprs[11] bits 3-7 were reserved. Bit 7 marks the new counters. */
+    ctx->gprs[11] |= 0x80 | read_ahead_retry;
     ctx->gprs[4] = ((u64)MIN(read_ahead_fills[0], 0xffffu) << 48) |
                   ((u64)MIN(read_ahead_fills[1], 0xffffu) << 32);
     ctx->gprs[31] |= (u64)largest_fs_read << 32;

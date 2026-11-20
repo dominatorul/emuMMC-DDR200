@@ -49,6 +49,7 @@ bool sdmmc_get_sd_inserted(void) { return true; }
 void ddr_trace_read_ahead(unsigned blocks) { assert(blocks && blocks <= sizeof(output) / 512); }
 void ddr_trace_read_ahead_map(Result result) { assert((result == 0) == mapping_ok); }
 void ddr_trace_read_ahead_fill(bool succeeded) { (void)succeeded; }
+void ddr_trace_read_ahead_retry(unsigned strikes, unsigned reenables) { (void)strikes; (void)reenables; }
 void ddr_trace_batch_refused(enum DdrBatchRefusal reason) { ++refusals[reason]; }
 void ddr_trace_sdma_restart(bool handoff) { (void)handoff; ++restarts; }
 void ddr_trace_descriptor_mapping(bool unmap, u32 handle, Result result)

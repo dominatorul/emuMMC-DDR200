@@ -29,6 +29,7 @@ void ddr_trace_counted_read(u8 version, bool supported, bool disabled, bool comp
 void ddr_trace_read_ahead_map(Result result);
 void ddr_trace_read_ahead(u32 blocks);
 void ddr_trace_read_ahead_fill(bool succeeded);
+void ddr_trace_read_ahead_retry(unsigned strikes, unsigned reenables);
 #endif
 void ddr_trace_reassert(void);
 void ddr_trace_boot_power(void);

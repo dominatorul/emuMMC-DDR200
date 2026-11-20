@@ -22,6 +22,8 @@ enum {
     DeviceAlignment = 4 * 1024 * 1024,
     ReadStreams = 4,
     ReadStreamIdleUs = 1000000,
+    ReadAheadCooldownUs = 60000000,
+    ReadAheadStrikeLimit = 3,
 };
 
 static struct { _Alignas(0x1000) u8 data[ReadAheadBytes]; } read_window;
@@ -44,7 +46,8 @@ static struct {
     read_stream_t streams[ReadStreams];
     u32 first;
     u32 blocks;
-    bool fill_failed;
+    u64 retry_at;
+    u8 strikes, reenables;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     bool adma_verified;
     u8 verified_tap[2];
@@ -352,7 +355,7 @@ static u32 advance_stream(u32 sector, u32 blocks, u64 now)
 static bool serve_batch(sdmmc_storage_t *storage, Handle das, u32 sector, u32 blocks, void *out, u32 preceding)
 {
     if (storage->ddr.rate != DdrRateFull || storage->sdmmc->divisor != 199680 ||
-        !storage->ddr.ready || read_ahead.fill_failed)
+        !storage->ddr.ready || read_ahead.strikes >= ReadAheadStrikeLimit)
         return refuse_batch(DdrBatchUnavailable);
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     if (!sdmmc_adma2_supported(storage->sdmmc))
@@ -385,9 +388,20 @@ static bool serve_batch(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bl
 #endif
         if (!read_ahead_eye_ready(storage))
             return refuse_batch(DdrBatchEye);
+        if (read_ahead.retry_at) {
+            ddr_eye_t eye = storage->ddr.history[0].eyes[0];
+            ddr_eye_t verified = storage->ddr.last_verified_eye;
+            if (get_tmr_us() < read_ahead.retry_at || storage->ddr.last_verified_us < read_ahead.retry_at ||
+                eye.left != verified.left || eye.right != verified.right)
+                return refuse_batch(DdrBatchUnavailable);
+        }
         if (!map_window(&read_ahead.mapping, das, &read_window, sizeof(read_window), Perm_W))
             return refuse_batch(DdrBatchWindow);
 
+        if (read_ahead.retry_at) {
+            read_ahead.retry_at = 0;
+            ddr_trace_read_ahead_retry(read_ahead.strikes, ++read_ahead.reenables);
+        }
         read_ahead.blocks = 0;
 #ifdef EMUMMC_DDR200_ADMA_PROBE
         bool ok = fill_adma(storage, sector);
@@ -396,7 +410,12 @@ static bool serve_batch(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bl
 #endif
         ddr_trace_read_ahead_fill(ok);
         if (!ok) {
-            read_ahead.fill_failed = true;
+            ++read_ahead.strikes;
+            read_ahead.retry_at = get_tmr_us() + ReadAheadCooldownUs;
+            ddr_trace_read_ahead_retry(read_ahead.strikes, read_ahead.reenables);
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+            read_ahead.adma_verified = false;
+#endif
             memset(read_ahead.streams, 0, sizeof(read_ahead.streams));
             return false;
         }

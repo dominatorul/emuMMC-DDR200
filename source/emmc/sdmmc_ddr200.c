@@ -76,6 +76,14 @@ static int verification_neighbor(ddr_eye_t eye, int tap, int guard, const u32 us
     return ddr_pick_tap_in_range(left, right, used, false);
 }
 
+static void remember_full_verification(ddr_policy_t *policy, ddr_eye_t eye)
+{
+    if (policy->rate == DdrRateFull) {
+        policy->last_verified_eye = eye;
+        policy->last_verified_us = get_tmr_us();
+    }
+}
+
 static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsigned tap,
     unsigned guard, u32 used[4])
 {
@@ -111,6 +119,8 @@ static bool verify_tap(sdmmc_storage_t *storage, ddr_eye_t eye, u32 sector, unsi
         ok = tap_readback(storage->sdmmc) == tap;
     }
     ddr_trace_verify(tap, neighbor, ok);
+    if (ok)
+        remember_full_verification(&storage->ddr, eye);
     return ok;
 }
 
@@ -202,6 +212,8 @@ static unsigned verify_full_rate(sdmmc_storage_t *storage, const ddr_history_t *
     sdmmc_set_ddr200_tap(host, applied);
     bool ok = tap_readback(host) == applied;
     ddr_trace_verify(applied, partner, ok);
+    if (ok)
+        remember_full_verification(policy, eye);
     policy->tune_failure = ok ? DdrDropUnknown : DdrDropClockSetup;
     return ok ? applied : SDMMC_INVALID_TAP;
 }
