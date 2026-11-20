@@ -50,6 +50,7 @@ static unsigned no_ready, hint_scans, switched_to_stock, log_events;
 static bool stop_ok, inconsistent, verify_rejected, verify_guarded_only;
 static bool card_retained_ddr;
 static unsigned rejected_sdr_checks, retained_restorations;
+static unsigned group4_request;
 static bool retained_full_clock_fails, retained_reduced_clock_fails;
 static unsigned retained_clock_changes, retained_failures;
 static char flow[256];
@@ -172,6 +173,8 @@ int sdmmc_execute_cmd(sdmmc_t *target, sdmmc_cmd_t *cmd, sdmmc_req_t *req, u32 *
 #endif
     if (cmd->cmd == SD_SWITCH) {
         assert(!req->is_write && req->blksize == 64);
+        if ((cmd->arg & 0xffff0fff) == 0x80ff0fff)
+            group4_request = (cmd->arg >> 12) & 15;
         if (card_retained_ddr) {
             assert(cmd->arg == 0x00ffffff && (regs.hostctl2 & 7) == UHS_SDR104_BUS_SPEED);
             ++rejected_sdr_checks;
@@ -452,6 +455,11 @@ static void test_eye_model(void)
 int main(void)
 {
     test_eye_model();
+    reset();
+    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800 | SD_MAX_CURRENT_400, (u8 *)window);
+    assert(group4_request == SD_SET_CURRENT_LIMIT_400);
+    sdmmc_sd_set_current_limit(&card, SD_MAX_CURRENT_800, (u8 *)window);
+    assert(group4_request == SD_SET_CURRENT_LIMIT_200);
     u8 functions[64] = {[9] = 7, [10] = 0x40};
     u8 buf[16 * 512];
 #ifdef EMUMMC_DDR200_ADMA_PROBE

@@ -1167,11 +1167,8 @@ void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 
 {
 	u32 pwr = SD_SET_CURRENT_LIMIT_200;
 
-	if (current_limit & SD_MAX_CURRENT_800)
-		pwr = SD_SET_CURRENT_LIMIT_800;
-	else if (current_limit & SD_MAX_CURRENT_600)
-		pwr = SD_SET_CURRENT_LIMIT_600;
-	else if (current_limit & SD_MAX_CURRENT_400)
+	// SD Physical Layer table 4-12: a VDD1-only host selects function 0 or 1.
+	if (current_limit & SD_MAX_CURRENT_400)
 		pwr = SD_SET_CURRENT_LIMIT_400;
 
 	_sd_storage_switch(storage, buf, SD_SWITCH_SET, 3, pwr);
@@ -1180,14 +1177,6 @@ void sdmmc_sd_set_current_limit(sdmmc_storage_t *storage, u16 current_limit, u8 
 	{
 		switch (pwr)
 		{
-		case SD_SET_CURRENT_LIMIT_800:
-DPRINTF("[SD] power limit raised to 800mA\n");
-			break;
-
-		case SD_SET_CURRENT_LIMIT_600:
-DPRINTF("[SD] power limit raised to 600mA\n");
-			break;
-
 		case SD_SET_CURRENT_LIMIT_400:
 DPRINTF("[SD] power limit raised to 400mA\n");
 			break;

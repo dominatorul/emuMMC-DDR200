@@ -13,6 +13,8 @@ enum {
     ReadAheadRunIn = 512 * 1024 / 512,
 #ifdef EMUMMC_DDR200_ADMA_PROBE
     ReadAheadRequest = 64 * 1024 / 512,
+    ReadAheadSmallSeed = 16 * 1024 / 512,
+    ReadAheadLargeRunIn = 256 * 1024 / 512,
 #else
     ReadAheadRequest = 256 * 1024 / 512,
     ReadAheadMinEye = 9,
@@ -262,7 +264,7 @@ static bool fill_adma(sdmmc_storage_t *storage, u32 sector)
     unsigned a = read_ahead.verified_tap[0], b = read_ahead.verified_tap[1];
     if (!read_ahead.adma_verified || read_ahead.verified_upgrade != storage->ddr.upgrades ||
         (tap != a && tap != b) || !guarded_tap(eye, a, guard) || !guarded_tap(eye, b, guard)) {
-        unsigned alternate = guarded_tap(eye, tap + 1, guard) ? tap + 1 : tap - 1;
+        unsigned alternate = guarded_tap(eye, tap - 1, guard) ? tap - 1 : tap + 1;
         bool ok = qualify_adma(storage, sector, eye, tap, alternate);
         if (!ok)
             ddr_trace_batch_refused(DdrBatchTapPair);
@@ -338,7 +340,11 @@ static u32 advance_stream(u32 sector, u32 blocks, u64 now)
         if (stream->seen < oldest->seen)
             oldest = stream;
     }
-    if (blocks >= ReadAheadRequest)
+    bool can_seed = blocks >= ReadAheadRequest;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+    can_seed |= blocks >= ReadAheadSmallSeed && (!oldest->blocks || now - oldest->seen >= ReadStreamIdleUs);
+#endif
+    if (can_seed)
         *oldest = (read_stream_t){(u64)sector + blocks, now, MIN(blocks, ReadAheadRunIn)};
     return 0;
 }
@@ -358,7 +364,12 @@ static bool serve_batch(sdmmc_storage_t *storage, Handle das, u32 sector, u32 bl
     if (!covered) {
         if (!preceding)
             return refuse_batch(blocks < ReadAheadRequest ? DdrBatchSmall : DdrBatchNonAdjacent);
-        if (preceding < ReadAheadRunIn)
+        unsigned run_in = ReadAheadRunIn;
+#ifdef EMUMMC_DDR200_ADMA_PROBE
+        if (blocks >= ReadAheadLargeRunIn)
+            run_in = ReadAheadLargeRunIn;
+#endif
+        if (preceding < run_in)
             return refuse_batch(blocks < ReadAheadRequest ? DdrBatchSmall : DdrBatchRunIn);
         if ((u64)sector + ReadAheadBlocks > storage->sec_cnt || blocks > ReadAheadBlocks)
             return refuse_batch(DdrBatchWindow);

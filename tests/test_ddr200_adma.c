@@ -337,5 +337,16 @@ int main(void)
     sdmmc_read_ahead_invalidate(ReadAheadRunIn + 2 * small + 1, 1);
     assert(!sdmmc_read_ahead(&card, das, ReadAheadRunIn + 2 * small + 1, small, output));
     assert(commands == 2);
+
+    reset((ddr_eye_t){29, 40}, 34);
+    assert(!sdmmc_read_ahead(&card, das, 0, ReadAheadLargeRunIn, output));
+    assert(sdmmc_read_ahead(&card, das, ReadAheadLargeRunIn, ReadAheadLargeRunIn, output));
+    assert(commands == 2 && sample_taps[DdrDmaAlternate] == 33);
+
+    reset((ddr_eye_t){29, 40}, 34);
+    for (u32 sector = 0; sector < ReadAheadRunIn; sector += ReadAheadSmallSeed)
+        assert(!sdmmc_read_ahead(&card, das, sector, ReadAheadSmallSeed, output));
+    assert(!commands && sdmmc_read_ahead(&card, das, ReadAheadRunIn, ReadAheadSmallSeed, output));
+    assert(commands == 2 && output[0] == 8);
     puts("ADMA2 chains, resets, guarded batching, stream interleaving and refusal counters passed");
 }
