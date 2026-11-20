@@ -860,23 +860,23 @@ static int _sdmmc_manual_tuning_set_tap(sdmmc_t *sdmmc, sdmmc_manual_tuning_t *t
 	return 1;
 }
 
-u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 complete[4])
+u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, bool initial, u32 raw[4], u32 complete[4])
 {
 	if (sdmmc->powersave_enabled || first >= end || end > 128)
 		return 0;
 
-	u32 saved_tap = (sdmmc->regs->venclkctl >> 16) & 0xFF;
 #ifndef EMUMMC_DDR200_HEKATE
-	u16 saved_tuned = sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK;
+	initial = false;
 #endif
+	u32 saved_tap = (sdmmc->regs->venclkctl >> 16) & 0xFF;
+	u16 saved_tuned = sdmmc->regs->hostctl2 & SDHCI_CTRL_TUNED_CLK;
 	u16 saved_clock = sdmmc->regs->clkcon & SDHCI_CLOCK_CARD_EN;
 	sdmmc->regs->ventunctl1 = 0;
 	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFF1FFF) | (2 << 13);
 	sdmmc->regs->ventunctl0 = (sdmmc->regs->ventunctl0 & 0xFFFFE03F) | (1 << 6);
 	sdmmc->regs->ventunctl0 |= TEGRA_MMC_VNDR_TUN_CTRL0_TAP_VAL_UPDATED_BY_HW;
-#ifndef EMUMMC_DDR200_HEKATE
-	sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
-#endif
+	if (!initial)
+		sdmmc->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
 	sdmmc->regs->hostctl2 |= SDHCI_CTRL_EXEC_TUNING;
 
 	u32 tap = first;
@@ -899,12 +899,14 @@ u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 comple
 			usleep(1);
 		}
 	}
-#ifdef EMUMMC_DDR200_HEKATE
-	sdmmc->regs->hostctl2 &= ~SDHCI_CTRL_EXEC_TUNING;
-#else
-	sdmmc->regs->hostctl2 = (sdmmc->regs->hostctl2 &
-		~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK)) | saved_tuned;
-#endif
+	/* Hekate startup leaves the last hardware TUNED_CLK sample in place.
+	   A runtime scan is observational: the last tested tap must not switch
+	   the live sampling clock before the caller verifies and applies a tap. */
+	if (initial)
+		sdmmc->regs->hostctl2 &= ~SDHCI_CTRL_EXEC_TUNING;
+	else
+		sdmmc->regs->hostctl2 = (sdmmc->regs->hostctl2 &
+			~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK)) | saved_tuned;
 	sdmmc_set_ddr200_tap(sdmmc, saved_tap);
 	sdmmc->regs->clkcon = (sdmmc->regs->clkcon & ~SDHCI_CLOCK_CARD_EN) | saved_clock;
 	return tap - first;
@@ -922,7 +924,7 @@ static int _sdmmc_tuning_execute_ddr200(sdmmc_t *sdmmc, u32 cmd)
 	}
 	ddr_trace_host(DdrLatestTune, sdmmc);
 	sdmmc_manual_tuning_t tuning = {.num_iter = 128};
-	tuning.iter_done = sdmmc_scan_ddr200(sdmmc, 0, tuning.num_iter, tuning.raw, tuning.result);
+	tuning.iter_done = sdmmc_scan_ddr200(sdmmc, 0, tuning.num_iter, true, tuning.raw, tuning.result);
 	return _sdmmc_manual_tuning_set_tap(sdmmc, &tuning);
 }
 

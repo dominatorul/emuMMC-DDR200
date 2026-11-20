@@ -230,14 +230,14 @@ static ddr_eye_t scan_eye(sdmmc_storage_t *storage, const ddr_history_t *history
         first = MAX(0, center - 16);
         end = MIN(DdrTapCount, center + 17);
     }
-    *samples = sdmmc_scan_ddr200(host, first, end, raw, passing);
+    *samples = sdmmc_scan_ddr200(host, first, end, false, raw, passing);
     ddr_eye_t eye = ddr_select_eye(passing, first, first + *samples, DdrRuntimeWidth, old);
     if (first || end < DdrTapCount) {
         if (ddr_eye_width(eye) && eye.left != first && eye.right + 1u < end && *samples == end - first)
             return eye;
         memset(raw, 0, sizeof(u32) * 4);
         memset(passing, 0, sizeof(u32) * 4);
-        *samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+        *samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, false, raw, passing);
         return ddr_select_eye(passing, 0, *samples, DdrRuntimeWidth, old);
     }
     return eye;
@@ -274,7 +274,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
 #ifdef EMUMMC_DDR200_HEKATE
     /* Match Hekate's full sweep, TUNED_CLK pass map and midpoint. Horizon
        reuses a live link, so verify that midpoint before resuming FS I/O. */
-    unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+    unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, kind == DdrSweepInitial, raw, passing);
     bool runtime = kind == DdrSweepTrack || kind == DdrSweepRecovery;
     ddr_eye_t eye = runtime ? ddr_widest_eye(passing, samples) : ddr_hekate_eye(raw);
     unsigned applied = SDMMC_INVALID_TAP;
@@ -338,7 +338,7 @@ static bool train_link(sdmmc_storage_t *storage, enum DdrRate rate, u8 kind, boo
     ddr_eye_t eye;
     if (kind == DdrSweepInitial) {
         *history = (ddr_history_t){0};
-        samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+        samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, true, raw, passing);
         eye = ddr_widest_eye(passing, samples);
     } else {
         eye = scan_eye(storage, history, local, raw, passing, &samples);
@@ -510,7 +510,7 @@ static bool train_sdr104(sdmmc_storage_t *storage, u8 status[64])
     if (!ready) {
         u32 raw[4] = {0}, passing[4] = {0};
         host->regs->hostctl2 &= ~(SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK);
-        unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, raw, passing);
+        unsigned samples = sdmmc_scan_ddr200(host, 0, DdrTapCount, false, raw, passing);
         ddr_eye_t eye = ddr_widest_eye(passing, samples);
         if (ddr_eye_width(eye) >= 2 * DdrNarrowMargin + 1) {
             sdmmc_set_ddr200_tap(host, (eye.left + eye.right) / 2);

@@ -128,9 +128,10 @@ static void produce_eye(u32 map[4], ddr_eye_t eye, unsigned period, u32 first, u
             map[tap / 32] |= 1u << (tap % 32);
 }
 
-u32 sdmmc_scan_ddr200(sdmmc_t *target, u32 first, u32 end, u32 raw[4], u32 passing[4])
+u32 sdmmc_scan_ddr200(sdmmc_t *target, u32 first, u32 end, bool initial, u32 raw[4], u32 passing[4])
 {
     assert(target == &host && !host.powersave_enabled);
+    assert(!initial || (first == 0 && end == DdrTapCount));
     event('T');
     if (end - first < DdrTapCount)
         ++hint_scans;

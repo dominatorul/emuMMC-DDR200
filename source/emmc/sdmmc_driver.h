@@ -330,7 +330,7 @@ int sdmmc_ddr200_dll_probe(sdmmc_t *host);
 #endif
 int  sdmmc_setup_ddr200_clock(sdmmc_t *sdmmc, bool reduced);
 void sdmmc_set_ddr200_tap(sdmmc_t *sdmmc, u32 tap);
-u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, u32 raw[4], u32 complete[4]);
+u32 sdmmc_scan_ddr200(sdmmc_t *sdmmc, u32 first, u32 end, bool initial, u32 raw[4], u32 complete[4]);
 #endif
 void sdmmc_card_clock_powersave(sdmmc_t *sdmmc, int powersave_enable);
 int  sdmmc_get_rsp(sdmmc_t *sdmmc, u32 *rsp, u32 size, u32 type);

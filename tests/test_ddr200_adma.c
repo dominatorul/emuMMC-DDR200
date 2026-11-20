@@ -33,8 +33,20 @@ static u32 sequential, served;
 static int fault_tap;
 static u16 fault_irq;
 static bool stale_data, mapping_ok = true;
+static bool scan_sample_tuned;
 
 u64 get_tmr_us(void) { return ++time_us; }
+void usleep(u64 delay)
+{
+    time_us += delay;
+    if (regs.hostctl2 & SDHCI_CTRL_EXEC_TUNING) {
+        regs.norintsts |= SDHCI_INT_DATA_AVAIL;
+        if (scan_sample_tuned)
+            regs.hostctl2 |= SDHCI_CTRL_TUNED_CLK;
+        else
+            regs.hostctl2 &= ~SDHCI_CTRL_TUNED_CLK;
+    }
+}
 u64 get_tmr_ms(void)
 {
     if (regs.swrst) {
@@ -275,9 +287,35 @@ static void test_dma(void)
     assert(maps == 2 && unmaps == 1);
 }
 
+static void test_scan_state(void)
+{
+    reset((ddr_eye_t){29, 36}, 32);
+    host.powersave_enabled = false;
+    regs.clkcon = SDHCI_CLOCK_CARD_EN;
+    for (unsigned tuned = 0; tuned < 2; ++tuned) {
+        scan_sample_tuned = !tuned;
+        u16 entry = UHS_DDR50_BUS_SPEED | SDHCI_CTRL_VDD_180 | (tuned ? SDHCI_CTRL_TUNED_CLK : 0);
+        regs.hostctl2 = entry;
+        for (unsigned scan = 0; scan < 4; ++scan) {
+            u32 raw[4] = {0}, complete[4] = {0};
+            assert(sdmmc_scan_ddr200(&host, 0, 4, false, raw, complete) == 4);
+            assert(raw[0] == (scan_sample_tuned ? 15u : 0u) && complete[0] == raw[0]);
+            assert(regs.hostctl2 == entry && active_tap(&host) == 32);
+            assert(regs.clkcon == SDHCI_CLOCK_CARD_EN);
+        }
+    }
+#ifdef EMUMMC_DDR200_HEKATE
+    u32 raw[4] = {0}, complete[4] = {0};
+    scan_sample_tuned = false;
+    assert(sdmmc_scan_ddr200(&host, 0, 128, true, raw, complete) == 128);
+    assert(!(regs.hostctl2 & (SDHCI_CTRL_EXEC_TUNING | SDHCI_CTRL_TUNED_CLK)));
+#endif
+}
+
 int main(void)
 {
     test_dma();
+    test_scan_state();
 
     reset((ddr_eye_t){29, 36}, 32);
     assert(!read_next(0) && read_next(1024));
